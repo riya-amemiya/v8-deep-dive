@@ -1,0 +1,12 @@
+<h2 id="section-18">15. 全体まとめ</h2>
+
+<p>V8 における <code>Array.prototype.flat</code> は (1) 2018 年に CSA (<code class="file-ref">src/builtins/builtins-array-gen.cc::ArrayFlattenAssembler</code>) として誕生し、(2) 2023 年 12 月の bbe1122 で Torque (<code class="file-ref">src/builtins/array-flat.tq</code>) に移行し FastJSArrayWitness 経路で 4 倍速くなり、(3) 2026 年 2 月の 3eed742 で二パス TryFastFlat と CalculateFlattenedLengthFast による ElementsKind ベースの最終長算出が導入されさらに 4.6 〜 4.7 倍速くなった、という三段階の進化を経ています。</p>
+
+<p>現行 (HEAD 0ade545a) の実装は 610 行の単一ファイルで、3072 エントリのスタック上限と複数の bailout 経路、<code>FastJSArrayForCopy</code> および <code>FastJSArrayForReadWitness</code> による protector ガード、ElementsKind 単一化の三本柱で仕様等価性とパフォーマンスを両立しています。</p>
+
+<p>設計の本質的な美しさは、ElementsKind の整数値が NativeContext の Map スロットインデックスと 1 対 1 対応する設計、PACKED と HOLEY の判定が <code>kind % 2</code> で済む設計、<code>the_hole</code> と <code>kHoleNanInt64</code> で hole を tagged / double 両方で表現できる設計、<code>kEmptyFixedArray</code> を read-only シングルトンとして全 JSArray に共有させる設計、そして protector による「楽観的仮定の検証可能化」によって、仕様の動的意味論を「intact なら fast、破られたら bailout」という二元論に圧縮できている点にあります。flat の二パス設計はこの土台の上に「事前計測してから一回確保」というシンプルな最適化を載せただけで、4 倍を超える速度向上を達成しています。</p>
+
+<p>仕様準拠は test262 完全合格、V8 固有テストは harmony 四点、elements-kind 一点、regression 三点、wasm 連携六点が現在 CI を通っています。</p>
+
+<hr/>
+

@@ -1,0 +1,472 @@
+<section id="part4">
+<h2>第 IV 部 最適化機構 (IC, JIT, Sandbox)</h2>
+
+<h3>V8 最適化機構とメモリ管理 詳細技術解説</h3>
+
+<p>本資料は V8 ソースコード (<code>/home/user/v8</code>) を直接読み解いた上で、Inline Cache、Hidden Class、コンパイラ階層、Deoptimization、サンドボックス、各種ポインタテーブル、スナップショット、ハンドル API といった V8 の主要な最適化とメモリ機構を、具体的なファイル・行番号・データ構造とともに整理したものです。登壇資料の参考文献として用いられることを想定し、抽象論ではなく実装レベルの記述を中心に据えています。</p>
+
+<h3 id="p4-1">1. Inline Cache (IC)</h3>
+
+<h4>1.1 IC の状態遷移</h4>
+
+<p>V8 の <code>IC</code> は <code class="file-ref">src/ic/ic.h</code> で定義されており、状態は <code class="file-ref">src/common/globals.h:1861</code> の <code>enum class InlineCacheState</code> で表現されます。状態は以下のとおりです。</p>
+
+<pre><code class="language-text">NO_FEEDBACK         (FB を集めない)
+UNINITIALIZED       (まだ実行されていない)
+MONOMORPHIC         (1 種類の receiver 型のみ見た)
+RECOMPUTE_HANDLER   (prototype 失敗または map deprecation)
+POLYMORPHIC         (複数の receiver 型を見たが上限内)
+MEGADOM             (同じアクセサを持つ多くの DOM 型を見た)
+HOMOMORPHIC         (多数の receiver 型を 1 つの handler で扱える)
+MEGAMORPHIC         (上限を超えるほど多数の receiver 型)
+GENERIC             (汎用ハンドラを設置、追加のフィードバックは取らない)
+</code></pre>
+
+<p>POLYMORPHIC の上限は <code>DEFAULT_MAX_POLYMORPHIC_MAP_COUNT = 4</code>(<code class="file-ref">src/flags/flag-definitions.h:3238</code>)で、フラグ <code>--max-valid-polymorphic-map-count</code> を通じて変更可能です (<code class="file-ref">src/flags/flag-definitions.h:3239</code>)。<code>MapsAndHandlers</code> の内部 <code>DirectHandleSmallVector</code> のスタック格納サイズもこの定数で決まっています (<code class="file-ref">src/objects/feedback-vector.h:178</code>)。</p>
+
+<h4>1.2 IC の更新ロジック</h4>
+
+<p><code>IC::SetCache</code>(<code class="file-ref">src/ic/ic.cc:977-1035</code>)が状態遷移の中枢です。要点は次のとおりです。<code>UNINITIALIZED</code> のときは <code>UpdateMonomorphicIC</code>(<code class="file-ref">src/ic/ic.cc:896</code>)が呼ばれて単一の (map, handler) ペアが FeedbackVector に書き込まれます。<code>MONOMORPHIC</code> のときに新しい receiver map が来ると <code>UpdatePolymorphicIC</code>(<code class="file-ref">src/ic/ic.cc:717-820</code>)が走り、既存エントリと比較しながら最大 4 個まで (map, handler) を追加します。失敗した場合は <code>CopyICToMegamorphicCache</code>(<code class="file-ref">src/ic/ic.cc:902</code>)でグローバル StubCache にコピーし、状態を <code>MEGAMORPHIC</code> に格上げします。</p>
+
+<p>POLYMORPHIC が拒否される条件は明確で、<code>number_of_valid_maps &gt;= v8_flags.max_valid_polymorphic_map_count</code>(<code class="file-ref">src/ic/ic.cc:791</code>)、辞書 Map での handler 不一致(<code class="file-ref">src/ic/ic.cc:769</code>、deopt ループ防止のため即 MEGAMORPHIC へ)、prototype 失敗による上書きケースが該当します。</p>
+
+<p>POLYMORPHIC のエントリは <code>FeedbackIterator</code> でループしながら比較されます(<code class="file-ref">src/ic/ic.cc:733</code>)。Deprecated map が混ざっていれば、それは別カウントで扱われ、<code>deprecated_maps &gt;= max_valid_polymorphic_map_count</code> のときも MEGAMORPHIC へ抜けます(<code class="file-ref">src/ic/ic.cc:794</code>)。これは古い Map(migration target に置換済み)がフィードバックに残ったまま大量に増えないようにするための上限です。</p>
+
+<h4>1.3 FeedbackVector の物理レイアウト</h4>
+
+<p><code>V8_OBJECT class FeedbackVector : public HeapObject</code>(<code class="file-ref">src/objects/feedback-vector.h:307</code>)は固定ヘッダのあとに <code>FLEXIBLE_ARRAY_MEMBER</code> で <code>MaybeObject</code> のスロットを並べる可変長オブジェクトです。ヘッダは <code>length</code>、<code>invocation_count</code>、<code>invocation_count_before_stable</code>、<code>osr_state</code>、<code>flags</code>、<code>shared_function_info</code>、<code>closure_feedback_cell_array</code>、<code>parent_feedback_cell</code> などを含みます(<code class="file-ref">src/objects/feedback-vector.h:319-352</code>)。</p>
+
+<p><code>FeedbackSlotKind</code>(<code class="file-ref">src/objects/feedback-vector.h:45</code>)は 23 種類定義されており、<code>kLoadProperty</code>、<code>kSetNamedStrict</code>、<code>kCall</code>、<code>kBinaryOp</code>、<code>kCompareOp</code>、<code>kCloneObject</code>、<code>kForIn</code>、<code>kInstanceOf</code> 等があります。各 slot kind ごとに 1 個または 2 個の MaybeObject を消費し、Polymorphic feedback は 2 つ目のスロットに <code>WeakFixedArray&lt;Map, Handler&gt;</code> を持ちます。</p>
+
+<p><code>FeedbackNexus::ExtractMaps</code>(<code class="file-ref">src/objects/feedback-vector.cc:1167</code>)は <code>FeedbackIterator</code> をループし、POLYMORPHIC スロットに格納されている (map, handler) ペアを抽出します。Map は弱参照で保持されるため、GC により回収された map は <code>it.handler().IsCleared()</code> で判定して除外されます(<code class="file-ref">src/ic/ic.cc:734</code>)。Polymorphic スロットの典型的なメモリ消費は <code>WeakFixedArray header + N * (Map* + Handler*) = 16 + N * 16</code> バイト前後で、N=4 なら 80 バイトほどです。</p>
+
+<h4>1.4 LoadHandler / StoreHandler の Smi エンコーディング</h4>
+
+<p><code>LoadHandler</code>(<code class="file-ref">src/ic/handler-configuration.h:28</code>)は <code>DataHandler</code> を継承し、軽量ハンドラは Smi 内に下記のビットフィールドでパッキングされます(<code class="file-ref">src/ic/handler-configuration.h:33-127</code>)。</p>
+
+<p><code>KindBits</code> (4 bit, 0-3) — <code>kElement</code>, <code>kField</code>, <code>kConstantFromPrototype</code>, <code>kAccessorFromPrototype</code>, <code>kNativeDataProperty</code>, <code>kApiGetter</code>, <code>kInterceptor</code>, <code>kSlow</code>, <code>kProxy</code>, <code>kNonExistent</code>, <code>kModuleExport</code>, <code>kGeneric</code> などのハンドラ種別。</p>
+<p><code>DoAccessCheckOnLookupStartObjectBits</code> (1 bit, 4)</p>
+<p><code>LookupOnLookupStartObjectBits</code> (1 bit, 5)</p>
+<p><code>kField</code> 用に <code>StorageOffsetInWordsBits</code> (kDescriptorIndexBitCount+1 = 11 bit)、<code>IsInobjectBits</code> (1)、<code>IsDoubleBits</code> (1)、<code>DescriptorIndexBits</code> (11) — <code class="file-ref">src/ic/handler-configuration.h:98-106</code>。</p>
+<p><code>kElement</code> 用に <code>IsJsArrayBits</code>、<code>AllowHandlingHole</code>、<code>ElementsKindBits</code> (8 bit) — <code class="file-ref">src/ic/handler-configuration.h:123-127</code>。</p>
+
+<p>つまり典型的なフィールドロードは 31 ビット Smi 1 個だけで「inobject か外部か、double slack 表現か、descriptor 番号、word offset」が全部表せます。これによりハンドラそのものをヒープに置かず即値で配布できます。Smi に収まらない複雑なハンドラ(prototype chain を辿る、interceptor を呼ぶ、ApiCallback を踏むなど)は <code>DataHandler</code> を継承した <code>LoadHandler</code> インスタンスとして <code>LoadFromPrototype</code> などのファクトリで生成されます(<code class="file-ref">src/ic/handler-configuration.h:196</code>)。</p>
+
+<h4>1.5 IC を活用した Map chain の効率化</h4>
+
+<p>V8 の Map (Hidden Class) は安定すると <code>IsHandler</code> チェック(<code class="file-ref">src/ic/ic.h:68</code>)の対象になり、ハンドラが POLYMORPHIC vector に格納されると次回以降は Map ポインタ比較のみで O(1) でディスパッチできます。Prototype チェーン上のキャッシュは <code>LookupOnLookupStartObjectBits</code> でステップ数を表現し、Validity Cell(<code>DependentCode</code> 経由)が Map 変化時にハンドラを無効化します。MEGAMORPHIC 状態では <code>StubCache</code>(<code class="file-ref">src/ic/stub-cache.h</code>)というプロセスグローバル(厳密には Isolate 単位)のハッシュテーブルにフォールバックし、<code>UpdateMegamorphicCache</code>(<code class="file-ref">src/ic/ic.cc:1025</code>)が (map, name) → handler を登録します。</p>
+
+<h3 id="p4-2">2. Hidden Class (Map) と Transition</h3>
+
+<h4>2.1 Map と DescriptorArray</h4>
+
+<p><code>V8_OBJECT class Map : public HeapObject</code>(<code class="file-ref">src/objects/map.h:258</code>)は inobject プロパティ数、instance size、<code>bit_field</code> 系のフラグ、<code>prototype</code>、<code>constructor_or_back_pointer</code>、<code>transitions_or_prototype_info</code>、<code>instance_descriptors</code>、<code>dependent_code</code> を持ちます。各 Map は最大 <code>kMaxNumberOfDescriptors = (1 &lt;&lt; 10) - 4 = 1020</code> 個のプロパティを記述できます(<code class="file-ref">src/objects/property-details.h:242,249</code>)。これを超えるとオブジェクトは dictionary mode(slow mode)へ遷移します。</p>
+
+<h4>2.2 Transition の 3 つの形態</h4>
+
+<p>Map から派生 Map への移行は <code>TransitionsAccessor</code>(<code class="file-ref">src/objects/transitions.h:75</code>)で管理され、<code>raw_transitions</code> フィールドのエンコーディングは 5 種類存在します(<code class="file-ref">src/objects/transitions.cc:20-39</code>)。</p>
+
+<p><strong>kUninitialized</strong> — まだ遷移を持たない(Smi(0))</p>
+<p><strong>kWeakRef</strong> — 単一遷移を <code>MakeWeak(target_map)</code> として直接埋め込む(<code class="file-ref">src/objects/transitions.cc:21,56</code>)。</p>
+<p><strong>kFullTransitionArray</strong> — 完全な <code>TransitionArray</code>。複数のプロパティ名や prototype/elements kind 遷移をまとめて保持。</p>
+<p><strong>kPrototypeInfo</strong> / <strong>kPrototypeSharedClosureInfo</strong> — 別用途。</p>
+<p><strong>kMigrationTarget</strong> — Map deprecation 時に古い Map の <code>raw_transitions</code> を再利用して migration 先を保持(<code class="file-ref">src/objects/transitions.cc:560</code>)。</p>
+
+<p><code>TransitionArray</code> のレイアウトは <code class="file-ref">src/objects/transitions.h:305-360</code> に明示されています。<code>[0]</code> PrototypeTransitions の WeakFixedArray、<code>[1]</code> SideStepTransitions、<code>[2]</code> number_of_transitions、<code>[3..]</code> (key, weak target) ペア。1 エントリは 2 スロット (<code>kEntrySize = 2</code>) で、エントリ数は <code>kMaxNumberOfTransitions = 1024 + 512 = 1536</code>(<code class="file-ref">src/objects/transitions.h:150</code>)に制限されます。これは GC の incremental right-trimming がメモリリークを起こさないよう、TransitionArray をラージオブジェクト空間に置かない目的があります(同行のコメント参照)。</p>
+
+<p><code>SearchTransition</code> は線形探索/二分探索を切り替えます。<code>kMaxElementsForLinearSearch = 32</code>(<code class="file-ref">src/objects/transitions.h:319</code>)以下では <code>LinearSearchName</code>、超えたら <code>BinarySearchName</code>(<code class="file-ref">src/objects/transitions.h:438-439</code>)。バックグラウンドスレッドからも線形探索が使われます。</p>
+
+<h4>2.3 同じプロパティ追加順なら同じ Map</h4>
+
+<p><code>TransitionsAccessor::InsertHelper</code>(<code class="file-ref">src/objects/transitions.cc:43-130</code>)が遷移を追加する中枢で、既存遷移と同名・同 kind・同 attributes のものが見つかれば既存をそのまま使い、別なら新規 entry を二分探索の挿入位置に挿入します(<code class="file-ref">src/objects/transitions.cc:99-127</code>)。これにより <code>{}; o.x=1; o.y=2;</code> のオブジェクト 100 万個が全部同じ Map を共有でき、Map サイズと IC のフィードバック空間を抑えられます。</p>
+
+<h4>2.4 Boilerplate と AllocationSite</h4>
+
+<p>オブジェクトリテラルの初期化を高速化するため、<code>AllocationSite</code>(<code class="file-ref">src/objects/allocation-site.h:23</code>)に boilerplate JSObject が保存されます。<code>transition_info_or_boilerplate_</code> フィールド(<code class="file-ref">src/objects/allocation-site.h:149</code>)が Smi なら Array 用、JSObject なら literal の雛形です。<code>PretenureDecision</code> (<code class="file-ref">src/objects/allocation-site.h:28</code>) で <code>kUndecided</code>/<code>kDontTenure</code>/<code>kMaybeTenure</code>/<code>kTenure</code> の 4 段階を管理し、<code>MementoFoundCountBits</code> (26 bit) と <code>PretenureDecisionBits</code> (3 bit) を <code>pretenure_data_</code> に詰め込んでいます(<code class="file-ref">src/objects/allocation-site.h:80-82</code>)。</p>
+
+<p><code>AllocationSite::kMaximumArrayBytesToPretransition = 8 * 1024</code>(<code class="file-ref">src/objects/allocation-site.h:25</code>)は配列リテラル initial size の閾値で、これを超えるリテラルは elements kind 遷移のトラッキングを行いません。</p>
+
+<h3 id="p4-3">3. コンパイラ階層とコードメモリ</h3>
+
+<h4>3.1 Code の種別</h4>
+
+<p>V8 は単一の <code>Code</code> オブジェクトで全種類のコードを表現し、<code>CodeKind</code>(<code class="file-ref">src/objects/code-kind.h:36</code>)で識別します。</p>
+
+<pre><code class="language-text">BYTECODE_HANDLER, FOR_TESTING, FOR_TESTING_JS,
+BUILTIN, REGEXP, WASM_FUNCTION, WASM_TO_CAPI_FUNCTION,
+WASM_TO_JS_FUNCTION, JS_TO_WASM_FUNCTION, C_WASM_ENTRY,
+INTERPRETED_FUNCTION, BASELINE, MAGLEV, TURBOFAN_JS,
+WASM_STACK_ENTRY
+</code></pre>
+
+<p>階層関係は静的に強制されています。<code>static_assert(CodeKind::INTERPRETED_FUNCTION &lt; CodeKind::BASELINE)</code>、<code>BASELINE &lt; TURBOFAN_JS</code>(<code class="file-ref">src/objects/code-kind.h:41-42</code>)。判定述語は <code>CodeKindIsOptimizedJSFunction</code> (MAGLEV..TURBOFAN_JS の範囲チェック、<code class="file-ref">src/objects/code-kind.h:71</code>)、<code>CodeKindCanDeoptimize</code> (MAGLEV/TURBOFAN/WASM_FUNCTION+deopt、<code class="file-ref">src/objects/code-kind.h:88</code>) など。</p>
+
+<h4>3.2 Ignition (インタプリタ) と BytecodeArray</h4>
+
+<p>Ignition バイトコードは <code class="file-ref">src/objects/bytecode-array.h:29</code> の <code>V8_OBJECT class BytecodeArray : public ExposedTrustedObject</code> に格納されます。サンドボックス有効時はサンドボックス外の Trusted Space に置かれ、<code>BytecodeWrapper</code>(<code class="file-ref">src/objects/bytecode-array.h:178</code>)が <code>TrustedPointerMember&lt;BytecodeArray, kBytecodeArrayIndirectPointerTag&gt;</code> を介して間接参照します。</p>
+
+<p><code>BytecodeArray</code> は <code>length</code>、<code>wrapper</code>、<code>source_position_table</code>、<code>handler_table</code>、<code>constant_pool</code>、<code>frame_size</code>、<code>parameter_size</code>、<code>max_arguments</code>、<code>incoming_new_target_or_generator_register</code> のあとに <code>FLEXIBLE_ARRAY_MEMBER(uint8_t, bytes)</code> を続け、最後に実バイトコードが並ぶ可変長オブジェクトです(<code class="file-ref">src/objects/bytecode-array.h:153-166</code>)。サイズ上限は <code>kMaxSize = 512 MB</code>(<code class="file-ref">src/objects/bytecode-array.h:137</code>)。</p>
+
+<p><code>Interpreter</code>(<code class="file-ref">src/interpreter/interpreter.h:50</code>)は <code>dispatch_table_</code> 配列を持ち(<code class="file-ref">src/interpreter/interpreter.h:113</code>、サイズ <code>kDispatchTableSize = 3 * 256 = 768</code>)、<code>OperandScale</code> ごとにバイトコードハンドラ Code の <code>instruction_start</code> を格納します。<code>Interpreter::GetBytecodeHandler</code>(<code class="file-ref">src/interpreter/interpreter.h:77</code>)が遅延デシリアライズを行います。</p>
+
+<h4>3.3 Sparkplug (baseline) コンパイラ</h4>
+
+<p><code>BaselineCompiler</code>(<code class="file-ref">src/baseline/baseline-compiler.h:51</code>)はバイトコードを 1 命令ずつ走査して macro assembler 経由でほぼ 1 対 1 に native 命令を吐き出す軽量 JIT です。<code>EstimateInstructionSize</code>(<code class="file-ref">src/baseline/baseline-compiler.h:59</code>)でバイト数を推定してから <code>Build</code>(<code class="file-ref">src/baseline/baseline-compiler.h:58</code>)で <code>Code</code> を返します。Baseline の特徴は IC をインライン化せず、依然 FeedbackVector を使うことです。コードは <code>CodeSpace</code>(後述)に置かれます。</p>
+
+<p><code>BytecodeOffsetTableBuilder</code>(<code class="file-ref">src/baseline/baseline-compiler.h:31</code>)が VLQ 圧縮で PC offset と bytecode offset の対応を保持し、デバッガと OSR のために <code>TrustedByteArray</code> に変換されます(<code class="file-ref">src/baseline/baseline-compiler.h:42</code>)。</p>
+
+<h4>3.4 Maglev (mid-tier JIT)</h4>
+
+<p><code>maglev::MaglevCompiler::Compile</code>(<code class="file-ref">src/maglev/maglev-compiler.h:27</code>)はバックグラウンドスレッドから呼べる non-blocking コンパイラで、CFG 構築→グラフ最適化→leg allocation→コード生成という TurboFan 風のパイプラインですが、SSA レベルが浅く、最適化パスが少ないため Sparkplug より速くかつ TurboFan より速くコンパイルできるのが売りです。<code class="file-ref">src/maglev/maglev-graph-builder.cc</code> から <code class="file-ref">src/maglev/maglev-graph-optimizer.cc</code>、<code class="file-ref">src/maglev/maglev-regalloc.cc</code>、<code class="file-ref">src/maglev/maglev-code-generator.cc</code> までが主要な構成要素で、<code>MaglevCompilationInfo</code>(<code class="file-ref">src/maglev/maglev-compilation-info.h</code>)が Isolate と分離した PersistentHandles で zone 上にデータを保持します。</p>
+
+<h4>3.5 TurboFan (top-tier JIT)</h4>
+
+<p><code class="file-ref">src/compiler/</code> 配下に <code class="file-ref">pipeline.cc</code>、<code class="file-ref">turboshaft/</code> (Turboshaft IR)、<code class="file-ref">backend/</code> などが置かれ、複数の IR (TurboFan node graph、Turboshaft graph)、effect-control linearizer、escape analysis、loop optimization、register allocation、code generator を含みます。Sea of Nodes ベースで heap broker (<code class="file-ref">src/compiler/heap-refs.h</code>) を介してメインスレッドのヒープに安全にアクセスします。</p>
+
+<h4>3.6 Code オブジェクトのメモリレイアウト</h4>
+
+<p><code>V8_OBJECT class Code : public ExposedTrustedObject</code>(<code class="file-ref">src/objects/code.h:64</code>)は以下のフィールドを持ちます(<code class="file-ref">src/objects/code.h:391-435</code> の <code>CODE_DATA_FIELDS</code>)。</p>
+
+<p><code>kDeoptimizationDataOrInterpreterDataOffset</code> — Maglev/Turbofan は DeoptimizationData、Baseline は BytecodeArray、それ以外は <code>Smi::zero()</code>。</p>
+<p><code>kPositionTableOffset</code> — Baseline では bytecode offset table、それ以外は source position table。</p>
+<p><code>kWrapperOffset</code> — CodeWrapper (サンドボックス内のタグ付きハンドル)。</p>
+<p><code>kInstructionStreamOffset</code> — 別の code cage 内の <code>InstructionStream</code>。</p>
+<p><code>kInstructionStartOffset</code> — 機械語の生アドレス。</p>
+<p><code>kDispatchHandleOffset</code> — <code>JSDispatchHandle</code>(leaptiering)。</p>
+<p><code>kFlagsOffset</code> — <code>KindField</code>(4 bit) + <code>IsTurbofannedField</code> + <code>MarkedForDeoptimizationField</code> + <code>EmbeddedObjectsClearedField</code> + <code>CanHaveWeakObjectsField</code> 等 (<code class="file-ref">src/objects/code.h:459-468</code>)。</p>
+<p><code>kInstructionSizeOffset</code>, <code>kMetadataSizeOffset</code>, <code>kInlinedBytecodeSizeOffset</code>, <code>kOsrOffsetOffset</code>, <code>kHandlerTableOffsetOffset</code>, <code>kUnwindingInfoOffsetOffset</code>, <code>kConstantPoolOffsetOffset</code>, <code>kCodeCommentsOffsetOffset</code>, <code>kJumpTableInfoOffsetOffset</code>, <code>kParameterCountOffset</code>, <code>kBuiltinIdOffset</code>。</p>
+
+<p>実機械語は <code>InstructionStream</code> オブジェクトの後続バイト列に置かれ、メタデータ(handler table、constant pool、code comments、unwinding info)は同オブジェクト末尾の metadata セクションに連結されます。Embedded builtins は別格で、ELF/PE の <code>.text</code> セクションに焼き込まれた off-heap 命令列を <code>instruction_start</code> で直接参照します(<code class="file-ref">src/objects/code.h:39-50</code> の図解)。</p>
+
+<p><code>Code</code> 自身は Trusted Space に置かれます。<code>InstructionStream</code> は <code>CodeSpace</code>(<code class="file-ref">src/heap/paged-spaces.h:505</code>)または <code>CodeLargeObjectSpace</code>(<code class="file-ref">src/heap/large-spaces.h:197</code>)に配置されます。<code>CodeSpace</code> は <code>EXECUTABLE</code> フラグで作成され、コード固有のページ管理(W^X、ICache flush)を持ちます。<code>CodeLargeObjectSpace::AddPage</code>/<code>RemovePage</code> がコード用大規模ページの管理を担います。</p>
+
+<h4>3.7 階層昇格と TieringManager</h4>
+
+<p><code>TieringManager</code>(<code class="file-ref">src/execution/tiering-manager.cc</code>)の <code>MaybeOptimizeFrame</code>(<code class="file-ref">src/execution/tiering-manager.cc:300</code>)と <code>OnInterruptTick</code>(<code class="file-ref">src/execution/tiering-manager.cc:542</code>)が tier-up を駆動します。</p>
+
+<p>invocation 数の閾値は次のとおりです (<code class="file-ref">src/flags/flag-definitions.h:1137-1165</code>):</p>
+
+<p><code>--invocation-count-for-feedback-allocation = 8</code> (Sparkplug 入り口、FeedbackVector を割り当てる)</p>
+<p><code>--invocation-count-for-maglev = 400</code> (Android では 1000)</p>
+<p><code>--invocation-count-for-maglev-osr = 100</code></p>
+<p><code>--invocation-count-for-turbofan = 3000</code></p>
+<p><code>--invocation-count-for-osr = 500</code></p>
+<p><code>--minimum-invocations-after-ic-update = 500</code></p>
+
+<p><code>InterruptBudgetFor</code>(<code class="file-ref">src/execution/tiering-manager.cc:180-222</code>)は bytecode length を掛け合わせた予算を返し、各 invocation で消費していきます。Profile-Guided Optimization (<code>v8_flags.profile_guided_optimization</code>) が有効なら <code>CachedTieringDecision</code> に応じて値が変動します。</p>
+
+<p>JS 関数自身は <code>JSDispatchTable</code>(<code class="file-ref">src/sandbox/js-dispatch-table.h:179</code>)のエントリを <code>JSDispatchHandle</code> で参照します。tier-up したら <code>SetCodeNoWriteBarrier</code>(<code class="file-ref">src/sandbox/js-dispatch-table.h:218</code>)でエントリの Code ポインタとエントリポイントを差し替えるだけで全 closures がまとめて新しい Code に切り替わります(<code class="file-ref">src/sandbox/js-dispatch-table.h:170-178</code>)。これが leaptiering と呼ばれる仕組みです。</p>
+
+<h3 id="p4-4">4. Deoptimization</h3>
+
+<h4>4.1 Deoptimizer</h4>
+
+<p><code>Deoptimizer</code>(<code class="file-ref">src/deoptimizer/deoptimizer.h:36</code>)は最適化フレームを巻き戻して unoptimized フレーム(Ignition、または Baseline)を再構築するクラスです。<code>Deoptimizer::New</code>(<code class="file-ref">src/deoptimizer/deoptimizer.h:92</code>)が deopt エントリから呼ばれ、<code>ComputeOutputFrames</code>(<code class="file-ref">src/deoptimizer/deoptimizer.h:140</code>)が <code>TranslatedState</code> を用いて出力フレームを構築します。</p>
+
+<pre><code class="language-cpp">DeoptimizeFunction(Tagged&lt;JSFunction&gt;, LazyDeoptimizeReason, Tagged&lt;Code&gt;);
+DeoptimizeAll(Isolate*);
+DeoptimizeMarkedCode(Isolate*);
+DeoptimizeAllOptimizedCodeWithFunction(Isolate*, DirectHandle&lt;SharedFunctionInfo&gt;);
+</code></pre>
+<p>が主要 API です(<code class="file-ref">src/deoptimizer/deoptimizer.h:110-125</code>)。</p>
+
+<p><code>kMaxNumberOfEntries = 16384</code>(<code class="file-ref">src/deoptimizer/deoptimizer.h:167</code>)が deopt エントリ数の上限で、<code>kEagerDeoptExitSize</code>、<code>kLazyDeoptExitSize</code>(<code class="file-ref">src/deoptimizer/deoptimizer.h:175-176</code>)がそれぞれの呼び出しシーケンスのバイト数(プラットフォーム依存)です。Shadow Stack (CET/RISC-V) サポート (<code class="file-ref">src/deoptimizer/deoptimizer.h:155-163</code>) もあります。</p>
+
+<h4>4.2 DeoptimizationData</h4>
+
+<p><code>class DeoptimizationData : public ProtectedFixedArray</code>(<code class="file-ref">src/objects/deoptimization-data.h:271</code>)が Maglev/TurboFan コードに紐づき、deopt 必要時の情報を保持します。レイアウトは:</p>
+
+<pre><code class="language-text">[0] kFrameTranslationIndex        - DeoptimizationFrameTranslation
+[1] kInlinedFunctionCountIndex    - Smi
+[2] kProtectedLiteralArrayIndex   - ProtectedDeoptimizationLiteralArray
+[3] kLiteralArrayIndex            - DeoptimizationLiteralArray
+[4] kOsrBytecodeOffsetIndex
+[5] kOsrPcOffsetIndex
+[6] kOptimizationIdIndex
+[7] kWrappedSharedFunctionInfoIndex
+[8] kInliningPositionsIndex
+[9] kDeoptExitStartIndex
+[10] kEagerDeoptCountIndex
+[11] kLazyDeoptCountIndex
+[12..] {BytecodeOffsetRaw, TranslationIndex, Pc, (NodeId in DEBUG)} * N
+</code></pre>
+<p>(<code class="file-ref">src/objects/deoptimization-data.h:276-300</code>)。<code>kDeoptEntrySize = 3</code>(DEBUG 時は 4)バイト相当の Smi 領域を消費するエントリで、これに <code>IndexForEntry(i) = kFirstDeoptEntryIndex + i * kDeoptEntrySize</code>(<code class="file-ref">src/objects/deoptimization-data.h:378</code>)でアクセスします。<code>ProtectedFixedArray</code> は Trusted Space に置かれるため、サンドボックスからの corruption に強い設計です。</p>
+
+<h4>4.3 TranslatedState とフレーム再構築</h4>
+
+<p><code>TranslatedState</code>、<code>TranslatedFrame</code>、<code>TranslatedValue</code>(<code class="file-ref">src/deoptimizer/translated-state.h:42-52</code>)がそれぞれ最適化フレーム全体、unoptimized 1 フレーム、値 1 個を抽象化します。<code>TranslatedValue</code> の <code>Kind</code>(<code class="file-ref">src/deoptimizer/translated-state.h:78-99</code>)は <code>kTagged</code>, <code>kInt32</code>, <code>kInt64ToBigInt</code>, <code>kFloat</code>, <code>kDouble</code>, <code>kHoleyDouble</code>, <code>kSimd128</code>, <code>kCapturedObject</code>, <code>kDuplicatedObject</code>, <code>kCapturedStringConcat</code> の 14 種類。</p>
+
+<p>deopt 時のメモリ動作は次のとおりです。<code>Deoptimizer::ComputeOutputFrames</code> が <code>DeoptimizationFrameTranslation</code> を読みながら、レジスタ／スタックスロットを <code>TranslatedValue</code> に詰めます。<code>kCapturedObject</code> のような escape analysis で eliminate された JSObject は、<code>MaterializeHeapObjects</code>(<code class="file-ref">src/deoptimizer/deoptimizer.h:137</code>)で実際にヒープアロケーションが発生し、<code>MaterializedObjectStore</code>(<code class="file-ref">src/deoptimizer/materialized-object-store.h</code>)に登録されます。これは「最適化中はオブジェクトを構築せず、deopt 時にはじめてヒープに具現化する」というレイジー戦略であり、deopt は本来のパフォーマンスの観点では高コストです。</p>
+
+<p><code>Deoptimizer::ZapCode</code>(<code class="file-ref">src/deoptimizer/deoptimizer.h:197</code>)は deopt 済み Code を再実行不能にするために命令列を trap 命令で上書きしますが、GC が reloc info を見て参照を辿る可能性を考慮して、<code>RelocIterator</code> で reloc 領域を避けつつ上書きします。<code>EnsureValidReturnAddress</code>(<code class="file-ref">src/deoptimizer/deoptimizer.h:133</code>)は許可リストにある return address でないとクラッシュさせる CFI 防御です。</p>
+
+<h3 id="p4-5">5. V8 Sandbox</h3>
+
+<h4>5.1 仮想メモリ予約サイズ</h4>
+
+<p>サンドボックスは「アタッカーがサンドボックス内のメモリを任意に corrupt できる」ことを攻撃モデルとして、それ以外のメモリへの影響を遮断します(<code class="file-ref">src/sandbox/README.md:5-20</code>)。サイズは OS／アーキ別に決まります(<code class="file-ref">include/v8-internal.h:218-246</code>)。</p>
+
+<pre><code class="language-text">kSandboxSizeLog2 = 40 (1 TB)   通常の 64bit Linux/macOS/Win
+              = 37 (128 GB)   Android, RISC-V, LoongArch
+              = 34 (16 GB)    iOS
+</code></pre>
+
+<p>部分予約モード(partially-reserved sandbox)では <code>kSandboxMinimumReservationSize = 8 GB</code>(<code class="file-ref">include/v8-internal.h:271</code>)まで縮退できます。これは Windows 8.1 以前で <code>VirtualAlloc2</code> が無く 1TB 予約が現実的でない場合の救済策で、<code>Sandbox::Initialize</code>(<code class="file-ref">src/sandbox/sandbox.cc:147</code>)が <code>vas-&gt;CanAllocateSubspaces()</code> で判定し、必要なら <code>InitializeAsPartiallyReservedSandbox</code> にフォールバックします(<code class="file-ref">src/sandbox/sandbox.cc:194</code>)。</p>
+
+<p>ガード領域は <code>kSandboxGuardRegionSize = 32 GB + (kMaxSafeBufferSizeForSandbox + 1)</code>(<code class="file-ref">include/v8-internal.h:296</code>)で、サンドボックス前後に同サイズが確保されます。さらに <code>kAdditionalTrailingGuardRegionSize = 288 GB - kSandboxGuardRegionSize</code>(<code class="file-ref">include/v8-internal.h:312</code>)が末尾に追加され、TypedArray アクセス <code>base + offset + index * element_size</code> でガード域を「飛び越え」られないようにしています。これは crbug.com/40070746 の防御策です。</p>
+
+<p><code>Sandbox::Initialize</code> のレイアウト図(<code class="file-ref">src/sandbox/sandbox.h:50-60</code>):</p>
+
+<pre><code class="language-text">+-+---------+----+-----------------------+---------+-+
+|G|  32 GB  |    |  ArrayBuffer BS,     |  32 GB  | |
+|u| Guard   | 4G | WASM memories,        | Guard   |T|
+|a| Region  |Heap| other sandboxed obj   | Region  |r|
+|r| (front) |    |                       | (back)  |a|
+|d|         |    | (Ideally) 1 TB        |         |i|
++-+---------+----+-----------------------+---------+-+
+  ^                                      ^
+  base                                   end
+</code></pre>
+
+<h4>5.2 Smi address range 予約</h4>
+
+<p><code>Sandbox::Initialize</code> は更にプロセスの最初の 4GB をアクセス不能領域として確保しようとします(<code class="file-ref">src/sandbox/sandbox.cc:309-316</code>)。これは Smi←→HeapObject 混同型バグの defense in depth で、<code>kSmiAddressRange = 4 GB</code>(<code class="file-ref">src/sandbox/sandbox.h:77</code>)と <code>kSmiAddressRangePadding = 4 KB</code>(<code class="file-ref">src/sandbox/sandbox.h:82</code>、<code>JSObject::kMaxInstanceSize</code> より大きい)が定数として定義されます。</p>
+
+<h4>5.3 SandboxedPointer</h4>
+
+<p><code>SandboxedPointer_t = Address</code>(<code class="file-ref">include/v8-internal.h:216</code>)で、サンドボックス内オブジェクトはサンドボックス基点からのオフセットを <code>&lt;&lt; kSandboxedPointerShift</code> (=64-40=24bit シフト) して 64bit に展開された値を保持します(<code class="file-ref">include/v8-internal.h:259</code>)。これにより corrupt しても範囲外を指せません。ArrayBuffer の backing store ポインタなどがこの形式で格納されます(<code class="file-ref">src/sandbox/sandboxed-pointer.h</code>)。</p>
+
+<h4>5.4 External Pointer Table (EPT)</h4>
+
+<p>外部 C++ オブジェクトへの参照は <code>ExternalPointerTable</code>(<code class="file-ref">src/sandbox/external-pointer-table.h:236</code>)経由に置換され、JSObject 内には 32bit handle のみが置かれます。テーブルサイズ(<code class="file-ref">include/v8-internal.h:329-345</code>):</p>
+
+<pre><code class="language-text">kExternalPointerTableReservationSize = 512 MB (デフォルト 64bit)
+                                     = 256 MB (Android)
+                                     = 128 MB (iOS)
+kExternalPointerTableEntrySize = 8 byte
+kMaxExternalPointers = 64M (512MB/8B)
+kExternalPointerIndexShift = 6 (Android は 7、iOS は 8)
+</code></pre>
+
+<p>エントリのレイアウト(<code class="file-ref">src/sandbox/external-pointer-table.h:39-160</code>、<code class="file-ref">include/v8-internal.h:365-373</code>):</p>
+
+<pre><code class="language-text">bit  63 ─ 56 │ 55 │ 54 ─  0
+     ───────┼────┼────────
+     7-bit │ M  │ 48-bit pointer payload
+     type  │bit │
+     tag   │    │
+</code></pre>
+
+<p><code>kExternalPointerTagMask = 0x00fe000000000000</code></p>
+<p><code>kExternalPointerMarkBit = 1ULL &lt;&lt; 48</code></p>
+<p><code>kExternalPointerPayloadMask = 0xff00ffffffffffff</code></p>
+
+<p>ロード時に <code>(payload &amp; ~mark_bit) ^ tag</code> のような操作で untag し、タグが期待と違えば pointer は non-canonical になりクラッシュします。これが type confusion 防御の核心です。</p>
+
+<p>EPT の GC は marking bit を用い、Mark/Sweep の最後に segment 単位で freelist を再構築します。Generational EPT が <code>SURVIVOR_TO_EXTERNAL_POINTER</code> remembered set を用いる仕組みも <code class="file-ref">src/sandbox/external-pointer-table.h:215-228</code> に書かれています。</p>
+
+<p>Compaction は <code>CompactibleExternalEntityTable</code>(<code class="file-ref">src/sandbox/compactible-external-entity-table.h:84</code>)で、segment 単位の evacuation を行います(<code class="file-ref">src/sandbox/compactible-external-entity-table.h:32-82</code> のコメントに詳細なアルゴリズム解説あり)。要旨は、最後 N segment を evacuation area として指定、live entry に対し evacuation entry を新規発行、sweep フェーズで実コピーと handle 更新を行います。<code>kNotCompactingMarker = UINT32_MAX</code>(<code class="file-ref">src/sandbox/compactible-external-entity-table.h:132</code>)と <code>kCompactionAbortedMarker = 0xf0000000</code>(同 141)でステートを表現し、<code>bool should_evacuate = index &gt;= start_of_evacuation_area</code> という単一比較で判定できる設計です。</p>
+
+<h4>5.5 Trusted Pointer Table (TPT)</h4>
+
+<p>EPT が外部 C++ オブジェクト用なのに対し、<code>TrustedPointerTable</code>(<code class="file-ref">src/sandbox/trusted-pointer-table.h:129</code>)は V8 HeapObject ではあるがサンドボックス外(Trusted Space)に置かれるオブジェクトを参照します。サイズ(<code class="file-ref">include/v8-internal.h:900-915</code>):</p>
+
+<pre><code class="language-text">kTrustedPointerTableReservationSize = 64 MB
+kTrustedPointerTableEntrySize = 8 byte
+kMaxTrustedPointers = 8M (64MB/8B)
+kTrustedPointerHandleShift = 9
+</code></pre>
+
+<p>エントリは 48bit ポインタ + 1bit mark + 15bit タグ(<code class="file-ref">src/sandbox/indirect-pointer-tag.h:23-35</code> に図示):</p>
+
+<pre><code class="language-text">kTrustedPointerTableTagMask    = 0xfffe000000000000
+kTrustedPointerTableMarkBit    = 0x0001000000000000
+kTrustedPointerTablePayloadMask= 0x0000ffffffffffff
+kTrustedPointerTableTagShift   = 49
+</code></pre>
+
+<p>タグの定義は <code>enum IndirectPointerTag</code>(<code class="file-ref">src/sandbox/indirect-pointer-tag.h:39-99</code>)にあり、<code>kSharedWasmTrustedInstanceDataIndirectPointerTag</code>、<code>kBytecodeArrayIndirectPointerTag = 0x3f</code>、<code>kCodeIndirectPointerTag = 0x40</code> などが定義されます。タグ範囲 <code>[1, 0x3f]</code> は per-Isolate TPT、<code>0x40</code> は Code 専用、<code>0xfc..0xff</code> は特殊値(Unpublished/Zapped/Evacuation/Free)です(<code class="file-ref">src/sandbox/indirect-pointer-tag.h:50-99</code>)。</p>
+
+<p><code>IsFastIndirectPointerTag</code>(<code class="file-ref">src/sandbox/indirect-pointer-tag.h:108</code>)は「タグが 2 の冪なら untag が単一 AND で済む」というファストパス判定で、<code>kWasmTrustedInstanceDataIndirectPointerTag = 4</code> がファストになるよう調整されています(<code class="file-ref">src/sandbox/indirect-pointer-tag.h:55,186</code>)。</p>
+
+<p><code>kUnpublishedIndirectPointerTag = 0xfc</code>(<code class="file-ref">src/sandbox/indirect-pointer-tag.h:91</code>)は「検証が完了するまでサンドボックスから参照できないようにする」ためのマジック値で、<code>BytecodeArray</code> の <code>MarkVerified</code>(<code class="file-ref">src/objects/bytecode-array.h:150</code>)が Bytecode verifier 通過後に <code>Publish</code> を呼んで切り替えます。</p>
+
+<h4>5.6 Code Pointer Table (CPT)</h4>
+
+<p><code>CodePointerTable</code>(<code class="file-ref">src/sandbox/code-pointer-table.h:114</code>)は Code 専用の特化版 TPT です。サイズ(<code class="file-ref">include/v8-internal.h:942-967</code>):</p>
+
+<pre><code class="language-text">kCodePointerTableReservationSize = 128 MB
+kCodePointerTableEntrySize = 8 byte (Code* + 1bit mark)
+kMaxCodePointers = 16M
+kCodePointerHandleShift = 8
+kCodePointerHandleMarker = 0x1   // TPT handle と区別するマーカー
+</code></pre>
+
+<p>エントリは 2 つの値(Code object pointer + entrypoint)を含み、JSFunction の呼び出しが「テーブル 1 回引きで entrypoint を取得」して直接 jump できる構造です(<code class="file-ref">src/sandbox/code-pointer-table.h:96-112</code>)。<code>IsWriteProtected = true</code>(<code class="file-ref">src/sandbox/code-pointer-table.h:32</code>)で、Intel PKEYs などのハードウェア保護機能があるプラットフォームではプロセス全体に対して write protect された forward-edge CFI を提供します。すなわち「サンドボックス内に任意書き込みが可能なアタッカーでも、Code Pointer Table 経由でしか Code を呼び出せないので、任意関数ガジェットへの jump が原理的に阻まれる」設計です。</p>
+
+<h4>5.7 JSDispatchTable と Leaptiering</h4>
+
+<p><code>JSDispatchTable</code>(<code class="file-ref">src/sandbox/js-dispatch-table.h:179</code>)はサンドボックスの一部ではあるものの、Code Pointer Table と同様に書き込み保護され(<code>JSDispatchEntry::IsWriteProtected</code> ≈ true)、CFI と高速 tiering を両立します(<code class="file-ref">src/sandbox/js-dispatch-table.h:160-178</code>)。各エントリは <code>Address object</code> + <code>Address entrypoint</code> + 16-bit <code>parameter_count</code> で構成され、JSFunction 呼び出し時に parameter count が一致しなければクラッシュさせる検証も入っています。</p>
+
+<h4>5.8 Indirect Pointer</h4>
+
+<p>サンドボックス内オブジェクトが Trusted/Code オブジェクトを指すフィールドは <code>TrustedPointerMember&lt;T, tag&gt;</code>(<code class="file-ref">src/objects/trusted-pointer.h</code>)で、ストレージは <code>IndirectPointerHandle</code>(32bit)です。<code>kCodePointerHandleMarker = 0x1</code>(<code class="file-ref">include/v8-internal.h:958</code>)で TPT handle と CPT handle を低位ビットで識別します。Union 型のフィールド(Code と Trusted の両方を指せる)でも、handle のマーカービットで正しいテーブルを引けます。</p>
+
+<h4>5.9 攻撃シナリオに対する防御</h4>
+
+<p>主な攻撃と防御は以下のとおり整理できます。</p>
+
+<p><strong>Type confusion (JSObject を別 type に解釈し外部関数を呼ぶ)</strong> — External Pointer Table のタグ機構により、JSObject フィールドから取り出した「外部関数ポインタ」は handle 経由でしか引けず、誤った tag では非 canonical アドレスになりクラッシュします(<code class="file-ref">src/sandbox/external-pointer-table.h:184-198</code>)。</p>
+<p><strong>Pointer corruption による outside-of-sandbox write</strong> — ヒープ内ポインタは PtrCompr 32bit またはサンドボックス基点オフセットなので、64bit 範囲外を直接指せません。<code>Sandbox::Contains</code>(<code class="file-ref">src/sandbox/sandbox.h:191</code>)と <code>OutsideSandbox</code>(<code class="file-ref">src/sandbox/sandbox.h:355</code>)が境界判定を提供。</p>
+<p><strong>JIT スプレー / 任意関数呼び出し</strong> — Code Pointer Table のエントリは write-protected な領域に置かれ、サンドボックス内アタッカーでも書き換えできません(<code class="file-ref">src/sandbox/code-pointer-table.h:106-112</code>)。</p>
+<p><strong>Smi←→HeapObject 混同による NULL→arbitrary read</strong> — プロセス最初の 4GB をガード予約することで Smi 値(最大 ~2^32)を dereference するクラッシュを保証(<code class="file-ref">src/sandbox/sandbox.cc:309-316</code>)。</p>
+<p><strong>ArrayBuffer OOB → サンドボックス境界突破</strong> — <code>kMaxSafeBufferSizeForSandbox = 32 GB - 1</code>(<code class="file-ref">include/v8-internal.h:281</code>)に制限し、<code>kBoundedSizeShift = 29</code> で size を上位ビットにシフトしたエンコーディングで保持(<code class="file-ref">include/v8-internal.h:283-288</code>)。これに 32GB + 288GB のガード領域を合わせ、TypedArray index 計算で <code>base + offset + index * 8</code> がガード域に着地するよう仕掛けてあります。</p>
+<p><strong>Bytecode 偽造による任意命令実行</strong> — Bytecode array は Trusted Space + <code>kUnpublishedIndirectPointerTag</code> で隔離され、<code>BytecodeVerifier</code>(<code class="file-ref">src/sandbox/bytecode-verifier.h</code>)通過後にしか publish されません。</p>
+
+<h3 id="p4-6">6. Embedded Builtins / Snapshot</h3>
+
+<h4>6.1 Embedded Builtins</h4>
+
+<p><code>EmbeddedData</code>(<code class="file-ref">src/snapshot/embedded/embedded-data.h:55</code>)は約 700KB の組み込み builtin コードを ELF/PE の <code>.text</code>/<code>.rodata</code> セクションに静的データとして埋め込み、起動時にコピー不要で実行可能にします。<code>OffHeapInstructionStream::PcIsOffHeap</code>(<code class="file-ref">src/snapshot/embedded/embedded-data.h:28</code>)が現在の PC が embedded 領域内か判定し、<code>TryLookupCode</code>(同:38)で builtin ID を返します。</p>
+
+<p>Short builtin calls(<code class="file-ref">src/snapshot/embedded/embedded-data.h:86-104</code>)は、Wasm 呼び出しのように far call が必要な場合、Isolate ごとに builtin を un-embedding してプロセス内コードレンジに再配置する仕組みで、近接 jump で呼べるようにします。詳細は crbug.com/v8/11527。</p>
+
+<h4>6.2 Shared Read-Only Heap</h4>
+
+<p><code>ReadOnlyHeap</code>(<code class="file-ref">src/heap/read-only-heap.h:36</code>)はプロセス内全 Isolate で共有可能な ReadOnlySpace を持ち、<code>SetUp</code>(<code class="file-ref">src/heap/read-only-heap.h:54</code>)で <code>read_only_snapshot_data</code> をデシリアライズします。RO 領域に置かれる典型例は ReadOnlyRoots(<code class="file-ref">src/roots/roots.h:545</code>、約 数百個の <code>kReadOnlyRootsCount</code> エントリ)、Map、文字列定数、Symbol、prototype 用の標準 Map などです。</p>
+
+<p><code>#ifdef V8_ENABLE_SANDBOX</code> 時には RO ヒープも独自の <code>CodePointerTable::Space code_pointer_space_</code> を持ち(<code class="file-ref">src/heap/read-only-heap.h:117-120</code>)、RO 領域内に置かれた builtin Code に対応する CPT エントリを永続的に保持します。</p>
+
+<p>RO Heap の共有は <code>CreateInitialHeapForBootstrapping</code>(<code class="file-ref">src/heap/read-only-heap.h:96</code>)で 1 回だけ生成し、それ以降の Isolate は <code>InitializeIsolateRoots</code>(<code class="file-ref">src/heap/read-only-heap.h:86</code>)で参照を取得するだけです。これによりプロセス内 N 個の Isolate を作っても RO データはほぼ単一物理メモリで共有できます。</p>
+
+<h3 id="p4-7">7. Code Caching / Off-thread Compile</h3>
+
+<h4>7.1 BackgroundCompileTask</h4>
+
+<p><code>BackgroundCompileTask</code>(<code class="file-ref">src/codegen/compiler.h:587</code>)は script streaming/parse/compile をバックグラウンドスレッドで行うためのタスクオブジェクトです。<code>Run</code>(<code class="file-ref">src/codegen/compiler.h:611</code>)は LocalIsolate で動作し、<code>PersistentHandles</code>(<code class="file-ref">src/codegen/compiler.h:648</code>)を用いてメインスレッドの Isolate に依存せずにオブジェクトを生成します。最終的に <code>FinalizeScript</code>/<code>FinalizeFunction</code>(<code class="file-ref">src/codegen/compiler.h:622, 627</code>)でメインスレッドに合流し、グローバル Isolate に書き込みます。</p>
+
+<h4>7.2 Script Streaming Data</h4>
+
+<p><code>ScriptStreamingData</code>(<code class="file-ref">src/codegen/compiler.h:669</code>)は <code>ExternalSourceStream</code>(embedder 提供)からのチャンクをバッファリングし、parser に逐次供給します。Chromium はネットワークから HTML/JS をダウンロードしながら同時に parse/compile することで、TTI を短縮します。</p>
+
+<h4>7.3 Code Cache</h4>
+
+<p><code class="file-ref">src/codegen/compilation-cache.h</code> の <code>CompilationCache</code> がスクリプトソース文字列・ScriptDetails をキーに、<code>SharedFunctionInfo</code> をキャッシュします。永続キャッシュは <code class="file-ref">src/snapshot/code-serializer.cc</code> でディスクへシリアライズ・デシリアライズします(Chromium の HTTP cache メタデータに保存される <code>CachedData</code>)。</p>
+
+<h3 id="p4-8">8. Embedder API のメモリ管理</h3>
+
+<h4>8.1 Isolate::CreateParams</h4>
+
+<p><code>v8::Isolate::CreateParams</code>(<code class="file-ref">include/v8-isolate.h:296-371</code>)は Isolate 構築時の設定構造体で、メモリ周りの主要フィールドは:</p>
+
+<p><code>array_buffer_allocator</code> (<code class="file-ref">include/v8-isolate.h:343</code>) — ArrayBuffer backing store の <code>malloc</code>/<code>free</code> を embedder が提供。</p>
+<p><code>array_buffer_allocator_shared</code> (<code class="file-ref">include/v8-isolate.h:344</code>) — <code>shared_ptr</code> 版で BackingStore が allocator を保持。</p>
+<p><code>constraints</code> (<code class="file-ref">include/v8-isolate.h:311</code>) — <code>ResourceConstraints</code>、ヒープサイズの上限・下限。</p>
+<p><code>snapshot_blob</code> (<code class="file-ref">include/v8-isolate.h:317</code>) — 起動時の起動スナップショット blob。</p>
+<p><code>cpp_heap</code> (<code class="file-ref">include/v8-isolate.h:370</code>) — CppHeap (<code>v8::CppHeap</code>) を渡すと Isolate がオーナーになり、Oilpan ベースの C++ オブジェクトを管理。</p>
+
+<h4>8.2 Handle と HandleScope</h4>
+
+<p><code>HandleBase</code>(<code class="file-ref">src/handles/handles.h:57</code>)は 1 ポインタ <code>Address* location_</code> を持つだけの薄いラッパで、これが GC roots として <code>Heap</code> から強参照として扱われます。<code>Handle&lt;T&gt;</code>(<code class="file-ref">src/handles/handles.h:150</code>)は型付きの派生クラス。</p>
+
+<p><code>HandleScope</code>(<code class="file-ref">src/handles/handles.h:263</code>)はスタック上に確保され、<code>Isolate</code> の <code>HandleScopeData</code> の <code>next_</code> / <code>limit_</code> ポインタを保存し、デストラクタで巻き戻す RAII オブジェクトです(<code class="file-ref">src/handles/handles.h:319-321</code>)。<code>CreateHandle</code>(<code class="file-ref">src/handles/handles.h:287</code>)が <code>next_ &lt; limit_</code> であれば 1 ポインタ進めて <code>Address*</code> を返し、足りなければ <code>Extend</code>(<code class="file-ref">src/handles/handles.h:331</code>)でブロックを増やします。<code>kCheckHandleThreshold = 30 * 1024</code>(<code class="file-ref">src/handles/handles.h:315</code>)。これにより handles の確保は通常パスで pointer-bump 1 命令、解放はスコープ終端で base ポインタを戻すだけと極めて高速です。</p>
+
+<p><code>DirectHandle</code>(<code>#ifdef V8_ENABLE_DIRECT_HANDLE</code>、<code class="file-ref">src/handles/handles.h:31</code>)は間接参照を廃した直値型ハンドルで、conservative stack scanning と合わせて使うことで <code>HandleScope</code> の cell 確保すら不要にする実験的仕組みです。</p>
+
+<h4>8.3 LocalHandles / PersistentHandles</h4>
+
+<p><code>LocalHandles</code>(<code class="file-ref">src/handles/local-handles.h</code>)はバックグラウンドスレッド (LocalIsolate) 用のハンドルです。<code>PersistentHandles</code>(<code class="file-ref">src/handles/persistent-handles.h</code>)はスレッド境界をまたいでハンドルを持ち越せる単位で、<code>BackgroundCompileTask::NewPersistentHandle</code>(<code class="file-ref">src/codegen/compiler.h:617</code>)が新しい IndirectHandle を発行します。</p>
+
+<h4>8.4 Direct Handle vs Indirect Handle</h4>
+
+<p><code>indirect_handle</code>(<code class="file-ref">src/handles/handles.h:108-118</code>)はビルド設定により direct→indirect 変換を行い、<code>V8_ENABLE_DIRECT_HANDLE</code> の有無で API のメモリ動作が大きく変わります(特に Conservative Stack Scanning の前提)。</p>
+
+<h3 id="p4-9">9. Persistent / Global Handle</h3>
+
+<h4>9.1 GlobalHandles</h4>
+
+<p><code>GlobalHandles</code>(<code class="file-ref">src/handles/global-handles.h:30</code>)は HandleScope 外で生き続けるハンドルを管理します。内部実装は <code>NodeSpace&lt;Node&gt;</code> のテーブル(<code class="file-ref">src/handles/global-handles.h:156</code>)で、Node ブロック単位でメモリを確保し、各 Node が 1 個のハンドルを表現します。<code>Create</code>(<code class="file-ref">src/handles/global-handles.h:74</code>)が Node を確保し、<code>Destroy</code>(<code class="file-ref">src/handles/global-handles.h:46</code>)が解放します。</p>
+
+<p>弱参照は <code>MakeWeak</code>(<code class="file-ref">src/handles/global-handles.h:57</code>)で、<code>WeakCallbackInfo&lt;void&gt;::Callback</code> と <code>WeakCallbackType</code> を指定します。GC が「弱参照しか指していない」と判断したノードはコールバックが 2 段階で呼ばれ(<code>InvokeFirstPassWeakCallbacks</code>、<code>InvokeSecondPassPhantomCallbacks</code>、<code class="file-ref">src/handles/global-handles.h:82-83</code>)、phantom weak の場合は callback 起動前にハンドル値が Smi にクリアされます。</p>
+
+<p><code>young_nodes_</code>(<code class="file-ref">src/handles/global-handles.h:159</code>)は若い世代の Node を別途追跡し、Scavenger が高速にイテレートできるようにします。<code>IterateYoungStrongAndDependentRoots</code>(<code class="file-ref">src/handles/global-handles.h:104</code>)と <code>ProcessWeakYoungObjects</code>(<code class="file-ref">src/handles/global-handles.h:109</code>)がその機構です。</p>
+
+<h4>9.2 EternalHandles</h4>
+
+<p><code>EternalHandles</code>(<code class="file-ref">src/handles/global-handles.h:192</code>)は決して解放されないハンドルで、プロセス終了まで生存します。<code>Create</code>(<code class="file-ref">src/handles/global-handles.h:200</code>)でインデックスを発行し、<code>Get(int index)</code>(<code class="file-ref">src/handles/global-handles.h:204</code>)で取得します。内部は <code>kSize = 256</code> 個ずつのブロックを vector で持ち、<code>index &gt;&gt; 8</code> でブロックを、<code>index &amp; 0xff</code> でブロック内オフセットを得ます(<code class="file-ref">src/handles/global-handles.h:219-228</code>)。Eternal の使い所は private symbol や標準的な API テンプレートのように Isolate の生存期間中保持し続けるオブジェクトです。</p>
+
+<h4>9.3 GlobalHandleVector</h4>
+
+<p><code>GlobalHandleVector&lt;T&gt;</code>(<code class="file-ref">src/handles/global-handles.h:239</code>)は std::vector の表面を持ちつつ、要素アドレス(<code>Address</code>)を <code>StrongRootAllocator</code> 経由で確保して GC 強参照として扱う巧妙なクラスです。動的サイズで GlobalHandle を管理したい場面(例えば background job が任意個の IndirectHandle を作る)で使われます。</p>
+
+<h4>9.4 TracedHandle</h4>
+
+<p><code class="file-ref">src/handles/traced-handles.h</code> の <code>TracedHandle</code> は Oilpan / Blink との連携用で、C++ の <code>Persistent&lt;T&gt;</code> 相当を効率的に処理し、unified heap GC でメインヒープと合わせてマーキングされます。</p>
+
+<h3 id="p4-10">10. 補足: Heap Spaces 概観</h3>
+
+<p>最後に主要ヒープ空間を整理します。</p>
+
+<p><strong>NewSpace / NewLargeObjectSpace</strong> — 新世代、Scavenger の対象。</p>
+<p><strong>OldSpace</strong> — 古世代、Mark-Sweep-Compact / Mark-Compact 対象。</p>
+<p><strong>CodeSpace</strong> (<code class="file-ref">src/heap/paged-spaces.h:505</code>) / <strong>CodeLargeObjectSpace</strong> (<code class="file-ref">src/heap/large-spaces.h:197</code>) — 実行可能ページ。<code>EXECUTABLE</code> フラグ付き。</p>
+<p><strong>SharedSpace</strong> (<code class="file-ref">src/heap/paged-spaces.h:517</code>) — マルチ Isolate 共有 (<code>--shared-string-table</code> 等)。</p>
+<p><strong>TrustedSpace</strong> (<code class="file-ref">src/heap/paged-spaces.h:532</code>) / <strong>TrustedLargeObjectSpace</strong> (<code class="file-ref">src/heap/large-spaces.h:166</code>) — サンドボックス外。BytecodeArray、Code、DeoptimizationData (ProtectedFixedArray) が住む。</p>
+<p><strong>SharedTrustedSpace</strong> (<code class="file-ref">src/heap/paged-spaces.h:541</code>) / <strong>SharedTrustedLargeObjectSpace</strong> (<code class="file-ref">src/heap/large-spaces.h:172</code>) — 共有された trusted。</p>
+<p><strong>ReadOnlySpace</strong> — <code>ReadOnlyHeap</code> 配下、Map・builtin Code・Roots。</p>
+
+<p>サンドボックス有効時の物理配置は概念的には:</p>
+
+<pre><code class="language-text">[Sandbox 1TB]                       [Outside sandbox]
+  ├─ PtrCompr Cage (4GB)               ├─ Trusted Space (HeapObjects)
+  │   ├─ NewSpace                      ├─ Code Pointer Table (128MB)
+  │   ├─ OldSpace                      ├─ Trusted Pointer Table (64MB)
+  │   ├─ CodeSpace (...)               ├─ External Pointer Table (512MB)
+  │   └─ ReadOnlySpace                 ├─ JSDispatchTable
+  └─ ArrayBuffer backing stores        └─ Embedded builtins (.text)
+</code></pre>
+
+<p>となります。CodeSpace は「サンドボックス内」にあるものの、Code オブジェクト(メタ情報)は Trusted Space に隔離されているため、InstructionStream の中身がサンドボックス corruption で書き換えられても、Code そのものの kind/handler offsets/deopt data は corrupt 困難という二重防御です。</p>
+
+<h3 id="p4-11">11. 参照ファイル一覧(抜粋)</h3>
+
+<p><code class="file-ref">/home/user/v8/src/ic/ic.h</code>, <code class="file-ref">/home/user/v8/src/ic/ic.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/ic/handler-configuration.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/feedback-vector.h</code>, <code class="file-ref">/home/user/v8/src/objects/feedback-vector.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/map.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/transitions.h</code>, <code class="file-ref">/home/user/v8/src/objects/transitions.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/allocation-site.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/code.h</code>, <code class="file-ref">/home/user/v8/src/objects/code-kind.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/bytecode-array.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/deoptimization-data.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/property-details.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/common/globals.h</code> (InlineCacheState 等)</p>
+<p><code class="file-ref">/home/user/v8/src/common/segmented-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/flags/flag-definitions.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/interpreter/interpreter.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/baseline/baseline-compiler.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/maglev/maglev.h</code>, <code class="file-ref">/home/user/v8/src/maglev/maglev-compiler.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/compiler/</code> (TurboFan)</p>
+<p><code class="file-ref">/home/user/v8/src/deoptimizer/deoptimizer.h</code>, <code class="file-ref">/home/user/v8/src/deoptimizer/translated-state.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/execution/tiering-manager.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/sandbox.h</code>, <code class="file-ref">/home/user/v8/src/sandbox/sandbox.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/external-pointer-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/trusted-pointer-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/code-pointer-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/js-dispatch-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/indirect-pointer-tag.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/compactible-external-entity-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/README.md</code></p>
+<p><code class="file-ref">/home/user/v8/include/v8-internal.h</code> (kSandboxSize 等の主要定数)</p>
+<p><code class="file-ref">/home/user/v8/include/v8-isolate.h</code> (CreateParams)</p>
+<p><code class="file-ref">/home/user/v8/src/handles/handles.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/handles/global-handles.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/paged-spaces.h</code>, <code class="file-ref">/home/user/v8/src/heap/large-spaces.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/read-only-heap.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/snapshot/embedded/embedded-data.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/codegen/compiler.h</code></p>
+
+<p>各ファイル・行番号は本稿執筆時点の <code>/home/user/v8</code> チェックアウトに基づきます。</p>
+
+</section>
+

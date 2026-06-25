@@ -1,0 +1,12 @@
+<h2 id="section-10">10. FlattenIntoArraySlow と仕様準拠</h2>
+
+<p><code>FlattenIntoArraySlow</code> (行 438-498) は仕様文のステップ番号 (a, b, i, ii, iii, ...) をそのままコメントで残しながら逐語訳しています。Property の存在確認に行 452 で <code>HasProperty(source, sourceIndex)</code> を呼び、これは仕様の <code>HasProperty</code> 抽象操作で、proxy であれば <code>[[HasProperty]]</code> トラップが発火し、通常オブジェクトでもプロトタイプチェーンを辿る <code>LookupIterator</code> が走ります。</p>
+
+<p>値取得は行 456 の <code>GetProperty(source, sourceIndex)</code> で、これも generic property lookup で proxy トラップ、getter、プロトタイプチェーン経由のフォールバックすべてを処理します。<code>IsArray</code> 判定は行 469 の <code>ArrayIsArray_Inline(element)</code> で、JSArray には true、JSProxy に対しては <code>runtime::ArrayIsArray</code> で C++ ランタイムに飛んでハンドラチェーンを辿り、それ以外は false を返します。</p>
+
+<p>fast path との対比で遅さの原因を挙げると、第一に要素アクセスごとに少なくとも <code>HasProperty + GetProperty</code> の 2 回の <code>LookupIterator</code> を起動する点で、これは tagged pointer の add とロードで済む fast path の <code>LoadElementNoHole</code> と比べて 1 オーダー以上重い処理です。第二に <code>IsArray</code> 判定が proxy 経路で <code>runtime::ArrayIsArray</code> ランタイム呼び出しを呼ぶ点で、ランタイム呼び出しは C++ stub への遷移コストが大きく、これだけでも数十ナノ秒オーダーかかります。第三に行 478-479 の再帰が <code>FlattenIntoArrayWithoutMapFn</code> builtin への明示呼び出しで、builtin の呼び出しコスト (パラメータ詰め替え、フレーム作成、<code>PerformStackCheck</code>) を毎階層支払うことです。第四に ElementsKind 最適化が一切効かない点で、結果格納先は <code>ArraySpeciesCreate(context, o, 0)</code> で作られた長さ 0 の PACKED_SMI 配列に対し <code>FastCreateDataProperty(target, targetIndex, element)</code> を 1 要素ずつ呼びます。これは Define Own Property を経由するためデフォルトの fast property add でも <code>LookupIterator</code> を内部で使い、要素ごとに ElementsKind 遷移と elements backing store の拡張・再配置を引き起こす可能性があります。</p>
+
+<p><code>FastCreateDataProperty</code> (<code class="file-ref">src/builtins/base.tq</code> 行 2083-2157) は append 専用 fast path とそれ以外の slow path に分かれます。fast path は receiver が <code>FastJSArray</code>、key が non-negative Smi、index が length 以下という条件をすべて満たすときに、<code>array.length</code> と等しければ append、そうでなければ index への直接書き込みを行います。Smi elements であれば value も Smi でなければスローに落ち、double elements であれば Number でなければ落ち、という形で kind 移行を回避します。スローパスは label Slow で集約され <code>CreateDataProperty(receiver, key, value)</code> ランタイムを呼びます。</p>
+
+<hr/>
+

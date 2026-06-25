@@ -1,0 +1,90 @@
+<h2 id="appendix-a">付録 A 参考リンクとファイル一覧</h2>
+
+<p>V8 リポジトリ内の主要参照先は次のとおりです。</p>
+
+<p>公式ドキュメント</p>
+<ul>
+<li><code>docs/torque/user-manual.md</code> (ユーザーマニュアル)</li>
+<li><code>docs/torque/architecture.md</code> (アーキテクチャ概説)</li>
+<li><code>agents/skills/torque/SKILL.md</code> (Torque スキル)</li>
+</ul>
+
+<p>Torque コンパイラ本体 (<code>src/torque/</code>、約 26,000 行 C++)</p>
+<ul>
+<li><code>torque.cc</code> (エントリポイント)</li>
+<li><code>torque-compiler.cc/h</code> (パイプライン)</li>
+<li><code>torque-parser.cc/h</code> (文法定義)</li>
+<li><code>earley-parser.cc/h</code> (Earley パーサ実装)</li>
+<li><code>ast.h</code> (AST 定義)</li>
+<li><code>types.h</code>、<code>type-oracle.cc/h</code> (型システム)</li>
+<li><code>type-inference.cc/h</code> (型推論)</li>
+<li><code>declaration-visitor.cc/h</code></li>
+<li><code>implementation-visitor.cc/h</code> (主要なコード生成ロジック、4,450 行)</li>
+<li><code>cfg.cc/h</code> (制御フローグラフ)</li>
+<li><code>instructions.cc/h</code> (中間表現)</li>
+<li><code>torque-code-generator.cc/h</code> (共通基底)</li>
+<li><code>csa-generator.cc/h</code> (CSA バックエンド、1,085 行)</li>
+<li><code>cc-generator.cc/h</code> (CC バックエンド、528 行)</li>
+<li><code>tsa-generator.cc/h</code> (TSA バックエンド、1,808 行)</li>
+<li><code>class-debug-reader-generator.cc</code></li>
+<li><code>instance-type-generator.cc</code></li>
+<li><code>kythe-data.cc/h</code>、<code>server-data.cc/h</code> (LSP、Kythe)</li>
+</ul>
+
+<p>Torque ファイル (ビルトイン、<code>src/builtins/*.tq</code>、157 ファイル)</p>
+<ul>
+<li><code>base.tq</code> (型システムと演算子オーバーロードの宝庫)</li>
+<li><code>torque-internal.tq</code> (intrinsic と Reference/Slice の基盤)</li>
+<li><code>cast.tq</code> (Cast、UnsafeCast、Is の実装)</li>
+<li><code>convert.tq</code> (Convert と FromConstexpr の特殊化)</li>
+<li><code>array-map.tq</code>、<code>array-foreach.tq</code>、<code>array-from.tq</code>、<code>array-filter.tq</code> (Array 系)</li>
+<li><code>promise-then.tq</code>、<code>promise-abstract-operations.tq</code> (Promise 系)</li>
+<li><code>iterator.tq</code>、<code>iterator-from.tq</code>、<code>iterator-helpers.tq</code> (Iterator 系)</li>
+<li><code>typed-array.tq</code>、<code>typed-array-foreach.tq</code>、<code>typed-array-slice.tq</code> (TypedArray 系)</li>
+<li><code>proxy-get-property.tq</code> (Proxy)</li>
+</ul>
+
+<p>Torque ファイル (オブジェクト、<code>src/objects/*.tq</code>、86 ファイル)</p>
+<ul>
+<li><code>heap-object.tq</code>、<code>map.tq</code>、<code>js-objects.tq</code>、<code>js-array.tq</code></li>
+<li><code>fixed-array.tq</code>、<code>property-array.tq</code>、<code>string.tq</code>、<code>heap-number.tq</code></li>
+<li><code>js-array-buffer.tq</code>、<code>bytecode-array.tq</code>、<code>trusted-object.tq</code></li>
+</ul>
+
+<p>CodeStubAssembler および TurboShaft</p>
+<ul>
+<li><code>src/codegen/code-stub-assembler.h/cc</code></li>
+<li><code>src/codegen/tnode.h</code></li>
+<li><code>src/codegen/turboshaft-builtins-assembler-inl.h</code></li>
+<li><code>src/compiler/code-assembler.h</code></li>
+<li><code>src/compiler/turboshaft/assembler.h</code>、<code>pipelines.cc</code>、<code>phase.h</code></li>
+<li><code>src/compiler/turboshaft/builtin-compiler.cc/h</code></li>
+</ul>
+
+<p>ビルド統合</p>
+<ul>
+<li><code>BUILD.gn</code> (<code>run_torque</code> テンプレート周辺、L2407-2520、<code>torque_files</code> L2072-2299)</li>
+<li><code>BUILD.bazel</code>、<code>bazel/defs.bzl</code></li>
+<li><code>src/snapshot/mksnapshot.cc</code></li>
+<li><code>src/builtins/setup-builtins-internal.cc</code></li>
+<li><code>src/builtins/builtins-definitions.h</code></li>
+</ul>
+
+<p>テスト</p>
+<ul>
+<li><code>test/torque/test-torque.tq</code> (1,213 行)</li>
+<li><code>test/unittests/torque/torque-unittest.cc</code> ほか</li>
+<li><code>test/cctest/torque/test-torque.cc</code></li>
+<li><code>test/mjsunit/</code></li>
+</ul>
+
+<p>外部リソース</p>
+<ul>
+<li>TC39 仕様 <code>https://tc39.es/ecma262/</code> (Torque の対応コメントを追うためのリファレンス)</li>
+<li><code>https://v8.dev/blog/csa</code> (CSA 公式記事)</li>
+<li><code>https://v8.dev/blog/array-prototype-filter</code> 等の V8 公式ブログ (ビルトインの最適化ストーリー)</li>
+<li><code>https://github.com/v8/vscode-torque</code> (VSCode 拡張)</li>
+</ul>
+
+<hr>
+

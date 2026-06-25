@@ -1,0 +1,193 @@
+<h2 id="chapter-6">第 6 章 CodeStubAssembler と TurboShaft への統合</h2>
+
+<p>Torque は CodeStubAssembler (CSA) を経由して TurboFan IR にコードを供給します。本章では CSA 自身の役割と、Torque 経由でどう統合されるかを掘り下げます。</p>
+
+<h3 id="sec-6-1">6.1 CodeStubAssembler (CSA)</h3>
+
+<p>CSA は <code class="file-ref">src/codegen/code-stub-assembler.h:70</code> で定義される C++ クラスです。</p>
+
+<pre><code class="language-cpp">class V8_EXPORT_PRIVATE CodeStubAssembler
+    : public compiler::CodeAssembler,
+      public TorqueGeneratedExportedMacrosAssembler {
+</code></pre>
+
+<p><code>TorqueGeneratedExportedMacrosAssembler</code> は Torque がビルド時に自動生成するクラスで、<code>@export</code> が付いた Torque マクロが C++ メソッドとして露出します (<code class="file-ref">implementation-visitor.cc:4312-4318</code>)。</p>
+
+<p>CSA は「stateless」で、すべての状態は <code>CodeAssemblerState</code> (Zone、Graph、Schedule、CallDescriptor) に持たせる設計です。CSA メソッドの第一引数として渡されます。</p>
+
+<p>CSA は Smi の untag / tag、HeapObject の Map ロード、Smi 演算、Tagged 比較、ブロック構造、ループ、Phi 関数まですべて C++ API で抽象化しており、Torque ユーザはアーキテクチャや Smi 表現を気にせず書けます。</p>
+
+<p>SmiArithmetic の生成は次のような形をしています (<code class="file-ref">code-stub-assembler.h:429-447</code>)。</p>
+
+<pre><code class="language-cpp">#define SMI_ARITHMETIC_BINOP(SmiOpName, IntPtrOpName, Int32OpName)          \
+  TNode&lt;Smi&gt; SmiOpName(TNode&lt;Smi&gt; a, TNode&lt;Smi&gt; b) {                        \
+    if (SmiValuesAre32Bits()) {                                             \
+      return BitcastWordToTaggedSigned(                                     \
+          IntPtrOpName(BitcastTaggedToWordForTagAndSmiBits(a),              \
+                       BitcastTaggedToWordForTagAndSmiBits(b)));            \
+    } else {                                                                \
+      ...                                                                   \
+    }                                                                       \
+  }
+SMI_ARITHMETIC_BINOP(SmiAdd, IntPtrAdd, Int32Add)
+SMI_ARITHMETIC_BINOP(SmiSub, IntPtrSub, Int32Sub)
+</code></pre>
+
+<h3 id="sec-6-2">6.2 TNode&lt;T&gt;</h3>
+
+<p><code>TNode&lt;T&gt;</code> は <code class="file-ref">src/codegen/tnode.h:394</code> に定義されており、内部は単なる <code>compiler::Node*</code> の薄いラッパです。</p>
+
+<pre><code class="language-cpp">template &lt;class T&gt;
+class TNode {
+ public:
+  template &lt;class U&gt;
+  TNode(const TNode&lt;U&gt;&amp; other) V8_NOEXCEPT
+    requires(is_subtype&lt;U, T&gt;::value)
+      : node_(other.node_) { ... }
+  operator compiler::Node*() const { return node_; }
+  static TNode UncheckedCast(compiler::Node* node) { return TNode(node); }
+};
+</code></pre>
+
+<p><code>is_subtype</code> による暗黙変換制約があるため、<code>TNode&lt;Smi&gt;</code> から <code>TNode&lt;Object&gt;</code> へは自動的に通るが逆は通らない、というように V8 のオブジェクト階層に沿った型安全性を C++ コンパイル時に保証できます。型タグは tnode.h の 26 行目以降にあり、<code>WordT</code>, <code>Int32T</code>, <code>RawPtrT</code>, <code>IntPtrT</code> などのマシン型と、<code>Smi</code>、<code>HeapObject</code>、<code>JSArray</code> などのタグ付き型がツリーをなしています。</p>
+
+<h3 id="sec-6-3">6.3 Variable と Label</h3>
+
+<p>CSA のローカル変数とラベルは Turbofan の SSA 構造をユーザから隠すための仕組みで、内部的には基本ブロック先頭での φ 関数の作成に展開されます。</p>
+
+<pre><code class="language-cpp">// code-assembler.h:487-490
+using Label = CodeAssemblerLabel;
+template &lt;class T&gt;
+using TVariable = TypedCodeAssemblerVariable&lt;T&gt;;
+</code></pre>
+
+<p>利用イメージは <code class="file-ref">code-stub-assembler-inl.h:95-145</code> の <code>FastCloneJSObject</code> が良い例です。</p>
+
+<pre><code class="language-cpp">Label done_copy_properties(this), done_copy_elements(this);
+TVARIABLE((Union&lt;FixedArray, PropertyArray&gt;), var_properties,
+          EmptyFixedArrayConstant());
+GotoIf(TaggedIsSmi(source_properties), &amp;done_copy_properties);
+GotoIf(IsEmptyFixedArray(source_properties), &amp;done_copy_properties);
+// ...
+Goto(&amp;done_copy_properties);
+BIND(&amp;done_copy_properties);
+</code></pre>
+
+<p><code>compiler::CodeAssemblerLabel</code> は分岐先のラベルで、<code>kDeferred</code> フラグ付きで生成されると寒い経路として末尾に配置されます。</p>
+
+<p><code>compiler::CodeAssemblerParameterizedLabel&lt;...&gt;</code> は Phi 引数付きのラベルで、Torque の Phi 値 (block input definitions) はこのテンプレート引数として渡されます。</p>
+
+<h3 id="sec-6-4">6.4 Torque が生成する CSA コードのパターン</h3>
+
+<p><code class="file-ref">csa-generator.cc:25-40</code> の EmitGraph は前述したように Block ごとに ParameterizedLabel を作ります。</p>
+
+<p>各 Block は ParameterizedLabel として宣言され、Torque のスタックスロット (Phi になっているもの) が型パラメータとして渡されます。<code>Branch</code> / <code>Goto</code> の生成では、Phi 化されているスロットだけが分岐先ラベルへの引数として渡されます。これは「スタックマシン的な動き」を SSA Phi に正しく変換するためです。</p>
+
+<p><code>Otherwise/label への Goto</code> は <code>CallCsaMacroAndBranchInstruction</code> として表現され、呼び出し先のラベルごとに <code>compiler::CodeAssemblerLabel</code> を用意して、<code>ca_.Bind(&amp;label)</code> で受けてから対応するブロックへ <code>ca_.Goto</code> する、というパターンに翻訳されます (<code class="file-ref">csa-generator.cc:368-488</code>)。</p>
+
+<p>例外ハンドラと catch は CSA の <code>compiler::ScopedExceptionHandler</code> を使った RAII で実装されます。<code class="file-ref">csa-generator.cc:659-711</code> に <code>PreCallableExceptionPreparation</code> と <code>PostCallableExceptionPreparation</code> があり、呼び出しの直前にハンドララベルをスコープに登録し、呼び出し後に <code>if (catch_name__label.is_used())</code> で実際に到達可能かを判定するコードを吐きます。</p>
+
+<h3 id="sec-6-5">6.5 Intrinsic の特別扱い</h3>
+
+<p>Torque の <code>%</code> で始まるシンボルは intrinsic と呼ばれ、CSAGenerator の <code>EmitInstruction(const CallIntrinsicInstruction&amp;)</code> (<code class="file-ref">csa-generator.cc:176-315</code>) に直接ハードコードされた処理が走ります。</p>
+
+<p><code>%RawDownCast&lt;T&gt;(x)</code> は型階層上のダウンキャストをチェックなしで行う intrinsic で、CSA 側では <code>TORQUE_CAST</code> または <code>ca_.UncheckedCast&lt;...&gt;</code> に展開されます。</p>
+
+<p><code>%FromConstexpr&lt;T&gt;(c)</code> は constexpr 値をランタイム値に持ち上げる intrinsic で、戻り型に応じて <code>ca_.SmiConstant</code>、<code>ca_.IntPtrConstant</code>、<code>ca_.NumberConstant</code> などのコンストラクタ呼び出しに展開されます。</p>
+
+<p><code>%MakeLazy&lt;T&gt;("getter_macro", args...)</code> は std::function&lt;TNode&lt;T&gt;()&gt; を作る intrinsic で、CSA バックエンドでは C++ ラムダ <code>[=] () { return ExternMacroName(state_, args...); }</code> を吐きます。</p>
+
+<h3 id="sec-6-6">6.6 TurboShaft Assembler (TSA)</h3>
+
+<p>TurboShaft は TurboFan の Sea of Nodes IR を置き換えるべく V8 が開発している新しい IR で、命令はブロックごとに線形化されており、reducer の連鎖でテンプレート的に IR を変換していくのが特徴です。コードは <code>src/compiler/turboshaft/</code> に集中しています。</p>
+
+<p>TurboshaftPipelineKind は次のとおりです (<code class="file-ref">src/compiler/turboshaft/phase.h:173</code>)。</p>
+
+<pre><code class="language-cpp">enum class TurboshaftPipelineKind { kJS, kWasm, kCSA, kTSABuiltin, kJSToWasm };
+</code></pre>
+
+<p><code>kCSA</code> は既存の CSA がいったん Turbofan グラフを作り、それを Turboshaft グラフに変換するための種別で、<code>kTSABuiltin</code> は最初から Turboshaft グラフで書かれているビルトイン用です。</p>
+
+<p><code>TSAGenerator</code> は AST を直接たどり、<code>AstVisitor&lt;TSAGenerator&gt;</code> を継承しています。出力は <code>*-tq-tsa.cc</code> と <code>*-tq-tsa.h</code> です。</p>
+
+<p>Torque のマクロは TSA バックエンドにおいては「Reducer」というテンプレートクラスのメソッドとして emit されます。</p>
+
+<pre><code class="language-cpp">// tsa-generator.cc:172-178
+template &lt;typename Next&gt;
+class TorqueGeneratedXxxReducer : public Next {
+ public:
+  BUILTIN_REDUCER(TorqueGeneratedXxx)
+  // ...
+};
+</code></pre>
+
+<p><code>BUILTIN_REDUCER</code> マクロは次のように展開されます (<code class="file-ref">src/codegen/turboshaft-builtins-assembler-inl.h:71-74</code>)。</p>
+
+<pre><code class="language-cpp">#define BUILTIN_REDUCER(name)          \
+  TURBOSHAFT_REDUCER_BOILERPLATE(name) \
+  DEFINE_TURBOSHAFT_ALIASES()
+</code></pre>
+
+<p>エイリアスは <code>V&lt;T&gt;</code>、<code>ConstOrV</code>、<code>Label&lt;...&gt;</code>、<code>LoopLabel</code>、<code>Block</code>、<code>OpIndex</code> などの Turboshaft 用の型を、ユーザがバックエンド意識せずに使えるようにします。</p>
+
+<p>制御構造は IF/ELSE/WHILE/GOTO/BIND/TYPESWITCH/CASE_ のマクロに変換されます (<code>src/compiler/turboshaft/define-assembler-macros.inc</code> で定義)。</p>
+
+<h3 id="sec-6-7">6.7 TurboShaft の Reducer Pipeline</h3>
+
+<p>ビルトイン用の Turboshaft 最適化フェーズは <code class="file-ref">src/compiler/turboshaft/pipelines.cc:157-178</code> に集約されています。</p>
+
+<pre><code class="language-cpp">void BuiltinPipeline::OptimizeBuiltin() {
+  Tracing::Scope tracing_scope(data()-&gt;info());
+
+  CHECK(Run&lt;CsaEarlyMachineOptimizationPhase&gt;());
+  CHECK(Run&lt;CsaLoadEliminationPhase&gt;());
+  CHECK(Run&lt;CsaLateEscapeAnalysisPhase&gt;());
+  CHECK(Run&lt;CsaBranchEliminationPhase&gt;());
+
+  if (data()-&gt;isolate()-&gt;builtins_effects_analyzer() != nullptr) {
+    CHECK(Run&lt;CsaEffectsComputationPhase&gt;());
+  }
+
+  CHECK(Run&lt;CsaMemoryOptimizationPhase&gt;());
+  CHECK(Run&lt;CodeEliminationAndSimplificationPhase&gt;());
+
+  if (v8_flags.turboshaft_enable_debug_features) {
+    CHECK(Run&lt;DebugFeatureLoweringPhase&gt;());
+  }
+}
+</code></pre>
+
+<p>各フェーズが順に reducer を通じて IR を最適化します。</p>
+
+<h3 id="sec-6-8">6.8 TS_BUILTIN マクロと TSA ビルトインの記述</h3>
+
+<p><code>v8_enable_experimental_tsa_builtins</code> フラグで有効化される TSA ビルトインは <code class="file-ref">builtin-definitions.h:1983-2016</code> で <code>TFJ_TSA</code>、<code>TFC_TSA</code>、<code>BCH_TSA</code> として登録されます。実体は次のファイルにあります。</p>
+
+<pre><code class="language-text">src/builtins/builtins-number-tsa.cc
+src/builtins/builtins-string-tsa.cc
+src/builtins/builtins-string-tsa-inl.h
+src/builtins/number-builtins-reducer-inl.h
+src/interpreter/interpreter-generator-tsa.cc
+</code></pre>
+
+<p><code>TS_BUILTIN</code> マクロは <code class="file-ref">src/builtins/builtins-utils-gen.h:62-89</code> で定義され、<code>AssemblerProlog</code>、<code>CatchScope</code>、<code>AssemblerEpilog</code> を組み合わせて Turboshaft の builtin compilation pipeline と接続します。</p>
+
+<pre><code class="language-cpp">TS_BUILTIN(Add_WithFeedback, NumberBuiltinsAssemblerTS) {
+  V&lt;Object&gt; lhs = Parameter&lt;Object&gt;(Descriptor::kLeft);
+  V&lt;Object&gt; rhs = Parameter&lt;Object&gt;(Descriptor::kRight);
+  V&lt;Context&gt; context = Parameter&lt;Context&gt;(Descriptor::kContext);
+  V&lt;FeedbackVector&gt; feedback_vector =
+      Parameter&lt;FeedbackVector&gt;(Descriptor::kFeedbackVector);
+  V&lt;WordPtr&gt; slot = Parameter&lt;WordPtr&gt;(Descriptor::kSlot);
+
+  SetFeedbackSlot(slot);
+  SetFeedbackVector(feedback_vector);
+
+  V&lt;Object&gt; result = AddWithFeedback(
+      context, lhs, rhs, UpdateFeedbackMode::kGuaranteedFeedback, false);
+  Return(result);
+}
+</code></pre>
+
+<hr>
+

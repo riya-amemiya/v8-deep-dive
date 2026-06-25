@@ -1,0 +1,58 @@
+<h2 id="appendix-b">付録 B 用語集</h2>
+
+<p>Torque は V8 のビルトインを記述する DSL。</p>
+
+<p>CSA (CodeStubAssembler) はプラットフォーム抽象アセンブラで、TurboFan graph を直接組む C++ API。</p>
+
+<p>TSA (Turboshaft Assembler) は CSA の後継で、Turboshaft reducer pipeline 向け。</p>
+
+<p>TurboFan は旧世代の最適化コンパイラ (sea-of-nodes 系)。</p>
+
+<p>Turboshaft は新世代の最適化コンパイラ。</p>
+
+<p>Maglev は TurboFan より軽量な中段 JIT (Torque で書かれた builtin は Maglev 経路でも使われる)。</p>
+
+<p>mksnapshot は builtin を機械語までコンパイルしてスナップショットに焼くツール。</p>
+
+<p>embedded blob は snapshot に焼かれたビルトインの機械語バイナリ。</p>
+
+<p>Tagged pointer は最下位ビットで Smi / HeapObject を弁別する V8 のヒープ表現。</p>
+
+<p>Smi (Small Integer) は 31bit (32bit 環境) または 32bit (64bit 環境かつ pointer compression なし) の整数。</p>
+
+<p>HeapObject はヒープ上の GC オブジェクトで、先頭に Map ポインタを持つ。</p>
+
+<p>Map は hidden class で、オブジェクトの形状とプロトタイプを記述するメタオブジェクト。</p>
+
+<p>Instance Type は HeapObject の種別を表す 16bit 整数。</p>
+
+<p>Elements Kind は Array の elements backing store の種別 (SMI/DOUBLE/OBJECT × PACKED/HOLEY、DICTIONARY)。</p>
+
+<p>Transient type はある条件 (Map、protector cell) が成立する間のみ valid な型。</p>
+
+<p>FastJSArrayWitness は transient な FastJSArray を観測し続けるための struct。</p>
+
+<p>Protector cell はグローバルに「protocol が破られていないか」を保持する Cell。</p>
+
+<p>Pointer compression は 64bit 環境でヒープポインタを 32bit に圧縮する V8 のスキーム。</p>
+
+<p>Sandbox は V8 ヒープと外部メモリ間の境界を強化する仕組み。</p>
+
+<p>ExternalPointer / TrustedPointer / CodePointer は Sandbox 越境ポインタの種別。</p>
+
+<p>Write barrier は GC との同期のためのフィールド書き込み時のフック。</p>
+
+<p>constexpr は Torque においては「mksnapshot 実行時に評価される C++ 値」。</p>
+
+<p>deferred block は寒い経路として末尾に配置される basic block。</p>
+
+<p>Phi は分岐合流地点で値をマージする SSA 形式の擬似関数。</p>
+
+<p>reducer は Turboshaft の IR 変換単位で、複数を連鎖させて段階的に最適化する。</p>
+
+<p>Lazy Deopt Continuation は Turbofan で最適化された JIT コードが lazy deopt したときの「途中再開」用エントリポイント。</p>
+
+<hr>
+
+<p>(本書は Torque リポジトリの執筆時点における振る舞いを記述しています。Torque は活発に進化しているため、最新仕様は <code>docs/torque/user-manual.md</code> と <code>src/torque/</code> のソースを参照してください。)</p>
+

@@ -1,0 +1,21 @@
+---
+// Document shell. The original artifact was a single self-contained HTML file
+// with an inline stylesheet and one inline script. Both are injected verbatim
+// via set:html so the built output stays byte-faithful and self-contained.
+import css from "../styles/global.css?raw";
+import sidebarScript from "../scripts/sidebar.js?raw";
+---
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>V8 Engine Deep Dive — 完全解説アーティファクト</title>
+<style set:html={css}></style>
+</head>
+<body>
+<slot />
+<script is:inline set:html={sidebarScript}></script>
+</body>
+</html>

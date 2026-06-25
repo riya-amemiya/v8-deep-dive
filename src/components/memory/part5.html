@@ -1,0 +1,1058 @@
+<section id="part5">
+<h2>第 V 部 オブジェクトのメモリ表現 (String, Array, TypedArray, HeapNumber, BigInt)</h2>
+
+<h3>V8 メモリ表現 完全解説 ― String・Array・TypedArray の内部構造</h3>
+
+<p>本書は V8 ソースコード (<code>/home/user/v8</code>) を直接読み解き、JavaScript の <code>String</code> / <code>Array</code> / <code>TypedArray</code> 等が V8 ヒープ上でどのように表現されているかを、ヘッダオフセット・ビットフィールド・状態遷移まで掘り下げて記述したものである。引用は V8 の現行ソースに基づき、行番号は <code>src/...</code> 直下の絶対パスで示す。</p>
+
+<h3 id="p5-0">0. 全 HeapObject 共通の前提 ― Tagged Pointer と Map</h3>
+
+<p>V8 ではヒープ上の値は全て「タグ付きポインタ」(Tagged) で表現される。最下位ビットが識別子を兼ねており、<code class="file-ref">include/v8-internal.h:57-74</code> に次のように定義されている。</p>
+
+<pre><code class="language-text">kSmiTag            = 0       (最下位ビット 0  → Smi)
+kHeapObjectTag     = 1       (最下位ビット 1  → ヒープポインタ)
+kWeakHeapObjectTag = 3       (...11           → 弱参照)
+kHeapObjectTagSize = 2
+</code></pre>
+
+<p><code>kSmiTagSize = 1</code> であり、64bit ビルド (<code>SmiTagging&lt;8&gt;</code>) では <code>kSmiShiftSize = 31</code>、つまり Smi は 32bit 値を上位 32bit に詰めて、下位 32bit を 0 にしたタグ付き Word になる (<code class="file-ref">include/v8-internal.h:135-146</code>)。ポインタ圧縮 (<code>V8_COMPRESS_POINTERS</code>) を有効にすると <code>kTaggedSize = 4</code> で 32bit Smi (<code class="file-ref">include/v8-internal.h:84-131</code>) を使う。</p>
+
+<p>全ての HeapObject はオブジェクト先頭に Map ポインタを持つ。Map は隠しクラスであり、<code>kMapOffset = offsetof(HeapObject, map_) = 0</code> (<code class="file-ref">src/objects/js-objects.h:384</code>)。インスタンスタイプは Map 内の <code>instance_type_</code> (<code>uint16_t</code>) で表され、文字列の細分類はここに格納される。</p>
+
+<p>レイアウト共通形:</p>
+
+<pre><code class="language-text">+------------------+ offset 0
+|       Map        |   (Tagged&lt;Map&gt;)
++------------------+ offset kTaggedSize
+|   ... payload    |
++------------------+
+</code></pre>
+
+<h3 id="p5-1">1. String の完全な分類</h3>
+
+<h4>1.1 String 階層の抽象構造</h4>
+
+<p><code class="file-ref">src/objects/string.h:120</code> から <code>class String : public Name</code> で定義される。基底クラス <code>Name</code> は <code class="file-ref">src/objects/name.h:83</code> で <code>PrimitiveHeapObject</code> を継承し、<code>std::atomic_uint32_t raw_hash_field_</code> を持つ (<code class="file-ref">src/objects/name.h:304</code>)。String は Name に <code>uint32_t length_</code> を追加する (<code class="file-ref">src/objects/string.h:802</code>)。</p>
+
+<p>すなわち String のメモリレイアウトは:</p>
+
+<pre><code class="language-text">offset 0  : Map*                         (kTaggedSize)
+offset T  : raw_hash_field_              (uint32_t,  Name から継承)
+offset T+4: length_                      (uint32_t)
+offset T+8: 派生クラス固有フィールド…
+</code></pre>
+
+<p>T は <code>kTaggedSize</code> で、ポインタ圧縮時 4、無効時 8 になる。string instance type (<code class="file-ref">src/objects/instance-type.h:116-165</code>) は 16bit のうち下位 7bit を使って representation × encoding × shared/internalized を表現する。bit 構成は <code class="file-ref">src/objects/instance-type.h:25-97</code> にある。</p>
+
+<pre><code class="language-text">bit 0-2 : StringRepresentationTag
+            kSeqStringTag      = 0b000
+            kConsStringTag     = 0b001
+            kExternalStringTag = 0b010
+            kSlicedStringTag   = 0b011
+            kThinStringTag     = 0b101  (bit2 が立つのは ThinString のみ)
+bit 3   : kStringEncodingMask
+            kTwoByteStringTag = 0
+            kOneByteStringTag = 1&lt;&lt;3 = 0x08
+bit 4   : kUncachedExternalStringTag (External 専用)
+bit 5   : kNotInternalizedTag (1=非 internalized)
+bit 6   : kSharedStringTag (1=共有ヒープへ移動済み)
+bit 7-  : 非文字列
+</code></pre>
+
+<p><code>kIsIndirectStringMask = 1&lt;&lt;0</code> (<code class="file-ref">src/objects/instance-type.h:38</code>) により bit0 を見るだけで「直接表現か間接表現か」が判別できるよう設計されている。Seq / External は直接 (bit0=0)、Cons / Sliced / Thin は間接 (bit0=1)。</p>
+
+<h4>1.2 SeqOneByteString / SeqTwoByteString</h4>
+
+<p><code class="file-ref">src/objects/string.h:891</code> (<code>V8_OBJECT class SeqOneByteString : public SeqString</code>) と <code class="file-ref">src/objects/string.h:968</code> (<code>V8_OBJECT class SeqTwoByteString : public SeqString</code>)。両者とも <code>FLEXIBLE_ARRAY_MEMBER(Char, chars)</code> でクラス末尾に文字データを直結する (<code class="file-ref">src/objects/string.h:950, 1023</code>)。文字幅は <code>Char = uint8_t</code> か <code>uint16_t</code>。サイズは:</p>
+
+<pre><code class="language-cpp">// src/objects/string-inl.h:1377-1394
+constexpr int32_t SeqOneByteString::DataSizeFor(int32_t length) {
+  return sizeof(SeqOneByteString) + length * sizeof(Char);
+}
+constexpr int32_t SeqOneByteString::SizeFor(int32_t length) {
+  return OBJECT_POINTER_ALIGN(SeqOneByteString::DataSizeFor(length));
+}
+</code></pre>
+
+<p>OBJECT_POINTER_ALIGN によりタグサイズ単位 (4 or 8) で末尾パディングが入る。レイアウト図 (圧縮ポインタ無効、64bit の場合):</p>
+
+<pre><code class="language-text">SeqOneByteString
++------------------+ 0
+| Map*             | 8 bytes
++------------------+ 8
+| raw_hash_field_  | 4 bytes
++------------------+ 12
+| length_          | 4 bytes
++------------------+ 16
+| chars[0..length] | length bytes (latin1)
++------------------+
+| padding          | 0..7 bytes
++------------------+
+</code></pre>
+
+<p><code>SeqOneByteString::kMaxCharsSize = kMaxLength</code>、<code>SeqTwoByteString::kMaxCharsSize = kMaxLength * sizeof(Char)</code> (<code class="file-ref">src/objects/string.h:929, 1002</code>)。<code>kMaxLength = v8::String::kMaxLength</code> で、<code class="file-ref">include/v8-primitive.h:129-133</code>:</p>
+
+<pre><code class="language-cpp">static constexpr int kMaxLength =
+    internal::kApiSystemPointerSize == 4 ? (1 &lt;&lt; 28) - 16 : (1 &lt;&lt; 29) - 24;
+</code></pre>
+
+<p>つまり 32bit プラットフォームで約 268M chars、64bit で約 536M chars。<code class="file-ref">src/objects/string.h:537</code> で <code>String::kMaxLength &lt;= kSmiMaxValue</code> が静的に検証される。</p>
+
+<p><code>SeqString</code> 自体は <code class="file-ref">src/objects/string.h:861-883</code> の抽象クラスで <code>Truncate()</code> と padding 管理 API (<code>GetDataAndPaddingSizes()</code>, <code>ClearPadding()</code>) を提供する。padding は <code class="file-ref">src/objects/string.cc:2095-2098</code> のように <code>memset</code> で 0 クリアされる。</p>
+
+<h4>1.3 ConsString ― <code>+</code> 演算子の遅延表現</h4>
+
+<p><code class="file-ref">src/objects/string.h:1047</code> 以降。</p>
+
+<pre><code class="language-cpp">V8_OBJECT class ConsString : public String {
+  ...
+ public:
+  TaggedMember&lt;String&gt; first_;   // src/objects/string.h:1097
+  TaggedMember&lt;String&gt; second_;  // src/objects/string.h:1098
+};
+</code></pre>
+
+<p><code>ConsString::kMinLength = 13</code> (<code class="file-ref">src/objects/string.h:1076</code>) より短い結合は SeqString を新規確保するのが常套。ConsString のレイアウト:</p>
+
+<pre><code class="language-text">+------------------+ 0
+| Map* (CONS_*)    |
++------------------+ T
+| raw_hash_field_  | uint32_t
++------------------+ T+4
+| length_          | uint32_t  ← 合算長 first.length + second.length
++------------------+ T+8
+| first_           | TaggedMember&lt;String&gt;
++------------------+ T+8+tagged
+| second_          | TaggedMember&lt;String&gt;
++------------------+
+</code></pre>
+
+<p>二分木構造を形成し、葉が SeqString や ExternalString になる。文字取得 <code>ConsString::Get</code> (<code class="file-ref">src/objects/string.cc:2100-2128</code>) は再帰的に左右へ辿る:</p>
+
+<pre><code class="language-cpp">while (true) {
+  if (StringShape(string).IsCons()) {
+    Tagged&lt;ConsString&gt; cons_string = Cast&lt;ConsString&gt;(string);
+    Tagged&lt;String&gt; left = cons_string-&gt;first();
+    if (left-&gt;length() &gt; index) {
+      string = left;
+    } else {
+      index -= left-&gt;length();
+      string = cons_string-&gt;second();
+    }
+  } else {
+    return string-&gt;Get(index, access_guard);
+  }
+}
+</code></pre>
+
+<p>深くなり過ぎたツリーは <code>ConsStringIterator</code> (<code class="file-ref">src/objects/string.h:1367-1418</code>、<code>kStackSize = 32</code>) で平坦化用スタックを管理する。GC 時には second が empty_string ならば first だけを残してショートカット可能と判定される (<code>IsShortcutCandidate</code>、<code class="file-ref">src/objects/instance-type.h:108-114</code>)。</p>
+
+<h4>1.4 SlicedString ― 部分文字列の遅延表現</h4>
+
+<p><code class="file-ref">src/objects/string.h:1166-1199</code>:</p>
+
+<pre><code class="language-cpp">V8_OBJECT class SlicedString : public String {
+  ...
+  TaggedMember&lt;String&gt; parent_;
+  TaggedMember&lt;Smi&gt; offset_;
+};
+</code></pre>
+
+<p><code>offset_</code> は Smi に格納された開始位置、<code>parent_</code> は SeqString か ExternalString のいずれか (<code class="file-ref">src/objects/string-inl.h:1419-1422</code> の <code>set_parent</code> 内で <code>DCHECK(IsSeqString(parent) || IsExternalString(parent))</code>)。<code>SlicedString::kMinLength = 13</code> (<code class="file-ref">src/objects/string.h:1181</code>)。これより短いと <code>String.prototype.substring</code> 等は SeqString を新規確保する。</p>
+
+<p>ネスト禁止 (Sliced of Sliced) は <code class="file-ref">src/objects/string.h:1161-1162</code> のコメントに「二重間接は単純化される」と明記されている。</p>
+
+<h4>1.5 ThinString ― internalize 後の薄い参照</h4>
+
+<p><code class="file-ref">src/objects/string.h:1116-1147</code>:</p>
+
+<pre><code class="language-cpp">V8_OBJECT class ThinString : public String {
+  ...
+  TaggedMember&lt;InternalizedString&gt; actual_;
+};
+</code></pre>
+
+<p>「in-place internalization が不可能」な場合 (External や Shared など) の代替として、元の場所に ThinString を被せ、<code>actual_</code> で internalized 版を指す。<code>String::MakeThin</code> (<code class="file-ref">src/objects/string.cc:136-203</code>) が実装:</p>
+
+<pre><code class="language-cpp">Tagged&lt;Map&gt; target_map = internalized-&gt;IsOneByteRepresentation()
+                             ? roots.thin_one_byte_string_map()
+                             : roots.thin_two_byte_string_map();
+...
+Tagged&lt;ThinString&gt; thin = UncheckedCast&lt;ThinString&gt;(Tagged(this));
+thin-&gt;set_actual(internalized);
+...
+int size_delta = old_size - sizeof(ThinString);
+if (size_delta != 0) {
+  isolate-&gt;heap()-&gt;NotifyObjectSizeChange(
+      thin, old_size, sizeof(ThinString), ...);
+}
+</code></pre>
+
+<p>元オブジェクトと ThinString のサイズ差は FreeSpace filler で埋められる (Large space では除外)。Map 書き換えは <code>set_map_safe_transition</code> で release-store され、並行マーカに対する整合性が保たれる。</p>
+
+<h4>1.6 ExternalString / ExternalOneByteString / ExternalTwoByteString</h4>
+
+<p><code class="file-ref">src/objects/string.h:1209-1212</code> (<code>UncachedExternalString</code>)、<code class="file-ref">src/objects/string.h:1223-1262</code> (<code>ExternalString</code>)。</p>
+
+<pre><code class="language-cpp">V8_OBJECT class UncachedExternalString : public String {
+ protected:
+  ExternalPointerMember&lt;kExternalStringResourceTag&gt; resource_;
+};
+V8_OBJECT class ExternalString : public UncachedExternalString {
+  ...
+ protected:
+  ExternalPointerMember&lt;kExternalStringResourceDataTag&gt; resource_data_;
+};
+</code></pre>
+
+<p>レイアウト:</p>
+
+<pre><code class="language-text">+------------------+ 0
+| Map*             |
++------------------+
+| raw_hash_field_  |
++------------------+
+| length_          |
++------------------+
+| resource_        | ExternalPointer (Embedder の Resource オブジェクト)
++------------------+
+| resource_data_   | ExternalPointer (高速アクセス用の生ポインタキャッシュ)
++------------------+
+</code></pre>
+
+<p><code>Uncached*</code> バリアントは <code>resource_data_</code> を省略してオブジェクトサイズを縮める (in-place 外部化で元サイズが不足な場合に使用、<code class="file-ref">src/objects/string.cc:248-287</code>)。</p>
+
+<p><code>ExternalOneByteString</code> (<code class="file-ref">src/objects/string.h:1274-1302</code>) と <code>ExternalTwoByteString</code> (<code class="file-ref">src/objects/string.h:1308-1340</code>) は静的アサート <code>sizeof(ExternalOneByteString) == sizeof(ExternalString)</code> で同サイズを保証する (<code class="file-ref">src/objects/string.h:1304, 1342</code>)。</p>
+
+<p>外部化処理 <code>String::MakeExternalDuringGC</code> (<code class="file-ref">src/objects/string.cc:291-340</code>) は GC 中に元の SeqString を上書きする。<code>ComputeExternalStringMap</code> (<code class="file-ref">src/objects/string.cc:247-287</code>) がサイズ・internalized・shared の組合せから 6 種の Map のいずれかを選ぶ。</p>
+
+<h4>1.7 InternalizedString とハッシュテーブル</h4>
+
+<p><code>InternalizedString : public String</code> (<code class="file-ref">src/objects/string.h:885-887</code>) は型タグだけの薄いクラス。文字列インターン (同一文字列を 1 つに正規化) は String Table (<code class="file-ref">src/strings/string-hasher.h</code> 参照経路) で行われる。InternalizedString は instance type の bit5 が 0 (<code>kInternalizedTag = 0</code>、<code class="file-ref">src/objects/instance-type.h:80</code>)。</p>
+
+<p><code>IsInPlaceInternalizable</code> (<code class="file-ref">src/objects/string.h:690-694</code>) によって SeqString や External が in-place で Map だけ書き換えられて internalized 化可能か判定される。不能なケース (ConsString や Shared、forwarding index あり等) では ThinString 変換になる。</p>
+
+<h4>1.8 raw_hash_field の構造 ― String hash</h4>
+
+<p><code class="file-ref">src/objects/name.h:165-256</code> に詳細。</p>
+
+<pre><code class="language-cpp">enum class HashFieldType : uint32_t {
+  kHash            = 0b10,
+  kIntegerIndex    = 0b00,
+  kForwardingIndex = 0b01,
+  kEmpty           = 0b11
+};
+using HashFieldTypeBits = base::BitField&lt;HashFieldType, 0, 2&gt;;
+using HashBits = HashFieldTypeBits::Next&lt;uint32_t, kBitsPerInt - 2&gt;;
+static constexpr int kEmptyHashField =
+    HashFieldTypeBits::encode(HashFieldType::kEmpty);
+static constexpr int kHashNotComputedMask = 1;
+</code></pre>
+
+<p>最下位 2bit が「内容種別」、上位 30bit がペイロード。<code>kEmpty = 0b11</code> は「未計算」を意味し最下位 bit が立つので <code>kHashNotComputedMask = 1</code> だけでフィルタできる。<code>kHash</code> のときは普通のハッシュ、<code>kIntegerIndex</code> のときは数値インデックス文字列 ("123" 等) のキャッシュ値、<code>kForwardingIndex</code> は文字列転送テーブル (内部化等の最中の同期に使用) を指す。</p>
+
+<p>Array index 用のサブビット:</p>
+<pre><code class="language-text">kArrayIndexValueBits  = 24  (src/objects/name.h:214)
+ArrayIndexValueBits   = HashFieldTypeBits::Next&lt;unsigned int, 24&gt;
+ArrayIndexLengthBits  = ArrayIndexValueBits::Next&lt;unsigned int, 32-24-2&gt;
+kMaxCachedArrayIndexLength = 7   (kArrayIndexValueBits=24 &lt; 10^7)
+</code></pre>
+
+<p><code>String::kMaxHashCalcLength = 16383</code> (<code class="file-ref">src/objects/string.h:541</code>) を超える文字列は内容ではなく長さからハッシュを生成する trivial hash になる (<code class="file-ref">src/strings/string-hasher-inl.h:99-107</code>):</p>
+
+<pre><code class="language-cpp">uint32_t StringHasher::GetTrivialHash(uint32_t length) {
+  DCHECK_GT(length, String::kMaxHashCalcLength);
+  static_assert(String::kMaxLength &lt;= String::HashBits::kMax);
+  return String::CreateHashFieldValue(length, String::HashFieldType::kHash);
+}
+</code></pre>
+
+<p>ハッシュ計算本体は rapidhash (<code class="file-ref">src/strings/string-hasher-inl.h:53-74</code>) で行われ、<code>ConvertRawHashToUsableHash</code> (<code class="file-ref">src/strings/string-hasher-inl.h:30-36</code>) が 0 を <code>kZeroHash = 27</code> に置換する。0 は「未計算」と区別するため予約。</p>
+
+<h4>1.9 Flatten 処理</h4>
+
+<p><code>String::Flatten</code> (<code class="file-ref">src/objects/string-inl.h:945-1000</code>) は最初に <code>StringShape(s).IsDirect()</code> をチェックし直接表現ならそのまま返す。ConsString の場合 <code>SlowFlatten</code> (<code class="file-ref">src/objects/string-inl.h:850-938</code>) に分岐。SlowFlatten の核心:</p>
+
+<pre><code class="language-cpp">HandleType&lt;SeqOneByteString&gt; flat = isolate-&gt;factory()
+    -&gt;NewRawOneByteString(length, allocation).ToHandleChecked();
+...
+WriteToFlat2(flat-&gt;GetChars(no_gc), raw_cons, 0, length, ...);
+raw_cons-&gt;set_first(*flat);
+raw_cons-&gt;set_second(ReadOnlyRoots(isolate).empty_string());
+result = flat;
+</code></pre>
+
+<p>すなわち新たな SeqString を確保して全文字を書き出し、元の ConsString の <code>first_</code> を新 SeqString に、<code>second_</code> を空文字列に書き換える。これにより <code>ConsString::IsFlat()</code> (<code class="file-ref">src/objects/string-inl.h:1447</code>) が <code>second()-&gt;length() == 0</code> で true を返す「degenerate cons」状態になる。GC ショートカットで second 側がempty_string なら最終的に first だけ残せるよう設計されている。</p>
+
+<h4>1.10 主要上限値の一覧</h4>
+
+<table>
+<thead><tr><th>定数</th><th>値</th><th>場所</th></tr></thead>
+<tbody>
+<tr><td><code>String::kMaxLength</code></td><td>(1&lt;&lt;28)-16 / (1&lt;&lt;29)-24</td><td><code class="file-ref">include/v8-primitive.h:129</code></td></tr>
+<tr><td><code>String::kMaxOneByteCharCode</code></td><td>0xFF</td><td><code class="file-ref">src/objects/string.h:525</code></td></tr>
+<tr><td><code>String::kMaxUtf16CodeUnit</code></td><td>0xFFFF</td><td><code class="file-ref">src/objects/string.h:527</code></td></tr>
+<tr><td><code>String::kMaxCodePoint</code></td><td>0x10FFFF</td><td><code class="file-ref">src/objects/string.h:529</code></td></tr>
+<tr><td><code>String::kMaxHashCalcLength</code></td><td>16383</td><td><code class="file-ref">src/objects/string.h:541</code></td></tr>
+<tr><td><code>ConsString::kMinLength</code></td><td>13</td><td><code class="file-ref">src/objects/string.h:1076</code></td></tr>
+<tr><td><code>SlicedString::kMinLength</code></td><td>13</td><td><code class="file-ref">src/objects/string.h:1181</code></td></tr>
+<tr><td><code>kZeroHash</code></td><td>27</td><td><code class="file-ref">src/strings/string-hasher.h:76</code></td></tr>
+</tbody>
+</table>
+
+<h3 id="p5-2">2. Array の内部構造</h3>
+
+<h4>2.1 JSArray 本体</h4>
+
+<p><code class="file-ref">src/objects/js-array.h:25-161</code>。</p>
+
+<pre><code class="language-cpp">V8_OBJECT class JSArray : public JSObject {
+ public:
+  ...
+  TaggedMember&lt;Number&gt; length_;   // src/objects/js-array.h:160
+};
+inline constexpr int JSArray::kHeaderSize = sizeof(JSArray);
+</code></pre>
+
+<p>JSArray 自体は JSObject に <code>length</code> プロパティを 1 つ in-object 追加した形。length は Smi または HeapNumber (32bit overflow したとき)。レイアウト:</p>
+
+<pre><code class="language-text">JSArray (継承: HeapObject -&gt; JSReceiver -&gt; JSObject -&gt; JSArray)
++----------------------+ 0
+| Map*                 |
++----------------------+ T
+| properties_or_hash_  |  JSReceiver
++----------------------+ 2T
+| elements_            |  JSObject
++----------------------+ 3T
+| length_              |  JSArray (Number, ほぼ常に Smi)
++----------------------+ 4T = kHeaderSize
+| (in-object propsなし)|
++----------------------+
+</code></pre>
+
+<p>ここで T は kTaggedSize。<code>JSArray::kPreallocatedArrayElements = 4</code> (<code class="file-ref">src/objects/js-array.h:129</code>) が新規空配列に与える FixedArray capacity の初期値。</p>
+
+<p><code>kMaxArrayLength = kMaxUInt32</code> (<code class="file-ref">src/objects/js-array.h:142-145</code>)、<code>kMaxFastArrayLength</code> は標準 32MiB か LOW_LIMITS で 8MiB (<code class="file-ref">src/objects/js-array.h:148-149</code>)。<code>kInitialMaxFastElementArray</code> (<code class="file-ref">src/objects/js-array.h:164</code>) は 1 回のメモリ配置で済む 最大要素数を計算したもの。</p>
+
+<h4>2.2 ElementsKind ― 配列の特殊化レベル</h4>
+
+<p><code class="file-ref">src/objects/elements-kind.h:105-183</code> の <code>enum ElementsKind : uint8_t</code> で全 ElementsKind が列挙される。並びは性能のため意図的:</p>
+
+<pre><code class="language-text">0  PACKED_SMI_ELEMENTS        ← 全 Smi、穴なし。最も特殊
+1  HOLEY_SMI_ELEMENTS
+2  PACKED_ELEMENTS            ← 任意 Tagged、穴なし
+3  HOLEY_ELEMENTS             ← 任意 Tagged、穴あり (最も汎用な fast kind)
+4  PACKED_DOUBLE_ELEMENTS     ← unboxed double、穴なし
+5  HOLEY_DOUBLE_ELEMENTS
+6  PACKED_NONEXTENSIBLE_ELEMENTS
+7  HOLEY_NONEXTENSIBLE_ELEMENTS
+8  PACKED_SEALED_ELEMENTS
+9  HOLEY_SEALED_ELEMENTS
+10 PACKED_FROZEN_ELEMENTS
+11 HOLEY_FROZEN_ELEMENTS
+12 SHARED_ARRAY_ELEMENTS
+13 DICTIONARY_ELEMENTS        ← slow path、NumberDictionary
+14 FAST_SLOPPY_ARGUMENTS_ELEMENTS
+15 SLOW_SLOPPY_ARGUMENTS_ELEMENTS
+16 FAST_STRING_WRAPPER_ELEMENTS
+17 SLOW_STRING_WRAPPER_ELEMENTS
+18..30  UINT8_ELEMENTS..FLOAT16_ELEMENTS   (Typed Arrays)
+31..43  RAB_GSAB_UINT8_ELEMENTS..          (Resizable/Growable Typed Arrays)
+44 WASM_ARRAY_ELEMENTS
+45 NO_ELEMENTS
+</code></pre>
+
+<p>判定マクロが豊富に用意される。代表的なもの (<code class="file-ref">src/objects/elements-kind.h:418-461</code>):</p>
+
+<pre><code class="language-cpp">constexpr bool IsHoleyElementsKind(ElementsKind kind) {
+  return kind % 2 == 1 &amp;&amp; kind &lt;= HOLEY_DOUBLE_ELEMENTS;  // 奇数==Holey
+}
+constexpr bool IsDoubleElementsKind(ElementsKind kind) {
+  return base::IsInRange(kind, PACKED_DOUBLE_ELEMENTS, HOLEY_DOUBLE_ELEMENTS);
+}
+constexpr ElementsKind GetHoleyElementsKind(ElementsKind packed_kind);
+constexpr ElementsKind GetPackedElementsKind(ElementsKind holey_kind);
+</code></pre>
+
+<p>「Packed と Holey は連番」「Smi -&gt; Object -&gt; Double の順に汎化」という規約により <code>std::max</code> で union が取れる。<code>UnionElementsKindUptoPackedness</code> (<code class="file-ref">src/objects/elements-kind.h:495-531</code>) がそれ。</p>
+
+<p><code>kElementsKindBits = 6</code> (<code class="file-ref">src/objects/elements-kind.h:193</code>) で Map の bit field に詰める。<code>ElementsKindToShiftSize</code> (<code class="file-ref">src/objects/elements-kind.h:213-267</code>) で要素サイズの log2 を取り、Typed Array では byte 単位ストライド計算に使う。</p>
+
+<h4>2.3 FixedArray と FixedDoubleArray の違い</h4>
+
+<p><code class="file-ref">src/objects/fixed-array.h:250-345</code> (<code>FixedArray</code>):</p>
+
+<pre><code class="language-cpp">V8_OBJECT class FixedArray : public TaggedArrayBase&lt;FixedArray, Object&gt; {
+ public:
+  uint32_t length_;
+#if TAGGED_SIZE_8_BYTES
+  uint32_t optional_padding_;
+#endif
+  FLEXIBLE_ARRAY_MEMBER(TaggedMember&lt;Object&gt;, objects);
+};
+</code></pre>
+
+<p>Tagged 要素を持つ通常配列。kTaggedSize が 8 だが length_ が 32bit のため <code>optional_padding_</code> で揃える。</p>
+
+<p><code class="file-ref">src/objects/fixed-array.h:577-630</code> (<code>FixedDoubleArray</code>):</p>
+
+<pre><code class="language-cpp">V8_OBJECT class FixedDoubleArray : public PrimitiveArrayBase&lt;FixedDoubleArray, double&gt; {
+ public:
+  using ElementMemberT = UnalignedDoubleMember;
+  ...
+  uint32_t length_;
+#if TAGGED_SIZE_8_BYTES
+  uint32_t optional_padding_;
+#endif
+  FLEXIBLE_ARRAY_MEMBER(ElementMemberT, values);
+};
+</code></pre>
+
+<p><code>PrimitiveArrayBase</code> (<code class="file-ref">src/objects/fixed-array.h:478-574</code>) を継承し、要素は <code>UnalignedDoubleMember</code>。32bit ビルドや圧縮ポインタ環境では double が 4byte 境界に置かれる可能性があるため明示的に unaligned 型を使う。</p>
+
+<p>レイアウト:</p>
+
+<pre><code class="language-text">FixedArray (Tagged 要素)
++----------------+ 0
+| Map*           | 8
++----------------+ 8
+| length_        | 4
++----------------+ 12
+| padding(8B用)  | 4
++----------------+ 16
+| objects[0]     | T  ← Tagged&lt;Object&gt;
+| objects[1]     |
+| ...            |
++----------------+
+
+FixedDoubleArray (unboxed double)
++----------------+ 0
+| Map*           | 8
++----------------+ 8
+| length_        | 4
++----------------+ 12
+| padding        | 4
++----------------+ 16
+| values[0]      | 8  ← double 直接
+| values[1]      | 8
+| ...            |
++----------------+
+</code></pre>
+
+<p>サイズ計算は <code>TaggedArrayBase::SizeFor</code> (<code class="file-ref">src/objects/fixed-array.h:232-235</code>):</p>
+
+<pre><code class="language-cpp">constexpr int SizeFor(int capacity) {
+  return OFFSET_OF_DATA_START(Derived) + capacity * kElementSize;
+}
+</code></pre>
+
+<p><code>kElementSize</code> は <code>FixedArray</code> で <code>kTaggedSize</code>、<code>FixedDoubleArray</code> で 8 (double)。</p>
+
+<p><code>kMaxFixedArrayCapacity = 128 * 1024 * 1024</code> (<code class="file-ref">src/objects/fixed-array.h:33-34</code>、LOW_LIMITS で 16M)。これは次の <code>power of two</code> が FixedDoubleArray の byte 数で int32 オーバーフローしないための上限。<code>FixedDoubleArray::kMaxLength == FixedArray::kMaxLength</code> を <code class="file-ref">src/objects/fixed-array.h:632</code> で静的検証。</p>
+
+<p><code>FixedArrayBase</code> (<code class="file-ref">src/objects/fixed-array.h:445-475</code>) は FixedArray と FixedDoubleArray の共通基底役 (実際には継承していないが、<code>is_subtype</code> の手動特殊化で扱う、<code class="file-ref">src/objects/fixed-array.h:437-443</code>)。共通ヘッダレイアウト定数:</p>
+
+<pre><code class="language-cpp">static constexpr int kLengthOffset = sizeof(HeapObject);  // 8 or 4
+#if TAGGED_SIZE_8_BYTES
+  static constexpr uint32_t kPaddingOffset = kLengthOffset + kUInt32Size;
+  static constexpr uint32_t kHeaderSize   = kPaddingOffset + kUInt32Size;
+#else
+  static constexpr uint32_t kHeaderSize   = kLengthOffset + kUInt32Size;
+#endif
+</code></pre>
+
+<h4>2.4 The Hole の表現</h4>
+
+<p>「穴」(欠落要素) の表現は ElementsKind により異なる:</p>
+
+<p>FixedArray (Tagged 系) では <code>the_hole_value()</code>、すなわち専用の Hole 型 (<code>Oddball</code>) を ROOT から取って格納する (<code class="file-ref">src/objects/elements.cc:246</code> 等)。</p>
+<p>FixedDoubleArray では特定の NaN ビットパターン <code>kHoleNanInt64</code> を入れる (<code class="file-ref">src/common/globals.h:2136-2145</code>)。</p>
+
+<pre><code class="language-cpp">// src/common/globals.h:2136-2145
+constexpr uint32_t kHoleNanUpper32 = 0xFFF7FFFF;
+constexpr uint32_t kHoleNanLower32 = 0xFFF7FFFF;
+constexpr uint64_t kHoleNanInt64  =
+    (uint64_t(kHoleNanUpper32) &lt;&lt; 32) | kHoleNanLower32;
+</code></pre>
+
+<p>これは 64bit が <code>0xFFF7FFFF'FFF7FFFF</code> の signaling NaN。FixedDoubleArray の hole 判定 (<code class="file-ref">src/objects/fixed-array-inl.h:633-641</code>):</p>
+
+<pre><code class="language-cpp">values()[index].set_value_as_bits(kHoleNanInt64);
+...
+return get_representation(index) == kHoleNanInt64;
+</code></pre>
+
+<p><code>V8_ENABLE_UNDEFINED_DOUBLE</code> が有効な場合は <code>kUndefinedNanInt64 = 0xFFF6FFFF'FFF6FFFF</code> も予約され、<code>undefined</code> を unboxed double で表せる (<code class="file-ref">src/common/globals.h:2138-2148</code>)。</p>
+
+<h4>2.5 Elements Transition</h4>
+
+<p><code class="file-ref">src/objects/elements.h:21-...</code> の <code>ElementsAccessor</code> 抽象クラスが各 ElementsKind 毎の振る舞いを提供する。<code>GrowCapacityAndConvertImpl</code> (<code class="file-ref">src/objects/elements.cc:1106</code> 等)、<code>ConvertElementsWithCapacity</code> (<code class="file-ref">src/objects/elements.cc:1018-1093</code>) で:</p>
+
+<pre><code class="language-cpp">// elements.cc:983 等
+Subclass::GrowCapacityAndConvertImpl(isolate, array, new_capacity)
+</code></pre>
+
+<p>が呼ばれ、ElementsKind が「より汎用」な側に推移する。順序関係は次の半順序:</p>
+
+<pre><code class="language-text">PACKED_SMI -&gt; HOLEY_SMI
+PACKED_SMI -&gt; PACKED -&gt; HOLEY
+PACKED_SMI -&gt; PACKED_DOUBLE -&gt; HOLEY_DOUBLE
+HOLEY_SMI -&gt; HOLEY
+HOLEY_DOUBLE -&gt; HOLEY
+</code></pre>
+
+<p><code>IsMoreGeneralElementsKindTransition</code> (<code class="file-ref">src/objects/elements-kind.cc</code> に実装) が判定。Smi -&gt; Double は要素を全て unbox する必要があるため expensive。Double -&gt; Object は逆に各 double を HeapNumber に box し直すため expensive。</p>
+
+<p>ElementsKind は Map に格納されており (Map の bit field 内、6bit)、要素種別の遷移は Hidden Class transition (Map の付け替え) を伴う。プロパティ追加・削除と独立して進む別軸の遷移であることに注意。</p>
+
+<p>Dictionary 化のトリガ:</p>
+<p>配列に巨大な「飛び穴」を作る (<code>SetLengthWouldNormalize</code>、<code class="file-ref">src/objects/js-array.h:64-65</code>)。</p>
+<p><code>Object.defineProperty</code> で非標準なディスクリプタを付ける。</p>
+<p><code>freeze</code>/<code>seal</code> 後にさらに変更要求が来た時など。</p>
+
+<p>DICTIONARY_ELEMENTS では backing storage が <code>NumberDictionary</code> (オープンアドレス法のハッシュテーブル) になり、各エントリが PropertyDetails も保持する。読み書きは O(1) 平均だが定数倍が大きく、TurboFan や Maglev はインライン化を諦める。</p>
+
+<h4>2.6 数値配列の特別扱い (unboxed double)</h4>
+
+<p><code>[1.5, 2.5, 3.5]</code> のような配列は <code>PACKED_DOUBLE_ELEMENTS</code> になり、<code>FixedDoubleArray</code> を直接の backing store とする。各要素は 8byte の raw IEEE 754 double として並ぶ。HeapNumber boxing コストがゼロになる。</p>
+
+<p><code>[1, 2, 3]</code> は最初 <code>PACKED_SMI_ELEMENTS</code> (<code>FixedArray</code> だが要素が Smi で詰まる) になり、<code>[1, 2, 3.5]</code> のような混合や <code>[1, 2, undefined]</code> のような non-Smi 値挿入で遷移する。</p>
+
+<h3 id="p5-3">3. JSObject Layout</h3>
+
+<h4>3.1 JSReceiver と JSObject</h4>
+
+<p><code class="file-ref">src/objects/js-objects.h:45</code> から <code>class JSReceiver : public HeapObject</code>。</p>
+
+<pre><code class="language-cpp">V8_OBJECT class JSReceiver : public HeapObject {
+ public:
+  ...
+  TaggedMember&lt;PropertiesOrHash&gt; properties_or_hash_;  // line 373
+};
+</code></pre>
+
+<p><code>PropertiesOrHash</code> の取り得る型 (<code class="file-ref">src/objects/js-objects.h:49-50</code>):</p>
+
+<pre><code class="language-cpp">using PropertiesOrHash = UnionOf&lt;SwissNameDictionary, FixedArrayBase,
+                                  PropertyArray, Smi, GlobalDictionary&gt;;
+</code></pre>
+
+<p>5 通り (<code class="file-ref">src/objects/js-objects.h:74-89</code> の説明):</p>
+
+<p>1. <code>EmptyFixedArray</code> (プレースホルダ)</p>
+<p>2. <code>Smi</code> ― オブジェクトのハッシュコード (プロパティが無いオブジェクト用)</p>
+<p>3. <code>PropertyArray</code> ― 高速プロパティの out-of-object スピル領域。length 場所にハッシュも詰める</p>
+<p>4. <code>NameDictionary</code> / <code>SwissNameDictionary</code> ― 通常 slow プロパティ</p>
+<p>5. <code>GlobalDictionary</code> ― GlobalObject 用</p>
+
+<p><code>JSObject</code> (<code class="file-ref">src/objects/js-objects.h:380-1029</code>) は JSReceiver に elements_ を追加:</p>
+
+<pre><code class="language-cpp">V8_OBJECT class JSObject : public JSReceiver {
+ public:
+  static constexpr int kMapOffset = offsetof(HeapObject, map_);  // 0
+  ...
+ public:
+  TaggedMember&lt;FixedArrayBase&gt; elements_;  // line 1028
+};
+inline constexpr int JSObject::kHeaderSize = sizeof(JSObject);
+</code></pre>
+
+<p><code>offsetof(JSObject, elements_) == sizeof(JSReceiver)</code> が <code class="file-ref">src/objects/js-objects.h:1049</code> で静的検証される。</p>
+
+<p>レイアウト:</p>
+
+<pre><code class="language-text">JSObject ヘッダ
++----------------------+ kMapOffset = 0
+| Map*                 |
++----------------------+ kPropertiesOrHashOffset = T
+| properties_or_hash_  |
++----------------------+ kElementsOffset = 2T
+| elements_            |
++----------------------+ kHeaderSize = 3T
+| inobject_property[0] |   ← Map の inobject_properties_count_ に応じて
+| inobject_property[1] |
+| ...                  |
++----------------------+ instance_size (Map に格納された値)
+</code></pre>
+
+<h4>3.2 In-Object Properties</h4>
+
+<p>In-object プロパティの最大数は <code>JSObject::kMaxInObjectProperties</code> (<code class="file-ref">src/objects/js-objects.h:1035-1036</code>):</p>
+
+<pre><code class="language-cpp">inline constexpr int JSObject::kMaxInObjectProperties =
+    (JSObject::kMaxInstanceSize - JSObject::kHeaderSize) &gt;&gt; kTaggedSizeLog2;
+</code></pre>
+
+<p><code>kMaxInstanceSize = 255 * kTaggedSize</code> (<code class="file-ref">src/objects/js-objects.h:966-968</code>)。これは Map の <code>instance_size_in_words_</code> が <code>uint8_t</code> のため。具体例 (64bit, 圧縮ポインタなし): <code>255*8 - 24 = 2016</code>、<code>2016 / 8 = 252</code> 個。</p>
+
+<p>特定インスタンスの in-object 数は Map に <code>inobject_properties_or_constructor_function_index_</code> というフィールドで保持される。プロパティ追加で hidden class が遷移し、in-object 領域が埋まるとさらに PropertyArray (out-of-object) が確保されて <code>properties_or_hash_</code> に保存される。<code>kFieldsAdded = 3</code> (<code class="file-ref">src/objects/js-objects.h:975</code>) ずつ拡張する。</p>
+
+<h4>3.3 Hidden Class Transition と Elements Transition の関係</h4>
+
+<p>Map は 1 つのオブジェクトの「shape」を 1 軸ではなく複数軸で表現する:</p>
+<p><strong>prototype</strong></p>
+<p><strong>in-object properties (種類・型・順序)</strong></p>
+<p><strong>elements_kind</strong></p>
+<p><strong>integrity level (extensible/sealed/frozen)</strong></p>
+
+<p>これらがどれか変化すると新しい Map に遷移する。プロパティ追加と要素種別変化は同じ Map グラフ上の別エッジを通る。Map は transition tree を形成し、同じ shape に到達するパスは canonical な単一 Map を共有 (transition cache)。</p>
+
+<h3 id="p5-4">4. ArrayBuffer / TypedArray</h3>
+
+<h4>4.1 JSArrayBuffer</h4>
+
+<p><code class="file-ref">src/objects/js-array-buffer.h:26-239</code>:</p>
+
+<pre><code class="language-cpp">V8_OBJECT class JSArrayBuffer : public JSAPIObjectWithEmbedderSlots {
+ public:
+  TaggedMember&lt;MaybeObject&gt; views_or_detach_key_;
+  UnalignedValueMember&lt;uintptr_t&gt; raw_byte_length_;
+  UnalignedValueMember&lt;uintptr_t&gt; raw_max_byte_length_;
+  UnalignedValueMember&lt;Address&gt;   backing_store_;
+  ExternalPointerMember&lt;kArrayBufferExtensionTag&gt; extension_;
+  uint32_t bit_field_;
+#if TAGGED_SIZE_8_BYTES
+  uint32_t optional_padding_;
+#endif
+};
+</code></pre>
+
+<p><code>kMaxByteLength</code> は <code class="file-ref">src/objects/js-array-buffer.h:32-38</code>:</p>
+
+<pre><code class="language-cpp">#if V8_ENABLE_SANDBOX
+  static constexpr size_t kMaxByteLength = kMaxSafeBufferSizeForSandbox;
+#elif V8_HOST_ARCH_32_BIT
+  static constexpr size_t kMaxByteLength = kMaxInt;  // 2GiB-1
+#else
+  static constexpr size_t kMaxByteLength = kMaxSafeInteger;  // 2^53-1
+#endif
+</code></pre>
+
+<p><code>bit_field_</code> は Torque で生成されるビットフィールド (<code>DEFINE_TORQUE_GENERATED_JS_ARRAY_BUFFER_FLAGS</code>、<code class="file-ref">src/objects/js-array-buffer.h:69</code>)。フラグ: <code>is_external</code>, <code>is_detachable</code>, <code>was_detached</code>, <code>is_shared</code>, <code>is_resizable_by_js</code>, <code>is_immutable</code>。</p>
+
+<p>レイアウト (圧縮ポインタ無効、64bit、エンベッダフィールド 2 個):</p>
+
+<pre><code class="language-text">+-----------------------+ 0
+| Map*                  |  8
++-----------------------+
+| properties_or_hash_   |  8
++-----------------------+
+| elements_             |  8 (常に empty_fixed_array)
++-----------------------+
+| EmbedderField[0..1]   |  CppHeapPointer + EmbedderDataSlot
++-----------------------+
+| views_or_detach_key_  |  8  (Smi or WeakArrayList)
++-----------------------+
+| raw_byte_length_      |  8
++-----------------------+
+| raw_max_byte_length_  |  8  (Resizable 時のキャップ)
++-----------------------+
+| backing_store_        |  8  (生ポインタ、サンドボックス内)
++-----------------------+
+| extension_            |  4-8 (ExternalPointerHandle)
++-----------------------+
+| bit_field_            |  4
++-----------------------+
+| optional_padding_     |  4
++-----------------------+
+</code></pre>
+
+<p><code>backing_store_</code> は <code>UnalignedValueMember&lt;Address&gt;</code> で実際のメモリへの直接ポインタ。<code>extension_</code> は GC が管理する <code>ArrayBufferExtension</code> への参照 (<code class="file-ref">src/objects/js-array-buffer.h:258-404</code>)。</p>
+
+<h4>4.2 BackingStore</h4>
+
+<p><code class="file-ref">src/objects/backing-store.h:48-314</code>:</p>
+
+<pre><code class="language-cpp">class V8_EXPORT_PRIVATE BackingStore : public BackingStoreBase {
+ public:
+  ...
+ private:
+  void* buffer_start_       = nullptr;       // line 271
+  std::atomic&lt;size_t&gt; byte_length_;          // line 272
+  size_t max_byte_length_;                   // line 274
+  size_t byte_capacity_;                     // line 276
+  const uint32_t id_;
+  ...
+  union TypeSpecificData {
+    v8::ArrayBuffer::Allocator* v8_api_array_buffer_allocator;
+    std::shared_ptr&lt;v8::ArrayBuffer::Allocator&gt; v8_api_array_buffer_allocator_shared;
+    SharedWasmMemoryData* shared_wasm_memory_data;
+    struct DeleterInfo {
+      v8::BackingStore::DeleterCallback callback;
+      void* data;
+    } deleter;
+  } type_specific_data_;
+  std::atomic&lt;base::EnumSet&lt;Flag, uint16_t&gt;&gt; flags_;
+};
+</code></pre>
+
+<p><code>buffer_start_</code> は実メモリ。flags は <code>kIsShared</code>, <code>kIsResizableByJs</code>, <code>kIsImmutable</code>, <code>kIsWasmMemory</code>, <code>kHasGuardRegions</code>, <code>kEmptyDeleter</code> 等 (<code class="file-ref">src/objects/backing-store.h:214-223</code>)。</p>
+
+<p><code>std::shared_ptr&lt;BackingStore&gt;</code> で参照カウントされ、複数の JSArrayBuffer や TypedArray が同じ BackingStore を共有できる (<code>postMessage</code> 等)。</p>
+
+<h4>4.3 SharedArrayBuffer / Detach / Resizable</h4>
+
+<p><code>JSArrayBuffer::Detach</code> (<code class="file-ref">src/objects/js-array-buffer.h:139-141</code>) は <code>is_detachable</code> フラグを確認し、<code>buffer_start_</code> を 0 にクリアして <code>was_detached</code> を立てる。Detach 後はすべての操作が TypeError になる。</p>
+
+<p>Resizable ArrayBuffer (Phase 4 of TC39) は <code>is_resizable_by_js</code> フラグで識別され、<code>raw_max_byte_length_</code> がキャップ。<code>BackingStore::ResizeInPlace</code> / <code>GrowInPlace</code> (<code class="file-ref">src/objects/backing-store.h:124-125</code>) で実メモリを伸縮 (Linux なら mremap 相当)。Growable SharedArrayBuffer (GSAB) は共有メモリで成長のみ可能 (縮小不可)。</p>
+
+<h4>4.4 JSArrayBufferView, JSTypedArray, JSDataView</h4>
+
+<p><code class="file-ref">src/objects/js-array-buffer.h:406-458</code>:</p>
+
+<pre><code class="language-cpp">V8_OBJECT class JSArrayBufferView : public JSAPIObjectWithEmbedderSlots {
+ public:
+  TaggedMember&lt;JSArrayBuffer&gt; buffer_;
+  uint32_t bit_field_;             // is_length_tracking, is_backed_by_rab 等
+#if TAGGED_SIZE_8_BYTES
+  uint32_t optional_padding_;
+#endif
+  UnalignedValueMember&lt;uintptr_t&gt; raw_byte_offset_;
+  UnalignedValueMember&lt;uintptr_t&gt; raw_byte_length_;
+};
+</code></pre>
+
+<p>JSTypedArray (<code class="file-ref">src/objects/js-array-buffer.h:460-590</code>):</p>
+
+<pre><code class="language-cpp">V8_OBJECT class JSTypedArray : public JSArrayBufferView {
+ public:
+  ...
+  UnalignedValueMember&lt;uintptr_t&gt; raw_length_;        // 要素数
+  UnalignedValueMember&lt;Address&gt;   external_pointer_;  // データの先頭ポインタ
+  TaggedMember&lt;Object&gt;            base_pointer_;      // on-heap時 ByteArray, off-heap時 Smi::zero()
+};
+</code></pre>
+
+<p>レイアウト:</p>
+
+<pre><code class="language-text">JSTypedArray (例: Uint32Array)
++----------------------+ 0
+| Map* (UINT32_*)      |
++----------------------+
+| properties_or_hash_  |
++----------------------+
+| elements_            | (Map で elements_kind を持つので空)
++----------------------+
+| EmbedderField[0..1]  |
++----------------------+
+| buffer_              | TaggedMember&lt;JSArrayBuffer&gt;
++----------------------+
+| bit_field_           | 4 bytes
++----------------------+
+| optional_padding_    | 4
++----------------------+
+| raw_byte_offset_     | 8
++----------------------+
+| raw_byte_length_     | 8
++----------------------+
+| raw_length_          | 8  (要素数 = byte_length / element_size)
++----------------------+
+| external_pointer_    | 8  (off-heap: 直接ポインタ / on-heap: ByteArray の data 位置 + 補正)
++----------------------+
+| base_pointer_        | 8  (off-heap: Smi::zero() / on-heap: ByteArray*)
++----------------------+
+</code></pre>
+
+<p><code>DataPtr() = base_pointer + external_pointer</code> という設計 (<code class="file-ref">src/objects/js-array-buffer.h:486-525</code>):</p>
+
+<pre><code class="language-cpp">// The `DataPtr` is `base_ptr + external_pointer`, and `base_ptr` is nullptr
+// for off-heap typed arrays.
+static constexpr bool kOffHeapDataPtrEqualsExternalPointer = true;
+</code></pre>
+
+<p>ポインタ圧縮が有効な時は <code>base_pointer_</code> を Tagged_t として ロードし、isolate root と external pointer 補正値を足すと真の絶対アドレスになるよう設計され、demand load と offset add が 1 命令に融合できる。</p>
+
+<h5>on-heap vs off-heap</h5>
+
+<p><code>is_on_heap()</code> (<code class="file-ref">src/objects/js-array-buffer-inl.h:523-535</code>):</p>
+
+<pre><code class="language-cpp">bool JSTypedArray::is_on_heap() const {
+  DisallowGarbageCollection no_gc;
+  return base_pointer() != Smi::zero();
+}
+</code></pre>
+
+<p>つまり <code>base_pointer_</code> が <code>Smi::zero()</code> か否かで判定。<code>kMaxSizeInHeap = 64</code> bytes (<code class="file-ref">src/objects/js-array-buffer.h:556-560</code>):</p>
+
+<pre><code class="language-cpp">#ifdef V8_TYPED_ARRAY_MAX_SIZE_IN_HEAP
+  static constexpr size_t kMaxSizeInHeap = V8_TYPED_ARRAY_MAX_SIZE_IN_HEAP;
+#else
+  static constexpr size_t kMaxSizeInHeap = 64;
+#endif
+</code></pre>
+
+<p>64 バイト以下のサイズで生成された TypedArray は ByteArray (V8 ヒープ内のバイト配列) に格納される。それ以上は array buffer allocator が malloc/mmap した off-heap 領域に置かれる。<code>SetOffHeapDataPtr</code> (<code class="file-ref">src/objects/js-array-buffer-inl.h:510-521</code>) で on -&gt; off 遷移が行われ、<code>base_pointer_</code> は release-store で <code>Smi::zero()</code> に書き換えられる。</p>
+
+<h5>TypedArray の種類</h5>
+
+<p><code class="file-ref">src/objects/elements-kind.h:18-29</code> の <code>TYPED_ARRAYS_BASE</code> マクロが列挙する 11 種類:</p>
+
+<pre><code class="language-text">Uint8 / Int8                (1 byte)
+Uint16 / Int16              (2 bytes)
+Uint32 / Int32              (4 bytes)
+BigUint64 / BigInt64        (8 bytes)
+Uint8Clamped                (1 byte, clamping)
+Float32                     (4 bytes)
+Float64                     (8 bytes)
+Float16                     (2 bytes、Float16 拡張)
+</code></pre>
+
+<p>それぞれ独立した ElementsKind を持ち (<code>UINT8_ELEMENTS</code> 等)、<code>ElementsKindToShiftSize</code> (<code class="file-ref">src/objects/elements-kind.h:213-267</code>) で要素 byte 数の log2 を返す。RAB/GSAB バリアントもそれぞれ別 ElementsKind を持ち、計 24 種類。</p>
+
+<p><code>kMaxByteLength</code> の上限から各 TypedArray の <code>kMaxLength</code> が型ごとに導かれる (<code class="file-ref">include/v8-typed-array.h:59-365</code>)。例: <code>Uint32Array::kMaxLength = TypedArray::kMaxByteLength / sizeof(uint32_t)</code>。</p>
+
+<p><code>BigInt64Array</code> / <code>BigUint64Array</code> は要素が BigInt (後述)。読み取り時に毎回 BigInt をヒープに確保するため通常の Int32Array より遅い。</p>
+
+<h3 id="p5-5">5. HeapNumber と Mutable Double Field</h3>
+
+<h4>5.1 HeapNumber</h4>
+
+<p><code class="file-ref">src/objects/heap-number.h:28-73</code>:</p>
+
+<pre><code class="language-cpp">V8_OBJECT class HeapNumber : public PrimitiveHeapObject {
+ public:
+  inline double value() const;
+  inline void set_value(double value);
+  inline uint64_t value_as_bits() const;
+  inline void set_value_as_bits(uint64_t bits);
+  inline bool is_the_hole() const;
+  ...
+  UnalignedDoubleMember value_;
+};
+</code></pre>
+
+<p>レイアウト:</p>
+
+<pre><code class="language-text">+-------------+ 0
+| Map*        | 4 or 8
++-------------+
+| value_      | 8 (double)
++-------------+
+</code></pre>
+
+<p>Smi に収まらない数値 (32bit を越える整数、非整数 double) は HeapNumber に boxing する。RequiredAlignment は double 値の 8byte 境界を保証する。<code>is_the_hole()</code> (<code class="file-ref">src/objects/heap-number-inl.h:26</code>):</p>
+
+<pre><code class="language-cpp">return value_as_bits() == kHoleNanInt64;
+</code></pre>
+
+<p>すなわち hole NaN との bit 一致を見る。</p>
+
+<h4>5.2 In-object double field</h4>
+
+<p>オブジェクトの数値プロパティが一貫して double に収まる場合、<code>Representation::Double</code> (<code class="file-ref">src/objects/property-details.h:115</code>) を選び、in-object 領域に double を直接書く。プロパティが <code>kMutable</code> のときは HeapNumber 経由でも box できるが、in-object なら直接 8 byte の double 領域となる。</p>
+
+<p><code>Representation::MightCauseMapDeprecation</code> (<code class="file-ref">src/objects/property-details.h:141-155</code>):</p>
+
+<pre><code class="language-cpp">if (IsTagged() || IsHeapObject() || IsDouble() || IsWasmValue()) {
+  return false;
+}
+// None to double and smi to double representation changes require
+// deprecation, because doubles might require box allocation, see
+// CanBeInPlaceChangedTo().
+DCHECK(IsNone() || IsSmi());
+return true;
+</code></pre>
+
+<p>Smi 表現の field に double を書こうとすると Map が deprecate され、新しい Map が作られる。逆に Double -&gt; Tagged は in-place で可能 (<code>CanBeInPlaceChangedTo</code>、<code class="file-ref">src/objects/property-details.h:157-169</code>)。</p>
+
+<p>Tagged 表現の field に double を入れるときは新たに HeapNumber を確保して入れる。これが「box allocation」。</p>
+
+<p>Mutable HeapNumber は double をプロパティで書き換え可能にしたい場合に専用 Map (heap_number_map とは別) を使うことがあったが、現代の V8 では Representation::Double を持つ in-object field を直接書き換える方式に統一されている。歴史的経緯のため <code>mutable_heap_number_map</code> という名前は ROOT から消えており、property-details.h の <code>kDouble</code> だけが残る。</p>
+
+<h3 id="p5-6">6. BigInt</h3>
+
+<p><code class="file-ref">src/objects/bigint.h:90-191</code>:</p>
+
+<pre><code class="language-cpp">V8_OBJECT class BigIntBase : public PrimitiveHeapObject {
+ public:
+  ...
+  using digit_t = uintptr_t;
+  static const uint32_t kDigitSize = sizeof(digit_t);
+  static const uint32_t kDigitBits = kDigitSize * kBitsPerByte;
+  ...
+  static const uint32_t kMaxBitsBits = 30;
+  static const uint32_t kMaxLength =
+      ((1 &lt;&lt; kMaxBitsBits) - 1) / (kSystemPointerSize * kBitsPerByte);
+  static const uint32_t kMaxBits = kMaxLength * kSystemPointerSize * kBitsPerByte;
+  ...
+  using SignBits   = base::BitField&lt;bool, 0, 1&gt;;
+  using PaddingBits = SignBits::Next&lt;uint32_t, kPaddingBits&gt;;
+  using LengthBits = PaddingBits::Next&lt;uint32_t, kLengthFieldBits&gt;;
+
+  std::atomic_uint32_t bitfield_;
+#ifdef BIGINT_NEEDS_PADDING
+  char padding_[4];
+#endif
+  FLEXIBLE_ARRAY_MEMBER(UnalignedValueMember&lt;digit_t&gt;, raw_digits);
+};
+</code></pre>
+
+<p>レイアウト:</p>
+
+<pre><code class="language-text">BigInt
++-------------+ 0
+| Map*        | T
++-------------+
+| bitfield_   | 4 (sign:1 + padding + length:25 等)
++-------------+
+| padding_    | 4 (64bit 非圧縮時のみ)
++-------------+
+| digit[0]    | 8 (uintptr_t)
+| digit[1]    | 8
+| ...         |
++-------------+
+</code></pre>
+
+<p><code>bitfield_</code> は sign (符号) と length (digit 個数) を 1 つの 32bit atomic に詰め込む (<code class="file-ref">src/objects/bigint.h:121-126</code>)。<code>kMaxBits ~ 10億 bit</code> (約 125MB のメモリ消費) で打ち切る。<code>kMaxLength</code> は 64bit 環境で <code>1 &lt;&lt; 27 / 64 ≈ 16M</code> digits = 1G bits.</p>
+
+<p><code>SizeFor</code> (<code class="file-ref">src/objects/bigint.h:263-265</code>):</p>
+
+<pre><code class="language-cpp">static inline uint32_t SizeFor(uint32_t length) {
+  return sizeof(BigInt) + length * kDigitSize;
+}
+</code></pre>
+
+<p><code>digit_t = uintptr_t</code> なので 64bit プラットフォームでは各 digit が 8 byte unsigned で、リトルエンディアン的に低位 → 高位の順に並ぶ (絶対値表現)。符号は <code>bitfield_</code> の bit 0。</p>
+
+<p>Mutable / Immutable を区別する <code>MutableBigInt</code> クラスが内部に存在し (<code class="file-ref">src/objects/bigint.cc</code>)、<code>FreshlyAllocatedBigInt</code> (<code class="file-ref">src/objects/bigint.h:172-191</code>) は newly allocated で書き込み可能な中間状態。完成後 <code>MakeImmutable</code> で BigInt にキャスト変換される。</p>
+
+<p><code>BigInt::Hash</code> (<code class="file-ref">src/objects/bigint.h:227-230</code>):</p>
+
+<pre><code class="language-cpp">return ComputeUnseededHash(length() | (sign() ? (1 &lt;&lt; 30) : 0)) ^
+       ComputeLongHash(static_cast&lt;uint64_t&gt;(is_zero() ? 0 : digit(0)));
+</code></pre>
+
+<p>length と最下位 digit のみからハッシュを計算するため、衝突を許容する近似値。</p>
+
+<h3 id="p5-7">7. JSReceiver, JSObject, JSFunction</h3>
+
+<h4>7.1 JSFunction</h4>
+
+<p><code class="file-ref">src/objects/js-function.h:130-...</code>:</p>
+
+<pre><code class="language-cpp">V8_OBJECT class JSFunction : public JSFunctionOrBoundFunctionOrWrappedFunction {
+  ...
+ public:
+  TaggedMember&lt;SharedFunctionInfo&gt; shared_function_info_;  // line 509
+  TaggedMember&lt;Context&gt;            context_;               // line 510
+  TaggedMember&lt;FeedbackCell&gt;       feedback_cell_;         // line 511
+};
+</code></pre>
+
+<p><code>JSFunctionWithPrototype</code> (<code class="file-ref">src/objects/js-function.h:536-552</code>) はさらに <code>prototype_or_initial_map_</code> を追加する。</p>
+
+<pre><code class="language-text">JSFunction レイアウト
++--------------------------+ 0
+| Map*                     |
++--------------------------+
+| properties_or_hash_      |
++--------------------------+
+| elements_                |
++--------------------------+
+| shared_function_info_    | SharedFunctionInfo
++--------------------------+
+| context_                 | NativeContext or FunctionContext
++--------------------------+
+| feedback_cell_           | FeedbackCell (内部に FeedbackVector)
++--------------------------+
+| prototype_or_initial_map_| (kPrototype 系のみ)
++--------------------------+
+</code></pre>
+
+<p><code>SharedFunctionInfo</code> (SFI) は同じ関数定義から作られる全クロージャ間で共有されるメタデータ (バイトコード、ソース位置、コードキャッシュ等)。<code>FeedbackVector</code> は型フィードバック用のスロット配列で、TurboFan/Maglev の入力になる。<code>FeedbackCell</code> は FeedbackVector を 1 段かぶせて参照カウント・初期化遅延等を扱う。</p>
+
+<h4>7.2 Closures と Context</h4>
+
+<p><code>Context</code> は変数バインディング配列 (FixedArray の親戚)。<code>context_</code> field を辿ることでスコープチェーンを表現する。Closures は同じ SFI を参照する複数の JSFunction が独立な <code>context_</code> を持つことで実現される。</p>
+
+<h3 id="p5-8">8. Hash の格納</h3>
+
+<h4>8.1 String hash field</h4>
+
+<p>前述 (1.8 節)。<code>Name::raw_hash_field_</code> (<code class="file-ref">src/objects/name.h:304</code>) の上位 30bit に格納。<code>String::ComputeAndSetRawHash</code> (<code class="file-ref">src/objects/string.cc:1911-1928</code>) で初回計算され atomically store される。<code>HasHashCode</code> 判定は <code>raw_hash_field_ &amp; kHashNotComputedMask == 0</code> で行う (<code class="file-ref">src/objects/name.h:176</code>)。</p>
+
+<h4>8.2 JSObject identity hash</h4>
+
+<p>JSObject は <code>properties_or_hash_</code> (<code class="file-ref">src/objects/js-objects.h:373</code>) を hash 兼用にする:</p>
+
+<p>プロパティが無く identity hash だけ要る場合: Smi として直接格納。</p>
+<p>PropertyArray を持つ場合: PropertyArray の <code>length_and_hash_</code> フィールド (<code class="file-ref">src/objects/property-array.h:82</code>) に length と hash を共存させる。<code>kLengthFieldSize = 10</code> (<code class="file-ref">src/objects/property-array.h:67</code>)、<code>HashField = BitField&lt;int, 10, kSmiValueSize - 10 - 1&gt;</code> (<code class="file-ref">src/objects/property-array.h:70-71</code>)。</p>
+<p>NameDictionary を持つ場合: 辞書の専用エントリに格納。</p>
+
+<p><code>JSReceiver::kHashMask = PropertyArray::HashField::kMask</code> (<code class="file-ref">src/objects/js-objects.h:363</code>)。<code>GetOrCreateIdentityHash</code> (<code class="file-ref">src/objects/js-objects.h:345</code>) で遅延生成される。</p>
+
+<h4>8.3 BigInt の hash</h4>
+
+<p>前述 (6 節)、length と digit(0) からの近似計算で 32bit ハッシュ。</p>
+
+<h3 id="p5-9">9. まとめ ― 状態遷移と最適化の俯瞰</h3>
+
+<p>ここまで見たように V8 は「同じ JS 値でも複数の物理表現がありえる」という設計を一貫して採用している。代表的な遷移グラフ:</p>
+
+<p><strong>String</strong></p>
+<pre><code class="language-text">SeqOneByte/SeqTwoByte ─ "+" ─&gt; ConsString ─ Flatten ─&gt; degenerate Cons (first=Seq, second="")
+SeqString ─ slice ─&gt; SlicedString
+String ─ internalize ─&gt; InternalizedString
+                       │
+                       └─ in-place 不可 ─&gt; ThinString -&gt; InternalizedString
+SeqString ─ MakeExternalDuringGC ─&gt; ExternalString
+External ─ internalize ─&gt; ThinString
+</code></pre>
+
+<p><strong>Array (ElementsKind)</strong></p>
+<pre><code class="language-text">PACKED_SMI ─ holey化 ─&gt; HOLEY_SMI
+           ─ object値 ─&gt; PACKED ─ holey化 ─&gt; HOLEY
+           ─ double値 ─&gt; PACKED_DOUBLE ─ holey化 ─&gt; HOLEY_DOUBLE
+HOLEY_DOUBLE ─ object値 ─&gt; HOLEY
+HOLEY ─ sparse/big ─&gt; DICTIONARY_ELEMENTS
+HOLEY ─ Object.preventExtensions ─&gt; HOLEY_NONEXTENSIBLE ─&gt; HOLEY_SEALED ─&gt; HOLEY_FROZEN
+</code></pre>
+
+<p><strong>TypedArray</strong></p>
+<pre><code class="language-text">new Uint8Array(&lt;= 8 elem) → on-heap (ByteArray backing, base_pointer != 0)
+new Uint8Array(&gt; 8 elem)  → off-heap (BackingStore malloc, base_pointer = Smi::zero())
+TypedArray.GetBuffer()    → on-heap → off-heap への昇格 (一度だけ起きる)
+ArrayBuffer.transfer()    → 旧 buffer detach、新 buffer 作成
+</code></pre>
+
+<p><strong>Number</strong></p>
+<pre><code class="language-text">Smi (32bit fit)                ─ overflow ─&gt; HeapNumber (boxed double)
+Object field Representation::Smi ─ double代入 ─&gt; Map deprecate → Representation::Double
+                                                                  ↓ in-place double
+                                ─ HeapObject代入 ─&gt; Representation::Tagged
+</code></pre>
+
+<p>これらの「複数表現」と「遷移」を直接 V8 内部から読み解くと、ベンチマーク結果や JIT の挙動が予測しやすくなる。例えば配列を <code>[1,2,3]</code> で初期化したあと <code>arr[100] = 1</code> のように飛び穴を作ると <code>PACKED_SMI</code> から <code>HOLEY_SMI</code> に落ち、さらに大きく飛ばすと <code>DICTIONARY_ELEMENTS</code> になり性能が桁違いに低下する、というのは ElementsKind の遷移を理解していれば自然に予測できる。同様に <code>s += "x"</code> を多用すると ConsString が深くなり最終的に Flatten で巨大コピーが走ること、JSON.parse のキーが内部で internalize されて ThinString になることなど、ソースに直接根拠を辿れるようになる。</p>
+
+<p>参照したファイルは以下の通り (主要なもの)。本書の各記述に対応する行番号を本文中で明示している。</p>
+
+<table>
+<thead><tr><th>パス</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/string.h</code></td><td>String, SeqString, ConsString, SlicedString, ThinString, ExternalString 定義</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/string-inl.h</code></td><td>Flatten, SlowFlatten, SizeFor 等</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/string.cc</code></td><td>MakeThin, MakeExternalDuringGC, ConsString::Get, SlowEquals</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/name.h</code></td><td>raw_hash_field_, HashFieldType, ArrayIndex 関連</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/instance-type.h</code></td><td>StringRepresentationTag, kInternalizedTag, kSharedStringTag</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/strings/string-hasher.h</code>, <code class="file-ref">string-hasher-inl.h</code></td><td>StringHasher, kZeroHash, GetTrivialHash</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/fixed-array.h</code></td><td>FixedArray, FixedDoubleArray, TaggedArrayBase, PrimitiveArrayBase</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/elements-kind.h</code></td><td>ElementsKind 列挙、判定マクロ</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/elements.h</code>, <code class="file-ref">elements.cc</code></td><td>ElementsAccessor、transition の実装</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/js-array.h</code></td><td>JSArray, kMaxFastArrayLength</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/js-objects.h</code></td><td>JSReceiver, JSObject, PropertiesOrHash, kMaxInObjectProperties</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/js-array-buffer.h</code>, <code class="file-ref">js-array-buffer-inl.h</code></td><td>JSArrayBuffer, JSArrayBufferView, JSTypedArray, is_on_heap</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/backing-store.h</code></td><td>BackingStore, ResizeInPlace, Flag 群</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/heap-number.h</code>, <code class="file-ref">heap-number-inl.h</code></td><td>HeapNumber, is_the_hole</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/bigint.h</code></td><td>BigIntBase, kMaxLength, digit 配列</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/js-function.h</code></td><td>JSFunction, shared_function_info, context, feedback_cell</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/property-details.h</code></td><td>Representation (None/Smi/Double/HeapObject/Tagged)</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/objects/property-array.h</code></td><td>PropertyArray, length_and_hash_</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/include/v8-internal.h</code></td><td>kSmiTag, kHeapObjectTag, SmiTagging</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/include/v8-primitive.h</code></td><td>String::kMaxLength</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/include/v8-typed-array.h</code></td><td>各 TypedArray の kMaxLength</td></tr>
+<tr><td><code class="file-ref">/home/user/v8/src/common/globals.h</code></td><td>kHoleNanInt64, kTaggedSize, kSystemPointerSize 等</td></tr>
+</tbody>
+</table>
+
+</section>
+

@@ -1,0 +1,8 @@
+<h2 id="section-14">14. growable_fixed_array</h2>
+
+<p><code class="file-ref">src/builtins/growable-fixed-array.tq</code> 全 48 行が namespace 全体を含みます。中心は struct <code>GrowableFixedArray</code> で、Push は <code>EnsureCapacity</code> の後に <code>array.objects[length++] = obj</code> というインライン書き込み、<code>ResizeFixedArray</code> は <code>ExtractFixedArray</code> で新しい容量へのコピーを行います。<code>EnsureCapacity</code> の成長率は <code>current + (current &gt;&gt; 1) + 16</code>、すなわち 1.5 倍プラス 16 です。初期は <code>kEmptyFixedArray</code> で容量 0 なので、最初の Push で 16 になり、次のリサイズで 16 + 8 + 16 = 40、その次は 40 + 20 + 16 = 76 と段階的に増えます。</p>
+
+<p>array-flat.tq の <code>CalculateFlattenedLengthFast</code> (行 75) と <code>TryFastFlat</code> (行 206、行 280) では、再帰深さを表現する手動スタックとしてこれを使っています。各段の <code>(currentArray, nextIndex, currentDepth)</code> の三つ組を Push し、リーフから戻るときに Pop します。</p>
+
+<hr/>
+

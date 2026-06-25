@@ -1,0 +1,24 @@
+<h2 id="chapter-11">第 11 章 テスト戦略</h2>
+
+<h3 id="sec-11-1">11.1 test/torque/test-torque.tq</h3>
+
+<p>実際の Torque コードのサンプル + テスト用マクロ集です (<code>test/torque/test-torque.tq</code>、1,213 行)。<code>@export</code> された各マクロは <code>test/cctest/torque/test-torque.cc</code> から呼ばれ、<code>cctest test-torque/Xxx</code> の形で個別実行できます。</p>
+
+<h3 id="sec-11-2">11.2 test/cctest/torque/test-torque.cc</h3>
+
+<p>test-torque.tq から出力された <code>@export</code> マクロを CSA から直接呼び出して動作検証する C++ テストです。<code>TestTorqueAssembler</code> が CodeStubAssembler を継承し、<code>CodeAssemblerTester</code> 経由でコードを生成してから <code>FunctionTester</code> で実行します。</p>
+
+<h3 id="sec-11-3">11.3 test/unittests/torque/</h3>
+
+<p>Torque コンパイラ自身のユニットテストです。<code>torque-unittest.cc</code> に <code>kTestTorquePrelude</code> という最小限の Torque 型定義文字列があり、<code>CompileTorque</code> を呼んでパース/型検査/IR 構築までを単体検証します。実コードを生成せず CFG までを検証するため、<code>output_directory = ""</code> で <code>SetDryRun(true)</code> 経由のドライランを使います。</p>
+
+<h3 id="sec-11-4">11.4 mjsunit テスト</h3>
+
+<p>実際のビルトインの挙動テストは <code>test/mjsunit/</code> 配下にあり、<code>tools/run-tests.py --outdir=out/x64.release mjsunit/array-foreach</code> のように個別 builtin の動作を JS レベルで検証できます。<code class="file-ref">agents/skills/torque/SKILL.md:57-79</code> の Mandatory verification workflow に手順がまとまっています。</p>
+
+<pre><code class="language-bash">tools/dev/gm.py quiet x64.optdebug
+tools/run-tests.py --progress dots --outdir=out/x64.optdebug mjsunit/&lt;test_name&gt;
+</code></pre>
+
+<hr>
+

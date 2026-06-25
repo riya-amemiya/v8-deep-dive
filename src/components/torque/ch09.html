@@ -1,0 +1,228 @@
+<h2 id="chapter-9">第 9 章 代表的ビルトインの実装パターン</h2>
+
+<h3 id="sec-9-1">9.1 Array.prototype.map</h3>
+
+<p><code class="file-ref">src/builtins/array-map.tq</code> のメインループ <code>ArrayMapLoopContinuation</code> は仕様準拠 slow path で、コメントが ECMA262 仕様のステップ番号と対応しています。</p>
+
+<pre><code class="language-torque">transitioning builtin ArrayMapLoopContinuation(
+    implicit context: Context)(_receiver: JSReceiver, callbackfn: Callable,
+    thisArg: JSAny, array: JSReceiver, o: JSReceiver, initialK: Number,
+    length: Number): JSAny {
+  // 6. Let k be 0.
+  // 7. Repeat, while k &lt; len
+  for (let k: Number = initialK; k &lt; length; k++) {
+    // 7a. Let Pk be ! ToString(k).
+    // 7b. Let kPresent be ? HasProperty(O, Pk).
+    const kPresent: Boolean = HasProperty_Inline(o, k);
+    if (kPresent == True) {
+      // i. Let kValue be ? Get(O, Pk).
+      const kValue: JSAny = GetProperty(o, k);
+      // ii. Let mapped_value be ? Call(callbackfn, T, kValue, k, O).
+      const mappedValue: JSAny = Call(context, callbackfn, thisArg, kValue, k, o);
+      // iii. Perform ? CreateDataPropertyOrThrow(A, Pk, mapped_value).
+      FastCreateDataProperty(array, k, mappedValue);
+    }
+  }
+  return array;
+}
+</code></pre>
+
+<p>これと並行して、<code>Vector</code> struct を使った fast path 実装 (要素を観察しながら elements kind を最適化) も同ファイルにあり、Bailout で行き来します。</p>
+
+<h3 id="sec-9-2">9.2 Array.prototype.forEach</h3>
+
+<p>8.1 で見たとおり、<code>FastArrayForEach</code> は <code>FastJSArrayWitness</code> で transient 性を維持しながら密配列を直接イテレートし、callback 呼び出し直後に <code>Recheck()</code> で再検証する、というパターンです。</p>
+
+<h3 id="sec-9-3">9.3 Promise.prototype.then</h3>
+
+<p><code class="file-ref">src/builtins/promise-then.tq:25-86</code> の <code>PromisePrototypeThen</code> は次のように書かれています。</p>
+
+<pre><code class="language-torque">transitioning javascript builtin PromisePrototypeThen(
+    js-implicit context: NativeContext, receiver: JSAny)(onFulfilled: JSAny,
+    onRejected: JSAny): JSAny {
+  // 1. Let promise be the this value.
+  // 2. If IsPromise(promise) is false, throw a TypeError exception.
+  const promise = Cast&lt;JSPromise&gt;(receiver) otherwise ThrowTypeError(...);
+
+  // 3. Let C be ? SpeciesConstructor(promise, %Promise%).
+  const promiseFun = *NativeContextSlot(ContextSlot::PROMISE_FUNCTION_INDEX);
+
+  let resultPromiseOrCapability: JSPromise|PromiseCapability;
+  let resultPromise: JSAny;
+  try {
+    if (IsPromiseSpeciesLookupChainIntact(context, promise.map)) {
+      goto AllocateAndInit;
+    }
+    const constructor = SpeciesConstructor(promise, promiseFun);
+    if (TaggedEqual(constructor, promiseFun)) {
+      goto AllocateAndInit;
+    } else {
+      const promiseCapability = NewPromiseCapability(constructor, True);
+      resultPromiseOrCapability = promiseCapability;
+      resultPromise = promiseCapability.promise;
+    }
+  } label AllocateAndInit {
+    const resultJSPromise = NewJSPromise(promise);
+    resultPromiseOrCapability = resultJSPromise;
+    resultPromise = resultJSPromise;
+  }
+
+  const onFulfilled = CastOrDefault&lt;Callable&gt;(onFulfilled, Undefined);
+  const onRejected = CastOrDefault&lt;Callable&gt;(onRejected, Undefined);
+  PerformPromiseThenImpl(promise, onFulfilled, onRejected, resultPromiseOrCapability);
+
+  if (HasAsyncEventDelegate()) {
+    return runtime::DebugPromiseThen(resultPromise);
+  }
+  return resultPromise;
+}
+</code></pre>
+
+<p><code>IsPromiseSpeciesLookupChainIntact</code> は <code>Promise.prototype</code> 周辺の protector cell をチェックし、SpeciesConstructor を呼ばずに <code>Promise</code> を直接生成できる条件を判定します。これが satisfied なら <code>AllocateAndInit</code> で <code>NewJSPromise(promise)</code> を fast path に入り、そうでなければ仕様準拠の <code>SpeciesConstructor</code> 経路に落ちます。</p>
+
+<h3 id="sec-9-4">9.4 PerformPromiseThenImpl の Fast Path</h3>
+
+<pre><code class="language-torque">// /home/user/v8/src/builtins/promise-abstract-operations.tq:463-502
+@export
+transitioning macro PerformPromiseThenImpl(...) {
+  if (promise.Status() == PromiseState::kPending) {
+    const promiseReactions =
+        UnsafeCast&lt;(Zero | PromiseReaction)&gt;(promise.reactions_or_result);
+    const reaction = NewPromiseReaction(...);
+    promise.reactions_or_result = reaction;
+  } else {
+    const reactionsOrResult = promise.reactions_or_result;
+    let microtask: PromiseReactionJobTask;
+    let handlerContext: Context;
+    if (promise.Status() == PromiseState::kFulfilled) {
+      handlerContext = ExtractHandlerContext(onFulfilled, onRejected);
+      microtask = NewPromiseFulfillReactionJobTask(...);
+    } else
+      deferred {
+        handlerContext = ExtractHandlerContext(onRejected, onFulfilled);
+        microtask = NewPromiseRejectReactionJobTask(...);
+        if (!promise.HasHandler()) {
+          runtime::PromiseRevokeReject(promise);
+        }
+      }
+    EnqueueMicrotask(handlerContext, microtask);
+  }
+  promise.SetHasHandler();
+}
+</code></pre>
+
+<p>Rejected ケースだけ <code>deferred</code> ブロックに入っているのは「実プログラムでは Fulfilled の方が圧倒的に多い」という前提に基づくコールド配置最適化です。</p>
+
+<h3 id="sec-9-5">9.5 Iterator.from と IteratorRecord</h3>
+
+<p>ES2024 で標準入りした <code>Iterator.from</code> の実装は <code class="file-ref">src/builtins/iterator-from.tq</code> にあり、<code>GetIteratorFlattenable</code> ヘルパ (これも ECMA262 の名前そのまま) を経由します。</p>
+
+<pre><code class="language-torque">transitioning macro GetIteratorFlattenable(
+    implicit context: Context)(obj: JSReceiver|String): IteratorRecord {
+  let iterator: JSAny;
+  try {
+    // 2. Let method be ? GetMethod(obj, @@iterator).
+    const method = GetMethod(obj, IteratorSymbolConstant())
+        otherwise IfNullOrUndefined;
+    // 4. Else (method is not undefined),
+    //  a. Let iterator be ? Call(method, obj).
+    iterator = Call(context, method, obj);
+  } label IfNullOrUndefined {
+    // 3. If method is undefined, then
+    //  a. Let iterator be obj.
+    iterator = obj;
+  }
+  // 5. If iterator is not an Object, throw a TypeError exception.
+  const iteratorObj = Cast&lt;JSReceiver&gt;(iterator)
+      otherwise ThrowTypeError(MessageTemplate::kNotIterable, obj);
+  // 6. Return ? GetIteratorDirect(iterator).
+  return GetIteratorDirect(iteratorObj);
+}
+</code></pre>
+
+<h3 id="sec-9-6">9.6 iterator-helpers のディスパッチ</h3>
+
+<p>iterator-helpers の <code>IteratorHelperPrototypeNext</code> は、すべての helper 種別を typeswitch で 1 段で分岐させ、それぞれの専用 next ビルトインへ tail させる構造です。</p>
+
+<pre><code class="language-torque">typeswitch (helper) {
+  case (mapHelper: JSIteratorMapHelper): return IteratorMapHelperNext(mapHelper);
+  case (filterHelper: JSIteratorFilterHelper): return IteratorFilterHelperNext(filterHelper);
+  case (takeHelper: JSIteratorTakeHelper): return IteratorTakeHelperNext(takeHelper);
+  case (dropHelper: JSIteratorDropHelper): return IteratorDropHelperNext(dropHelper);
+  case (flatMapHelper: JSIteratorFlatMapHelper): return IteratorFlatMapHelperNext(flatMapHelper);
+  case (concatHelper: JSIteratorConcatHelper): return IteratorConcatHelperNext(concatHelper);
+  case (zipHelper: JSIteratorZipKeyedHelper): return IteratorZipKeyedHelperNext(zipHelper);
+  case (zipHelper: JSIteratorZipHelper): return IteratorZipHelperNext(zipHelper);
+  case (Object): { unreachable; }
+}
+</code></pre>
+
+<p>仕様の段階で「これらすべてが Generator として表現される」と言われていますが、V8 は内部 state machine を抱えた専用オブジェクト (<code>JSIteratorHelper</code> の派生) として実装し、generator runtime のオーバーヘッドを完全に省いています。</p>
+
+<h3 id="sec-9-7">9.7 Proxy の Get トラップ</h3>
+
+<pre><code class="language-torque">// /home/user/v8/src/builtins/proxy-get-property.tq:14-62
+transitioning builtin ProxyGetProperty(
+    implicit context: Context)(proxy: JSProxy, name: PropertyKey,
+    receiverValue: JSAny, onNonExistent: Smi): JSAny {
+  PerformStackCheck();
+  // ...
+
+  let handler: JSReceiver;
+  typeswitch (proxy.handler) {
+    case (Null): {
+      ThrowTypeError(MessageTemplate::kProxyRevoked, 'get');
+    }
+    case (h: JSReceiver): {
+      handler = h;
+    }
+  }
+
+  const target = Cast&lt;JSReceiver&gt;(proxy.target) otherwise unreachable;
+  const trap: Callable = GetInterestingMethod(handler, GetStringConstant())
+      otherwise return GetPropertyWithReceiver(
+      target, name, receiverValue, onNonExistent);
+
+  const trapResult = Call(context, trap, handler, target, name, receiverValue);
+  CheckGetSetTrapResult(target, proxy, name, trapResult, kProxyGet);
+  return trapResult;
+}
+</code></pre>
+
+<p><code>GetInterestingMethod(handler, GetStringConstant()) otherwise return GetPropertyWithReceiver(...)</code> の形で、「<code>get</code> トラップが定義されていない」ときに <code>otherwise return</code> でターゲットへの直接アクセスをその場で <code>return</code> する書き方が特徴的です。</p>
+
+<h3 id="sec-9-8">9.8 Object.fromEntries の FastJSArray 最適化</h3>
+
+<p>Iterator を消費するもう一つの典型ビルトイン <code>Object.fromEntries</code> も、入力が <code>FastJSArrayWithNoCustomIteration</code> であれば直接配列を走査する Fast Path を持ちます。</p>
+
+<pre><code class="language-torque">// /home/user/v8/src/builtins/object-fromentries.tq:7-47
+transitioning macro ObjectFromEntriesFastCase(
+    implicit context: Context)(iterable: JSAny): JSObject labels IfSlow {
+  typeswitch (iterable) {
+    case (array: FastJSArrayWithNoCustomIteration): {
+      const elements: FixedArray = Cast&lt;FixedArray&gt;(array.elements) otherwise IfSlow;
+      const length: Smi = array.length;
+      const result: JSObject = NewJSObject();
+
+      for (let k: Smi = 0; k &lt; length; ++k) {
+        const value: JSAny = array::LoadElementOrUndefined(elements, k);
+        const pair: KeyValuePair =
+            collections::LoadKeyValuePairNoSideEffects(value) otherwise IfSlow;
+        typeswitch (pair.key) {
+          case (Name): { CreateDataProperty(result, pair.key, pair.value); }
+          case (Number): { CreateDataProperty(result, pair.key, pair.value); }
+          case (oddball: Oddball): { CreateDataProperty(result, oddball.to_string, pair.value); }
+          case (JSAny): { goto IfSlow; }
+        }
+      }
+      return result;
+    }
+    case (JSAny): { goto IfSlow; }
+  }
+}
+</code></pre>
+
+<p>「<code>FastJSArrayWithNoCustomIteration</code> という超強い型」が役立っており、これは <code>ArrayIteratorProtector</code> が intact、<code>NoElementsProtector</code> も intact、初期 Array.prototype のまま、というすべての条件を一発で満たした型です。</p>
+
+<hr>
+

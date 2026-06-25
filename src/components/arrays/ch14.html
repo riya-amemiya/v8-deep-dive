@@ -1,0 +1,60 @@
+<h2 id="chapter14">第14章 SIMD最適化 ― indexOf と includes</h2>
+
+<p>V8 の indexOf と includes は他の配列メソッドと異なり、CPU の SIMD (Single Instruction Multiple Data) 命令を活用するため、特別な実装になっています。</p>
+
+<h3 id="sec14-1">14.1 SIMD分岐</h3>
+
+<p><code class="file-ref">src/builtins/builtins-array-gen.cc:709</code> で</p>
+
+<pre><code class="language-cpp">const int kSIMDThreshold = 48;
+
+#if defined(__SSE3__) || defined(V8_HOST_ARCH_ARM64)
+const bool kCanVectorize = true;
+#else
+const bool kCanVectorize = false;
+#endif
+</code></pre>
+
+<p>長さ 48 未満の配列ではスカラ比較ループ、48 以上で SIMD が使えるなら SIMD パスに分岐します。</p>
+
+<h3 id="sec14-2">14.2 CPU別の実装</h3>
+
+<p><code class="file-ref">src/objects/simd.cc:40</code> の <code>get_vectorization_kind</code> が CPU 機能を runtime に検出します。</p>
+
+<pre><code class="language-cpp">inline SimdKinds get_vectorization_kind() {
+#ifdef __SSE3__
+  bool has_avx2 = CpuFeatures::IsSupported(AVX2);
+  if (has_avx2) return SimdKinds::kAVX2;
+  return SimdKinds::kSSE;
+#elif defined(NEON64)
+  if (CpuFeatures::IsSupported(SVE)) return SimdKinds::kSVE;
+  return SimdKinds::kNeon;
+#else
+  return SimdKinds::kNone;
+#endif
+}
+</code></pre>
+
+<p>AVX2 が使える x64 では 256bit (Pointer Compression 環境で 8 要素分) をまとめて比較、それ以外の SSE では 128bit (4 要素)、Arm64 で SVE は可変長 (実装による)、NEON は 128bit です。</p>
+
+<h3 id="sec14-3">14.3 ElementsKindごとの分岐</h3>
+
+<p><code class="file-ref">builtins-array-gen.cc:799</code> で ElementsKind ごとに専用 builtin に分岐します。</p>
+
+<pre><code class="language-cpp">GotoIf(IsElementsKindLessThanOrEqual(elements_kind, HOLEY_SMI_ELEMENTS),
+       &amp;if_smi);
+GotoIf(IsElementsKindLessThanOrEqual(elements_kind, HOLEY_ELEMENTS),
+       &amp;if_smiorobjects);
+GotoIf(
+    ElementsKindEqual(elements_kind, Int32Constant(PACKED_DOUBLE_ELEMENTS)),
+    &amp;if_packed_doubles);
+GotoIf(ElementsKindEqual(elements_kind, Int32Constant(HOLEY_DOUBLE_ELEMENTS)),
+       &amp;if_holey_doubles);
+</code></pre>
+
+<p>それぞれが <code>Builtin::kArrayIndexOfSmi</code>、<code>Builtin::kArrayIndexOfSmiOrObject</code>、<code>Builtin::kArrayIndexOfPackedDoubles</code>、<code>Builtin::kArrayIndexOfHoleyDoubles</code> を呼びます。</p>
+
+<p>これにより <code>indexOf</code> / <code>includes</code> は 1要素ずつ比較するのではなく、AVX2 では 256bit (8 要素 pointer-compress 環境)、Neon では 128bit (4 要素) の vector load + 比較 + nonzero-index 抽出を行います。数千要素の配列でも数百ナノ秒で線形検索が完了します。</p>
+
+<hr>
+

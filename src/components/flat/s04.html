@@ -1,0 +1,52 @@
+<h2 id="section-4">4. ElementsKind とその遷移</h2>
+
+<p><code class="file-ref">src/objects/elements-kind.h</code> 行 105 以降に <code>enum ElementsKind : uint8_t</code> が定義されています。Map の <code>bit_field2</code> 内に 6 ビットで格納されます (<code>kElementsKindBits = 6</code>、行 193)。</p>
+
+<p>fast 系の値は列挙順に 0 から割り当てられ、以下のような ElementsKind の値が定義されています。</p>
+
+<table>
+<thead>
+<tr><th>名前</th><th>値</th></tr>
+</thead>
+<tbody>
+<tr><td><code>PACKED_SMI_ELEMENTS</code></td><td>0</td></tr>
+<tr><td><code>HOLEY_SMI_ELEMENTS</code></td><td>1</td></tr>
+<tr><td><code>PACKED_ELEMENTS</code></td><td>2</td></tr>
+<tr><td><code>HOLEY_ELEMENTS</code></td><td>3</td></tr>
+<tr><td><code>PACKED_DOUBLE_ELEMENTS</code></td><td>4</td></tr>
+<tr><td><code>HOLEY_DOUBLE_ELEMENTS</code></td><td>5</td></tr>
+</tbody>
+</table>
+
+<p>この並びには二つの設計上の含意があります。第一に packed と holey が隣り合っており packed → holey は <code>+1</code> (<code>kFastElementsKindPackedToHoley</code>) で表せること (行 190-191)、第二に奇数なら holey、偶数なら packed が成り立つことで <code>IsHoleyElementsKind</code> は <code>kind % 2 == 1</code> で済むことです。</p>
+
+<p>それぞれの ElementsKind の意味は以下の通りです。<code>PACKED_SMI_ELEMENTS</code> は Smi のみを格納し穴がない状態で、バッキングストアは <code>FixedArray</code> ですが各スロットには tagged Smi が直接埋め込まれます。<code>HOLEY_SMI_ELEMENTS</code> は Smi と <code>the_hole</code> だけを格納する <code>FixedArray</code> です。<code>PACKED_ELEMENTS</code> は任意の <code>JSAny</code> 値 (Smi / HeapObject) を格納し穴がない状態、<code>HOLEY_ELEMENTS</code> は加えて <code>the_hole</code> を許容する <code>FixedArray</code> です。<code>PACKED_DOUBLE_ELEMENTS</code> / <code>HOLEY_DOUBLE_ELEMENTS</code> は <code>FixedDoubleArray</code> をバッキングストアにし、Smi / HeapNumber の境界を意識せず生の double をインラインで詰めます。<code>DICTIONARY_ELEMENTS</code> は <code>NumberDictionary</code> ハッシュテーブルをバッキングストアにする slow パスで、配列が sparse になる、巨大すぎる、<code>Object.defineProperty</code> で記述子付きの要素を入れる等の理由で fast → slow 化されます。</p>
+
+<p>遷移規則 (<code>IsMoreGeneralElementsKindTransition</code>, elements-kind.cc 行 184) は格子状で、<code>PACKED_SMI → HOLEY_SMI → HOLEY_DOUBLE → HOLEY_ELEMENTS</code> の方向にしか動けず、<code>PACKED_DOUBLE</code> は <code>HOLEY_DOUBLE</code> か <code>PACKED/HOLEY_ELEMENTS</code> への遷移しか許されず、<code>HOLEY_ELEMENTS</code> が <code>TERMINAL_FAST_ELEMENTS_KIND</code> (行 171) として終端になります。double → tagged の遷移はバッキングストアの型が変わるため別経路 (<code>GrowCapacityAndConvert</code>) を通り、それ以外の同じ表現幅での遷移は Map の差し替えだけで済みます。</p>
+
+<p>PACKED と HOLEY の差は「コンパイラがロード時の hole チェックを省略できるか」です。PACKED であれば hole が混ざらないことが Map レベルで保証されているので、TurboFan / Maglev は branch-free な単純ロードを発行できます。HOLEY だと毎回 hole 比較が必要になり、結果が hole なら別の slow path に飛ばす必要があります。flat の結果が常に PACKED 系になるのはこの最適化を後続コードに享受させるためで、<code>CalculateFlattenedLengthFast</code> の行 174-180 で <code>seenObject</code> / <code>seenDouble</code> / <code>seenSmi</code> フラグを観測した最終結果として PACKED_ELEMENTS、PACKED_DOUBLE_ELEMENTS、PACKED_SMI_ELEMENTS のいずれかを選んで返します。</p>
+
+<h3 id="section-4-1">4.1 hole の二つの表現</h3>
+
+<p>V8 における hole は「配列のそのインデックスに値が一度も書かれていない」状態を表すマーカーで、tagged な世界では <code>TheHole</code> という HeapObject シングルトン (<code class="file-ref">src/objects/hole.h</code> 行 16) で、<code>the_hole_value</code> という名前で read-only roots に登録されています。double の世界では HeapObject を置けないので、シグナル NaN の特定ビットパターン <code>kHoleNanInt64 = 0xFFF7FFFF_FFF7FFFF</code> を hole として使います。</p>
+
+<p>V8 が hole と undefined を区別する根拠は次のとおりです。tagged 配列では <code>the_hole_value</code> はユーザコードから観測できない特別な HeapObject (<code>Hole</code> 型) で、<code>undefined_value</code> (Undefined 型) とは別のシングルトンであり、map も型も別です。<code>LoadElementNoHole&lt;FixedArray&gt;</code> (<code class="file-ref">src/objects/js-array.tq</code> 行 158-170) では typeswitch で <code>TheHole</code> ケースを <code>IfHole</code> ラベルに分岐させ、ユーザに返す前に必ず undefined に置換するか飛ばすかが選ばれます。double 配列でも <code>LoadElementNoHole&lt;FixedDoubleArray&gt;</code> (行 172-185) が <code>kHoleNanInt64</code> を検出して <code>IfHole</code> に飛ばします。</p>
+
+<p>flat が hole を飛ばす実装は array-flat.tq 行 91-95 で、<code>fastOW.LoadElementNoHole(index) otherwise FoundHole</code> でロードを試み、hole なら <code>FoundHole</code> ラベルに飛んで <code>index++; continue;</code> で次の要素に進みます。これによりソースが HOLEY_* であっても結果配列は穴のない PACKED_* になります。仕様 (<code>HasProperty</code> で false なら飛ばす) と完全に整合します。</p>
+
+<h3 id="section-4-2">4.2 kEmptyFixedArray シングルトン</h3>
+
+<p><code class="file-ref">src/heap/setup-heap-internal.cc</code> 行 532-543 で 1 回だけ確保される <code>empty_fixed_array</code> ROOT が <code>kEmptyFixedArray</code> の本体です。<code>AllocateRaw(FixedArray::SizeFor(0), AllocationType::kReadOnly)</code> で <code>FixedArray::SizeFor(0)</code> バイトを read-only space に確保し、map を <code>roots.fixed_array_map()</code> にセット、length を 0 にして padding をクリアします。read-only space に置かれているため全 Isolate / 全 NativeContext からシングルトンとして共有でき、write barrier も不要、GC でも移動しません。</p>
+
+<p>Torque からは <code>const kEmptyFixedArray: EmptyFixedArray = EmptyFixedArrayConstant();</code> (<code class="file-ref">src/builtins/base.tq</code> 行 1470) で参照されます。flat の <code>NewFlatVector</code> (行 37-42) では <code>length &gt; 0 ? AllocateFixedArrayWithHoles(...) : kEmptyFixedArray</code> の三項演算でこの最適化を組み込んでいます。さらに <code>TryFastFlat</code> (行 194-198) では <code>flattenedLength == 0</code> のとき <code>NewJSArray(PACKED_SMI 用 map, kEmptyFixedArray)</code> を直接組み立てて返します。</p>
+
+<h3 id="section-4-3">4.3 NoElementsProtector</h3>
+
+<p><code class="file-ref">src/execution/protectors.h</code> 行 30 に <code>V(NoElements, NoElementsProtector, no_elements_protector)</code> として定義された Isolate-wide のセルで、<code>kProtectorValid = 1</code> の間は「<code>Array.prototype</code> および <code>Object.prototype</code> に index 付き property (要素) が追加されていない」ことを保証します。一度誰かが <code>Array.prototype[42] = 'x'</code> のような操作を行うと <code>Invalidate</code> され、その後その Isolate では <code>kProtectorInvalid = 0</code> になり、二度と戻りません。</p>
+
+<p>このプロテクタが有効である限り、<code>FastJSArray</code> 上で hole を読んだ場合の prototype chain look-up は省略でき、hole がそのまま <code>undefined</code> として扱われる (あるいは flat の場合スキップされる) 動作を信頼できます。flat の fast path は <code>FastJSArrayForReadWitness.Recheck()</code> (<code class="file-ref">src/objects/js-array.tq</code> 行 379-389) で毎ループ <code>IsNoElementsProtectorCellInvalid()</code> を確認し、無効化された瞬間に bailout します。</p>
+
+<p><code>ArraySpeciesProtector</code> も同様の仕組みで、<code>Array[Symbol.species]</code> および <code>Array.prototype.constructor</code> の改変を検知します。flat の fast path はレシーバを <code>Cast&lt;FastJSArrayForCopy&gt;</code> (行 189) でキャストしますが、<code>FastJSArrayForCopy</code> の定義 (<code class="file-ref">src/objects/js-array.tq</code> 行 126) は「<code>FastJSArray</code> when the global ArraySpeciesProtector is not invalidated」なので、species がいじられた瞬間に CastError が発生し fast path 全体が bailout します。</p>
+
+<hr/>
+

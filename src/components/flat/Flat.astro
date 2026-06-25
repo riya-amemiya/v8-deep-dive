@@ -1,0 +1,41 @@
+---
+// Flat — composed from verbatim per-chapter fragments sliced out of the
+// original monolithic index.html. The <article> wrapper is the book boundary;
+// each fragment is one chapter, ready to be split into its own route later.
+import intro from "./intro.html?raw";
+import s01 from "./s01.html?raw";
+import s02 from "./s02.html?raw";
+import s03 from "./s03.html?raw";
+import s04 from "./s04.html?raw";
+import s05 from "./s05.html?raw";
+import s06 from "./s06.html?raw";
+import s07 from "./s07.html?raw";
+import s08 from "./s08.html?raw";
+import s09 from "./s09.html?raw";
+import s10 from "./s10.html?raw";
+import s11 from "./s11.html?raw";
+import s12 from "./s12.html?raw";
+import s13 from "./s13.html?raw";
+import s14 from "./s14.html?raw";
+import s15 from "./s15.html?raw";
+import references from "./references.html?raw";
+---
+<article id="flat-internals" class="chapter">
+<Fragment set:html={intro} />
+<Fragment set:html={s01} />
+<Fragment set:html={s02} />
+<Fragment set:html={s03} />
+<Fragment set:html={s04} />
+<Fragment set:html={s05} />
+<Fragment set:html={s06} />
+<Fragment set:html={s07} />
+<Fragment set:html={s08} />
+<Fragment set:html={s09} />
+<Fragment set:html={s10} />
+<Fragment set:html={s11} />
+<Fragment set:html={s12} />
+<Fragment set:html={s13} />
+<Fragment set:html={s14} />
+<Fragment set:html={s15} />
+<Fragment set:html={references} />
+</article>

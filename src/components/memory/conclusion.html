@@ -1,0 +1,19 @@
+<section id="conclusion">
+<h2>結語</h2>
+
+<p>V8 のメモリ管理は、JavaScript の動的性をハードウェアの効率に翻訳する高度なエンジニアリングの結晶です。以下が本書を貫く設計原則の要約です。</p>
+
+<p>第一に、<strong>型情報をフィールドに別途持たない</strong> ことです。Tagged Pointer の LSB 1 ビットで Smi と HeapObject を区別し、HeapObject の先頭ワードに Map ポインタを置くことで、すべての型情報を「ポインタ自身」と「ヒープ上のオブジェクト先頭」に圧縮しています。</p>
+
+<p>第二に、<strong>同じ shape を Map で共有する</strong> ことです。Hidden Class (Map) と DescriptorArray、TransitionArray、PropertyArray の多層構造により、動的にプロパティが追加されるオブジェクトでも同じパスを辿ったものは同じ Map に収束し、Inline Cache がモノモーフィックに保たれます。</p>
+
+<p>第三に、<strong>世代別仮説に基づく階層的な GC</strong> です。Young (Scavenger または Minor MS)、Old (Mark-Compact)、Large Object、Trusted、Code、Read-Only、Shared という 7 層以上の空間と、それを支える 7 種類の Remembered Set、Write Barrier の 4 段構成、Incremental/Concurrent/Parallel の三方向の並行化、これらすべてが「JS 実行時間の 97% を mutator に渡す」(<code>kTargetMutatorUtilization = 0.97</code>) という目標のもとに調律されています。</p>
+
+<p>第四に、<strong>Inline Cache と階層 JIT</strong> です。UNINITIALIZED → MONOMORPHIC → POLYMORPHIC (上限 4) → MEGAMORPHIC という IC 状態と、Ignition (バイトコード) → Sparkplug (baseline JIT) → Maglev (mid JIT) → TurboFan (top JIT) の階層、そして失敗時の Deoptimization 機構が、コードのホット度に応じて適切な投資をする adaptive optimization を実現しています。</p>
+
+<p>第五に、<strong>アドレス空間を信頼境界として使う Sandbox</strong> です。1 TB の仮想アドレスを予約しその前後 32 GB を guard region とした「実用的に corrupt 不能なアドレス空間」を作り、External Pointer Table、Trusted Pointer Table、Code Pointer Table、JSDispatchTable という4種のテーブルで「sandbox 外への正当な参照」のみを認める設計は、現代の memory safety 強化の到達点と言えます。</p>
+
+<p>これらの仕組みすべてが、Tagged Pointer と Map という共通言語の上に積み重なっており、本書のコード参照を起点に各章の細部に降りていけば、JavaScript エンジンが「言語の柔軟性」と「C++ に匹敵する実行速度」を両立できている理由を、抽象論ではなく具体的な実装としてつかめるはずです。</p>
+
+</section>
+

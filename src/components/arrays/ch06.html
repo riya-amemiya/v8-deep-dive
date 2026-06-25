@@ -1,0 +1,78 @@
+<h2 id="chapter6">第6章 Torque ― V8独自のビルトイン言語</h2>
+
+<h3 id="sec6-1">6.1 Torqueとは何か</h3>
+
+<p>V8 の配列ビルトインは大きく3つの形で実装されています。最も高速なものは Torque で書かれたビルトインです。Torque は V8 専用の DSL (<code>src/torque/</code>) で、<code>.tq</code> ファイルに記述します。Torque コンパイラは型チェックを行ったうえで、最終的に CodeStubAssembler (CSA) と呼ばれる中間 IR に変換します。CSA は TurboFan のグラフ表現に直結しており、そこから機械語が生成されます。</p>
+
+<p><code class="file-ref">docs/torque/architecture.md</code> の冒頭には次のように説明があります。</p>
+
+<pre><code class="language-text">Before Torque, builtins were written in:
+1.  C++: Slow for execution because of call overhead from JS.
+2.  Platform-specific Assembly: Fast, but hard to maintain and error-prone.
+3.  CodeStubAssembler (CSA): A C++ API to generate machine code. Safer than
+    raw assembly, but still verbose and hard to read.
+Torque provides a higher-level, strongly-typed syntax that compiles down to
+CSA or the newer Turboshaft Assembler (TSA).
+</code></pre>
+
+<p>Torque で書かれたコードは最適化された fast path を簡潔に表現するための仕組みで、<code>map</code>、<code>filter</code>、<code>flat</code>、<code>reduce</code>、<code>slice</code> などほとんどの配列メソッドの本体はここに書かれています。</p>
+
+<p>C++ ビルトインは <code>BUILTIN(Foo) { ... }</code> という形で <code>src/builtins/builtins-*.cc</code> に直接書きます。これは仕様準拠の完全な (時には遅い) パスや、Torque で表現しづらい複雑なロジックに使われます。<code>push</code>, <code>pop</code>, <code>concat</code> の汎用パスなどがこれにあたります。</p>
+
+<p>最後に Runtime functions と呼ばれる、<code>RUNTIME_FUNCTION</code> マクロで宣言される C++ 関数があります。最も遅い fallback で、深いプロパティ操作 (<code>[[DefineOwnProperty]]</code> の完全実装) が必要な場面で使われます。</p>
+
+<h3 id="sec6-2">6.2 macro と builtin の違い</h3>
+
+<p><code class="file-ref">docs/torque/user-manual.md</code> から要点を抜粋すると、Torque には主に3つの呼び出し可能要素があります。</p>
+
+<p>macro は「inlinable な CSA コードの塊」で、マクロ呼び出しはコンパイル時に「展開」され、呼び出し側にコードがインライン化されます。CSA 上ではマクロは namespace 単位の Assembler クラスのメソッドとして生成されます。<code>extern macro</code> と書くと、Torque 側は宣言のみで、実装は手書きの CSA コード (<code>code-stub-assembler.cc</code>) に委ねられます。</p>
+
+<p>builtin はビルトインコードオブジェクトに1つだけ実装が存在し、呼び出し側からは普通の関数呼び出しが行われます。<code>call</code> 命令を発行するため、マクロほどホットなパスではコストが乗りますが、コード重複は無くなります。<code>tail</code> を付けるとテイルコールになります。</p>
+
+<p>runtime は V8 ランタイム (<code>Runtime::kXxx</code> で参照される C++ ランタイム関数) への外部参照です。実装は C++ で書かれ、Torque からは呼ぶだけです。</p>
+
+<p><code>transitioning</code> キーワードは、その関数が「JS を呼ぶ可能性がある」「副作用を起こす可能性がある」ことを示すマーカで、<code>transient type</code> (後述する <code>FastJSArray</code> など) の値を <code>transitioning</code> 操作を跨いで保持することは型システム上不正と扱われます。</p>
+
+<h3 id="sec6-3">6.3 transient typeとFastJSArrayWitness</h3>
+
+<p>V8 の Torque ビルトインで頻出するのが、<code>FastJSArray</code> 系の transient type を中心とした「楽観的キャスト + Recheck」のパターンです。</p>
+
+<p><code class="file-ref">src/objects/js-array.tq:118</code> で定義されている transient type</p>
+
+<pre><code class="language-torque">// A HeapObject with a JSArray map, and either fast packed elements, or fast
+// holey elements when the global NoElementsProtector is not invalidated.
+transient type FastJSArray extends JSArray;
+
+transient type FastJSArrayForRead extends JSArray;
+
+// A FastJSArray when the global ArraySpeciesProtector is not invalidated.
+transient type FastJSArrayForCopy extends FastJSArray;
+
+// A FastJSArrayForCopy when the global IsConcatSpreadableProtector is not
+// invalidated.
+transient type FastJSArrayForConcat extends FastJSArrayForCopy;
+
+// A FastJSArray when the global ArrayIteratorProtector is not invalidated.
+transient type FastJSArrayWithNoCustomIteration extends FastJSArray;
+</code></pre>
+
+<p>これらは「キャストに成功したという事実が、その後の操作の安全性を保証する」型レベルの契約です。<code>transient</code> というキーワードは「<code>transitioning</code> 操作 (JS 呼び出しなど) を跨いだら無効化される」というセマンティクスを示します。</p>
+
+<p><code>FastJSArray</code> のキャストは <code class="file-ref">src/builtins/cast.tq:531</code> で実装され、3つの条件を一気にチェックします。第一に Fast ElementsKind であること、第二にプロトタイプチェーンが初期 Array.prototype のままであること、第三に NoElementsProtector が有効であること。これらすべてが揃ったときだけキャストが成功します。<code>FastJSArrayForCopy</code> は追加で ArraySpeciesProtector を、<code>FastJSArrayForConcat</code> はさらに IsConcatSpreadableProtector を要求します。</p>
+
+<p>ユーザコードのコールバックを呼び出すと、その間に prototype チェーンや protector が変化する可能性があるため、callback の前後で再チェックが必要です。これを担当するのが <code>FastJSArrayWitness</code> 構造体 (<code class="file-ref">src/objects/js-array.tq:230</code>) です。</p>
+
+<pre><code class="language-torque">struct FastJSArrayWitness {
+  macro Recheck(): void labels CastError {
+    if (this.stable.map != this.map) goto CastError;
+    if (IsNoElementsProtectorCellInvalid()) goto CastError;
+    this.unstable = %RawDownCast&lt;FastJSArray&gt;(this.stable);
+  }
+  ...
+}
+</code></pre>
+
+<p><code>stable</code> (JS の引数として保持される非 transient 版) と <code>unstable</code> (callback の直前にだけ持つ transient 版) を分けて、callback の後に <code>Recheck</code> で <code>unstable</code> を再構築します。これが <code>map</code>, <code>filter</code>, <code>forEach</code>, <code>every</code>, <code>some</code>, <code>find</code>, <code>reduce</code> などすべての callback-driven メソッドの fast path の安全弁です。</p>
+
+<hr>
+

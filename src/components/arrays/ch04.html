@@ -1,0 +1,170 @@
+<h2 id="chapter4">第4章 値の格納と表現 ― SmiとHoleNaNと辞書</h2>
+
+<h3 id="sec4-1">4.1 Smi (Small Integer) の格納</h3>
+
+<p>Smi は HeapObject を介さない即値です。31bit の場合、<code>-2^30</code> から <code>2^30 - 1</code> までの整数を格納できます。32bit Smi なら <code>-2^31</code> から <code>2^31 - 1</code> までです。</p>
+
+<p><code class="file-ref">src/objects/smi.h:65</code> で Smi の生成は</p>
+
+<pre><code class="language-cpp">static inline constexpr Tagged&lt;Smi&gt; FromInt(int value) {
+  DCHECK(Smi::IsValid(value));
+  return Tagged&lt;Smi&gt;(Internals::IntegralToSmi(value));
+}
+</code></pre>
+
+<p>であり、内部の <code>IntToSmi</code> は</p>
+
+<pre><code class="language-cpp">V8_INLINE static constexpr Address IntToSmi(int value) {
+  return (static_cast&lt;Address&gt;(value) &lt;&lt; (kSmiTagSize + kSmiShiftSize)) |
+         kSmiTag;
+}
+</code></pre>
+
+<p>と、値を <code>kSmiTagSize + kSmiShiftSize</code> bit 左シフトして下位にタグを置くだけのものです。31bit Smi の場合は <code>kSmiTagSize = 1, kSmiShiftSize = 0</code> なので 1bit シフト、32bit Smi の場合は計 32bit のシフトで値を上位 32bit に上げます。</p>
+
+<p>逆向きの抽出 <code>SmiToInt</code> は値を右シフトするだけです。シフト演算ひとつなのでアセンブリ的には1命令で済み、HeapNumber を経由するアロケーションも GC への参照増加もありません。</p>
+
+<p>整数配列の要素はすべてこの Smi 形式で FixedArray の各スロットに直接埋め込まれます。GC は最下位ビットを見て「これは Smi だからスキャンする必要がない」と判断できるため、PACKED_SMI な配列はマーキングフェーズで非常に高速にスキップされます。</p>
+
+<h3 id="sec4-2">4.2 Unboxed Double</h3>
+
+<p><code>1.5</code> のような実数を含む配列は PACKED_DOUBLE になり、内部表現はタグなしの IEEE 754 double をフラットに並べた FixedDoubleArray になります。同じ値を JSObject のプロパティに格納する場合 (HeapNumber 経由) と比較すると、ヒープへのアロケーションが不要 (FixedDoubleArray は既にあるバッキング内に書き込むだけ)、ポインタ参照が一段減る (HeapNumber を経由しない)、GC のスキャン対象から外せる (Write Barrier 不要)、の三重で速くなります。これは数値計算ヘビーなコードで PACKED_DOUBLE を維持することが重要である根拠です。</p>
+
+<h3 id="sec4-3">4.3 Holeの表現</h3>
+
+<p>FixedArray における穴は <code>the_hole_value</code> という特殊な Oddball 値を該当スロットに格納することで表現されます (<code class="file-ref">src/objects/fixed-array-inl.h:411</code>)。</p>
+
+<pre><code class="language-cpp">void FixedArray::set_the_hole(ReadOnlyRoots ro_roots, uint32_t index) {
+  set(index, ro_roots.the_hole_value(), SKIP_WRITE_BARRIER);
+}
+</code></pre>
+
+<p><code>the_hole_value</code> は ReadOnly root に置かれている immortal な値なので Write Barrier 不要です。<code>is_the_hole</code> は単に当該スロットがこの sentinel と等しいかを比較するだけです。</p>
+
+<p>実装の細部としては、<code class="file-ref">src/objects/hole.h:16</code> の Hole クラスが <code>kPayloadSize = 64 * KB</code> という巨大なペイロードを持っています。これは、各種の Hole (<code>TheHole</code>, <code>PropertyCellHole</code>, <code>HashTableHole</code> ほか) を ReadOnly Heap 内で確実に分離して配置し、ポインタ比較で識別できるようにするためです。<code class="file-ref">src/objects/object-list-macros.h:519</code> の <code>HOLE_LIST</code> マクロが、すべての Hole を列挙します。</p>
+
+<pre><code class="language-cpp">#define HOLE_LIST(V)                                                 \
+  V(TheHole, the_hole_value, TheHoleValue)                           \
+  V(PropertyCellHole, property_cell_hole_value, PropertyCellHoleValue)\
+  V(HashTableHole, hash_table_hole_value, HashTableHoleValue)        \
+  V(PromiseHole, promise_hole_value, PromiseHoleValue)               \
+  V(ExceptionHole, exception, Exception)                             \
+  V(UninitializedHole, uninitialized_value, UninitializedValue)      \
+  V(ArgumentsMarker, arguments_marker, ArgumentsMarker)              \
+  V(OptimizedOut, optimized_out, OptimizedOut)                       \
+  ...
+</code></pre>
+
+<p>V8 Static Roots が有効な環境では、Hole が ReadOnly Heap 内の連続領域に置かれることを利用し、</p>
+
+<pre><code class="language-cpp">inline bool IsAnyHoleNoSpaceCheck(Tagged&lt;HeapObject&gt; obj) {
+  return base::IsInRange(static_cast&lt;Tagged_t&gt;(obj.ptr()),
+                         kMinStaticHoleValue, kMaxStaticHoleValue);
+}
+</code></pre>
+
+<p>という範囲チェック1つだけで「何らかの Hole かどうか」を高速に判定できます (<code class="file-ref">src/objects/object-predicates-inl.h:101</code>)。</p>
+
+<p>FixedDoubleArray では話が違います。double 値の全空間 (符号、指数、仮数のあらゆる組み合わせ) は実際の数値として有意義に使われる可能性があるため、特殊な「ありえないビット列の NaN」を hole とみなす方式を取ります。<code class="file-ref">src/common/globals.h:2136</code> で</p>
+
+<pre><code class="language-cpp">constexpr uint32_t kHoleNanUpper32 = 0xFFF7FFFF;
+constexpr uint32_t kHoleNanLower32 = 0xFFF7FFFF;
+...
+constexpr uint64_t kHoleNanInt64 =
+    (static_cast&lt;uint64_t&gt;(kHoleNanUpper32) &lt;&lt; 32) | kHoleNanLower32;
+</code></pre>
+
+<p>として定義されます。<code>0xFFF7FFFFFFF7FFFF</code> は IEEE 754 の signaling NaN 領域内で V8 が予約した特定ビットパターンで、通常の浮動小数演算で偶然生成されることはありません。<code class="file-ref">fixed-array-inl.h:631</code> で</p>
+
+<pre><code class="language-cpp">void FixedDoubleArray::set_the_hole(uint32_t index) {
+  ...
+  values()[index].set_value_as_bits(kHoleNanInt64);
+}
+</code></pre>
+
+<p>と直接ビット列を書き込みます。is_the_hole 判定もビット列比較だけで済み、極めて高速です。Maglev アセンブラはさらに最適化し、上位 32bit だけの比較で判定します (<code class="file-ref">src/maglev/x64/maglev-assembler-x64-inl.h:1133</code>)。下位 32bit も同じ値なので、32bit 比較1つで足ります。</p>
+
+<p>ECMAScript 仕様上ある配列スロットが穴 (hole) であることと、明示的に <code>undefined</code> を入れることは区別される必要があります。<code>a = [, 1]</code> の <code>a[0]</code> は hole で、<code>for-in</code> ループでも <code>Object.keys</code> でもキーとして列挙されません。一方 <code>b = [undefined, 1]</code> の <code>b[0]</code> は値 <code>undefined</code> を持つ実体スロットで、列挙対象になります。V8 はこの区別を hole sentinel と本物の undefined で正確に保ちます。</p>
+
+<p>V8_ENABLE_UNDEFINED_DOUBLE フラグが立っている環境では、HOLEY_DOUBLE 配列の中に「実体としての undefined」も保持できるよう、もうひとつのビット列 <code>kUndefinedNanInt64</code> (<code class="file-ref">globals.h:2147</code>) が用意されています。これにより <code>[undefined, 1.5]</code> のような配列が PACKED_DOUBLE で保持できる場面が増え、PACKED_ELEMENTS への遷移を遅延できます。</p>
+
+<p>書き込み側では、ユーザーコードが NaN を書こうとした場合、HoleNan と衝突しないよう常に quiet NaN に正規化されます (<code class="file-ref">fixed-array-inl.h:608</code>)。</p>
+
+<pre><code class="language-cpp">void FixedDoubleArray::set(uint32_t index, double value) {
+  if (std::isnan(value)) {
+    value = std::numeric_limits&lt;double&gt;::quiet_NaN();
+  }
+  values()[index].set_value(value);
+}
+</code></pre>
+
+<p>これは「ユーザーが意図しない NaN を書いて、それを Hole と誤判別する」事故を防ぐためです。</p>
+
+<h3 id="sec4-4">4.4 Dictionary Mode</h3>
+
+<p>配列に大量の穴ができた場合、あるいは要素のインデックスが極端に飛び番になった場合、fast な FixedArray を維持するメモリコストが見合わなくなります。そこで V8 は配列を Dictionary mode に降格させ、バッキングストアを NumberDictionary (整数キーのオープンアドレッシングハッシュテーブル) に切り替えます。</p>
+
+<p>NumberDictionary は <code class="file-ref">src/objects/dictionary.h:427</code> で定義され、各エントリは <code>[key, value, details]</code> の 3要素タプルです (<code class="file-ref">dictionary.h:385</code>、<code>kEntrySize = 3</code>)。FixedArray が要素1個あたり Smi/Object サイズで済むのに対し、NumberDictionary は3倍のサイズが必要で、さらにハッシュ衝突の余地があるため、エントリの実際の格納密度は理論上 1/2 ほどです。</p>
+
+<p>Dictionary mode に転落する条件は2つあります。<code class="file-ref">src/objects/js-objects-inl.h:1251</code> の <code>ShouldConvertToSlowElements</code> を見るとわかります。</p>
+
+<pre><code class="language-cpp">static inline bool ShouldConvertToSlowElements(Tagged&lt;JSObject&gt; object,
+                                               uint32_t capacity,
+                                               uint32_t index,
+                                               uint32_t* new_capacity) {
+  ...
+  if (index - capacity &gt;= JSObject::kMaxGap) return true;
+  *new_capacity = JSObject::NewElementsCapacity(index + 1);
+  ...
+  return ShouldConvertToSlowElements(object-&gt;GetFastElementsUsage(),
+                                     *new_capacity);
+}
+</code></pre>
+
+<p>ひとつめは「現在の capacity に対して 1024 以上 (= <code>kMaxGap</code>、<code class="file-ref">js-objects.h:952</code>) も飛んだインデックスへの代入」が起きた場合です。<code>arr[2000] = 'x'</code> を空配列に対していきなり行うとほぼ即時 Dictionary 化します。</p>
+
+<p>ふたつめは「fast な拡張後の容量と実使用要素数の比率が悪化したとき」です。<code class="file-ref">dictionary.h:480</code> の <code>kPreferFastElementsSizeFactor = 3</code> と <code>kEntrySize = 3</code> を組み合わせて、もし <code>(NumberDictionary のサイズ) * 3 &lt;= (FixedArray のサイズ)</code> という不等式が成り立つなら Dictionary のほうがメモリ効率がよいとみなして降格します。実装は <code class="file-ref">js-objects-inl.h:1243</code> です。</p>
+
+<pre><code class="language-cpp">static inline bool ShouldConvertToSlowElements(uint32_t used_elements,
+                                               uint32_t new_capacity) {
+  uint32_t size_threshold = NumberDictionary::kPreferFastElementsSizeFactor *
+                            NumberDictionary::ComputeCapacity(used_elements) *
+                            NumberDictionary::kEntrySize;
+  return size_threshold &lt;= new_capacity;
+}
+</code></pre>
+
+<p>ただし <code>kMaxUncheckedFastElementsLength = 5000</code> (Young 世代)、<code>kMaxUncheckedOldFastElementsLength = 500</code> (Old 世代) 未満であれば密度チェック自体をスキップして fast を維持します。</p>
+
+<p>Dictionary mode に一度落ちると、ユーザー側の操作 (delete してから連番で埋め直す等) では基本的に fast には戻りません。<code>NumberDictionary::kRequiresSlowElementsLimit = (1 &lt;&lt; 29) - 1</code> を超えるインデックスを使った場合や、<code>Object.defineProperty</code> でアクセサを定義した場合は、永続的に fast への降格不可となります (<code class="file-ref">dictionary.h:478</code>)。</p>
+
+<pre><code class="language-cpp">static const uint32_t kRequiresSlowElementsLimit = (1 &lt;&lt; 29) - 1;
+static const uint32_t kPreferFastElementsSizeFactor = 3;
+</code></pre>
+
+<p>NumberDictionary の <code>max_number_key</code> と <code>requires_slow_elements</code> フラグは、1個の Smi に「最大数値キー」と「永続 slow フラグ」を最下位ビットの詰め込みで管理しています (<code class="file-ref">dictionary-inl.h:122</code>)。</p>
+
+<pre><code class="language-cpp">bool NumberDictionary::requires_slow_elements() {
+  Tagged&lt;Object&gt; max_index_object = get(kMaxNumberKeyIndex);
+  if (!IsSmi(max_index_object)) return false;
+  return 0 != (Smi::ToUInt(max_index_object) &amp; kRequiresSlowElementsMask);
+}
+</code></pre>
+
+<h3 id="sec4-5">4.5 Copy-on-Write配列</h3>
+
+<p><code>[1, 2, 3]</code> のような配列リテラルが関数内で評価されると、V8 は同じリテラルが何度も評価されるたびに毎回フルアロケーションするのを避けるため、共有可能なテンプレート (boilerplate) を Old Space に置きます。同じリテラルから生まれた配列は最初その boilerplate を直接バッキングストアとして共有し、書き込みが発生する時点で初めて本物のコピーを作る、いわゆる Copy-on-Write 戦略を採ります。</p>
+
+<p><code class="file-ref">src/objects/fixed-array.cc:17</code> に判定があります。</p>
+
+<pre><code class="language-cpp">bool FixedArrayBase::IsCowArray() const {
+  return map() == GetReadOnlyRoots().fixed_cow_array_map();
+}
+</code></pre>
+
+<p>COW 状態の FixedArray は通常の FixedArray とは異なる Map (<code>fixed_cow_array_map</code>) を持ち、書き込み時には別の Map のフルコピーへ昇格します。<code class="file-ref">elements.cc:2516</code> 付近の <code>// Make sure COW arrays are copied.</code> というコメントから始まる処理がそれです。</p>
+
+<p>このメカニズムによって、ループ内で <code>for (...) { const arr = [1,2,3]; ... }</code> のように毎回リテラル配列を作っても、書き込みが発生しない限り実体は共有され、メモリ消費もアロケーションコストも最小化されます。</p>
+
+<hr>
+

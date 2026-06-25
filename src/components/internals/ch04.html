@@ -1,0 +1,386 @@
+<h2 id="ch4">第4章 JSObject のレイアウトと Properties / Elements</h2>
+
+<h3 id="ch4-1">4.1 クラス階層の全貌</h3>
+
+<p>V8 における JavaScript オブジェクトは、HeapObject を根とする多段継承で構成されています。</p>
+
+<pre><code class="language-text">HeapObject
+   └── JSReceiver        (properties_or_hash_ を持つ)
+          └── JSObject   (elements_ を持つ)
+                 ├── JSObjectWithEmbedderSlots
+                 ├── JSAPIObjectWithEmbedderSlots      (cpp_heap_wrappable_)
+                 ├── JSCustomElementsObject
+                 │      └── JSSpecialObject            (cpp_heap_wrappable_)
+                 ├── JSExternalObject                  (value_)
+                 ├── JSArray
+                 ├── JSArrayBuffer / JSArrayBufferView / JSTypedArray
+                 └── ...
+</code></pre>
+
+<p><code>JSReceiver</code> は「プロパティを定義できるオブジェクト」を表す抽象基底で、<code>JSObject</code> と <code>JSProxy</code> の共通親です。<code>JSCustomElementsObject</code> は elements_ が empty_fixed_array であってもカスタム要素アクセスが可能であることを型システムに伝えるためのマーカクラスです。<code>JSSpecialObject</code> はさらに JSGlobalObject や JSGlobalProxy のような特殊オブジェクトに対する受け皿です。</p>
+
+<h3 id="ch4-2">4.2 ヘッダの正確なバイト並び</h3>
+
+<p>JSReceiver は厳密に 1 個のメンバを持ちます。</p>
+
+<pre><code class="language-cpp">// src/objects/js-objects.h:372-374
+ public:
+  TaggedMember&lt;PropertiesOrHash&gt; properties_or_hash_;
+} V8_OBJECT_END;
+</code></pre>
+
+<p>JSObject は JSReceiver を継承した上で 1 個のメンバ <code>elements_</code> を持ちます。</p>
+
+<pre><code class="language-cpp">// src/objects/js-objects.h:1027-1029
+ public:
+  TaggedMember&lt;FixedArrayBase&gt; elements_;
+} V8_OBJECT_END;
+</code></pre>
+
+<p>各オフセットの定義です。</p>
+
+<pre><code class="language-cpp">// src/objects/js-objects.h:382-384
+static const int kEndOfStrongFieldsOffset;
+static const int kHeaderSize;
+static constexpr int kMapOffset = offsetof(HeapObject, map_);
+</code></pre>
+
+<p><code>kHeaderSize</code> は <code>sizeof(JSObject)</code> で計算されます。ポインタ圧縮が有効な 64 ビット環境では <code>kTaggedSize = 4</code> バイトとなり、JSObject ヘッダは以下のバイト配置です。</p>
+
+<pre><code class="language-text">                JSObject layout (V8_COMPRESS_POINTERS 有効, 64bit)
+                 ┌──────────────────────────────────┐
+   offset 0      │ map_                       (4B)  │  ← HeapObject から継承
+                 │  Tagged&lt;Map&gt;                     │
+                 ├──────────────────────────────────┤
+   offset 4      │ properties_or_hash_        (4B)  │  ← JSReceiver から継承
+                 │  Tagged&lt;PropertiesOrHash&gt;        │
+                 ├──────────────────────────────────┤
+   offset 8      │ elements_                  (4B)  │  ← JSObject 固有
+                 │  Tagged&lt;FixedArrayBase&gt;          │
+                 ├──────────────────────────────────┤
+   offset 12     │ in-object property 0       (4B)  │  ← Map に従って可変個
+                 │ in-object property 1       (4B)  │
+                 │ ...                              │
+                 └──────────────────────────────────┘
+</code></pre>
+
+<p>非圧縮 64 ビット環境ではすべてのスロットが 8 バイトに広がり、<code>kHeaderSize = 24</code> バイトになります。</p>
+
+<h3 id="ch4-3">4.3 PropertiesOrHash の 5 つの状態</h3>
+
+<p><code>properties_or_hash_</code> フィールドは 5 つの異なる種類の値を保持できます。</p>
+
+<pre><code class="language-cpp">// src/objects/js-objects.h:74-90
+// There are five possible values for the properties offset.
+// 1) EmptyFixedArray/EmptyPropertyDictionary - This is the standard
+// placeholder.
+// 2) Smi - This is the hash code of the object.
+// 3) PropertyArray - This is similar to a FixedArray but stores
+// the hash code of the object in its length field. This is a fast
+// backing store.
+// 4) NameDictionary - This is the dictionary-mode backing store.
+// 4) GlobalDictionary - This is the backing store for the
+// GlobalObject.
+</code></pre>
+
+<p>この多態性のためにフィールドの型は <code>UnionOf&lt;SwissNameDictionary, FixedArrayBase, PropertyArray, Smi, GlobalDictionary&gt;</code> というユニオン型になっています。</p>
+
+<pre><code class="language-cpp">// src/objects/js-objects.h:47-50
+using Properties =
+    UnionOf&lt;SwissNameDictionary, FixedArrayBase, PropertyArray&gt;;
+using PropertiesOrHash = UnionOf&lt;SwissNameDictionary, FixedArrayBase,
+                                 PropertyArray, Smi, GlobalDictionary&gt;;
+</code></pre>
+
+<p>なぜ 1 つのフィールドに 5 種類を詰め込むのか。それはオブジェクトのサイズを最小化するためです。新しく作られたばかりのオブジェクトはプロパティが少なく hash も計算されていないため EmptyFixedArray を指しているだけで十分。後から hash が必要になれば Smi に書き換え、プロパティが in-object スロットからあふれれば PropertyArray を割り当てる、というように動的にレイアウトを変える設計です。</p>
+
+<h3 id="ch4-4">4.4 In-object Properties の物理配置</h3>
+
+<p>JSObject のサイズは Map によって決まる instance_size で確定し、ヘッダの直後に in-object property 用のスロットが連続して並びます。</p>
+
+<pre><code class="language-cpp">// src/objects/map-inl.h:453-455
+int Map::GetInObjectPropertyOffset(int index) const {
+  return (GetInObjectPropertiesStartInWords() + index) * kTaggedSize;
+}
+</code></pre>
+
+<p>JSObject の場合、<code>GetInObjectPropertiesStartInWords</code> はほぼ常に <code>JSObject::kHeaderSize / kTaggedSize</code> と等しい値ですが、<code>JSArray</code> のようにサブクラスがさらに固定フィールドを追加していると、その分だけ後ろにずれます。<code>JSArray</code> は <code>length_</code> を追加で持つため、in-object プロパティの開始位置はヘッダ + length の後になります。</p>
+
+<p><code>GetInObjectProperties</code> の計算は <code>instance_size_in_words - GetInObjectPropertiesStartInWords()</code> で行われます。</p>
+
+<pre><code class="language-cpp">// src/objects/map-inl.h:427-430
+int Map::GetInObjectProperties() const {
+  DCHECK(IsJSObjectMap(this));
+  return instance_size_in_words() - GetInObjectPropertiesStartInWords();
+}
+</code></pre>
+
+<p>instance_size を 1 バイトで表現し (<code>kMaxInstanceSize = 255 * kTaggedSize</code>)、開始位置も 1 バイトで表現することで、Map に追加される情報を最小化しています。</p>
+
+<h4>なぜ in-object であるべきか</h4>
+
+<p>In-object プロパティの最大の価値は、ポインタを 1 段減らせることです。out-of-object な PropertyArray にプロパティが格納されている場合、<code>obj -&gt; properties_or_hash -&gt; array[i]</code> という 2 段の間接参照になります。in-object なら <code>obj.field_at_offset</code> の 1 段で済みます。これは V8 が生成する機械語の差として大きく表れます。さらに、TurboFan や Maglev のような最適化コンパイラは、Map (シェイプ) が安定していれば in-object プロパティへの load を完全にインライン化でき、register allocator もより自由に動作できます。</p>
+
+<h3 id="ch4-5">4.5 プロパティ追加の流れ - JSObject::AddProperty</h3>
+
+<pre><code class="language-cpp">// src/objects/js-objects.cc:3734-3759
+void JSObject::AddProperty(Isolate* isolate, DirectHandle&lt;JSObject&gt; object,
+                           DirectHandle&lt;Name&gt; name, DirectHandle&lt;Object&gt; value,
+                           PropertyAttributes attributes) {
+  name = isolate-&gt;factory()-&gt;InternalizeName(name);
+  if (TryFastAddDataProperty(isolate, object, name, value, attributes)) {
+    return;
+  }
+  LookupIterator it(isolate, object, name, object,
+                    LookupIterator::OWN_SKIP_INTERCEPTOR);
+  ...
+}
+</code></pre>
+
+<p>重要なのは <code>TryFastAddDataProperty</code> の呼び出しです。</p>
+
+<pre><code class="language-cpp">// src/objects/js-objects.cc:3697-3717
+bool TryFastAddDataProperty(Isolate* isolate, DirectHandle&lt;JSObject&gt; object,
+                            DirectHandle&lt;Name&gt; name, DirectHandle&lt;Object&gt; value,
+                            PropertyAttributes attributes) {
+  DCHECK(IsUniqueName(*name));
+  Tagged&lt;Map&gt; map =
+      TransitionsAccessor(isolate, object-&gt;map())
+          .SearchTransition(*name, PropertyKind::kData, attributes);
+  if (map.is_null()) return false;
+  ...
+}
+</code></pre>
+
+<p>最初に行うのは TransitionsAccessor による既存遷移の検索です。同じ名前のプロパティが追加された経歴があれば、その遷移先 Map を再利用できます。これが V8 の Hidden Class (Map) 最適化の核心です。同じ形のオブジェクトを作る JavaScript コードは、何度実行されても同じ Map 遷移チェーンをたどるため、新たな Map 生成が発生しません。</p>
+
+<h3 id="ch4-6">4.6 In-object スロットが足りなくなったとき - MigrateFastToFast</h3>
+
+<p>スロットが満タンになった瞬間に何が起きるかは <code>MigrateFastToFast</code> に書かれています。</p>
+
+<pre><code class="language-cpp">// src/objects/js-objects.cc:3236-3263
+// This migration is a transition from a map that has run out of property
+// space. Extend the backing store.
+int grow_by = new_map-&gt;UnusedPropertyFields() + 1;
+DirectHandle&lt;PropertyArray&gt; old_storage(object-&gt;property_array(), isolate);
+DCHECK_GE(grow_by, 0);
+DirectHandle&lt;PropertyArray&gt; new_storage =
+    isolate-&gt;factory()-&gt;CopyPropertyArrayAndGrow(
+        old_storage, static_cast&lt;uint32_t&gt;(grow_by));
+...
+</code></pre>
+
+<p>ここで <code>grow_by = new_map-&gt;UnusedPropertyFields() + 1</code> という計算が肝です。一度に複数スロット分の余裕を確保することで、続けて 1 つずつプロパティを足していく一般的なパターンでも頻繁な再アロケーションを避けられます。</p>
+
+<pre><code class="language-cpp">// src/objects/js-objects.h:972-977
+// When extending the backing storage for property values, we increase
+// its size by more than the 1 entry necessary, so sequentially adding fields
+// to the same object requires fewer allocations and copies.
+static const int kFieldsAdded = 3;
+</code></pre>
+
+<p>3 個ずつ拡張するヒューリスティクスです。</p>
+
+<h3 id="ch4-7">4.7 PropertyArray - out-of-object プロパティの実体</h3>
+
+<h4>length と hash を 1 つの Smi に詰める</h4>
+
+<pre><code class="language-cpp">// src/objects/property-array.h:67-72
+static const int kLengthFieldSize = 10;
+using LengthField = base::BitField&lt;int, 0, kLengthFieldSize&gt;;
+static const int kMaxLength = LengthField::kMax;
+using HashField = base::BitField&lt;int, kLengthFieldSize,
+                                 kSmiValueSize - kLengthFieldSize - 1&gt;;
+static const int kNoHashSentinel = 0;
+</code></pre>
+
+<p>PropertyArray は length と hash を 1 個の Smi <code>length_and_hash_</code> に詰めています。</p>
+
+<pre><code class="language-cpp">// src/objects/property-array.h:82-89
+ public:
+  TaggedMember&lt;Smi&gt; length_and_hash_;
+  FLEXIBLE_ARRAY_MEMBER(TaggedMember&lt;Object&gt;, objects);
+} V8_OBJECT_END;
+</code></pre>
+
+<p>低位 10 ビットが length、それ以上が hash です。Smi は 32 ビット圧縮環境では 31 ビットなので、ハッシュには十分なビット数が残ります。length が 10 ビットということは最大 1023 個のスロットを持てる、つまり 1 オブジェクトに 1023 個までの out-of-object プロパティを保持できます。これより多い場合は dictionary mode に落とします。</p>
+
+<p>なぜこんなに密に詰め込むのか。それは PropertyArray ヘッダ自体のサイズを最小化したいからです。1 ワード追加すると、すべての PropertyArray インスタンスに対してメモリオーバーヘッドが生じます。</p>
+
+<h4>In-object と out-of-object をどう区別するか</h4>
+
+<p>FieldIndex (<code>src/objects/field-index.h</code>) という抽象化層が用意されています。</p>
+
+<pre><code class="language-cpp">// src/objects/js-objects-inl.h:407-414
+Tagged&lt;JSAny&gt; JSObject::RawFastPropertyAt(FieldIndex index) const {
+  if (index.is_inobject()) {
+    return TaggedField&lt;JSAny&gt;::Relaxed_Load(this, index.offset());
+  } else {
+    return UncheckedCast&lt;JSAny&gt;(
+        property_array()-&gt;get(index.outobject_array_index()));
+  }
+}
+</code></pre>
+
+<p><code>is_inobject</code> のビット 1 つで分岐し、in-object なら JSObject 自身から、そうでなければ PropertyArray から読み出します。</p>
+
+<h3 id="ch4-8">4.8 Slow Properties (Dictionary Mode)</h3>
+
+<h4>NameDictionary と SwissNameDictionary の二択</h4>
+
+<p>V8 はビルドオプション <code>V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL</code> によって 2 種類の dictionary 実装を切り替えます。</p>
+
+<pre><code class="language-cpp">// src/objects/js-objects.cc:3429-3435
+DirectHandle&lt;NameDictionary&gt; dictionary;
+DirectHandle&lt;SwissNameDictionary&gt; ord_dictionary;
+if constexpr (V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL) {
+  ord_dictionary = isolate-&gt;factory()-&gt;NewSwissNameDictionary(property_count);
+} else {
+  dictionary = isolate-&gt;factory()-&gt;NewNameDictionary(property_count);
+}
+</code></pre>
+
+<p>V8 9 系以降の主流は SwissNameDictionary です。これは Google の Abseil ライブラリの flat_hash_map をベースにしており、SIMD 命令を用いて高速にエントリを探索できます。</p>
+
+<h4>SwissNameDictionary の革新的レイアウト</h4>
+
+<pre><code class="language-cpp">// src/objects/swiss-name-dictionary.h:27-34
+// Memory layout (see below for detailed description of parts):
+//   Prefix:                      [table type dependent part, can have 0 size]
+//   Capacity:                    4 bytes, raw int32_t
+//   Meta table pointer:          kTaggedSize bytes
+//   Data table:                  2 * |capacity| * |kTaggedSize| bytes
+//   Ctrl table:                  |capacity| + |kGroupWidth| uint8_t entries
+//   PropertyDetails table:       |capacity| uint_8 entries
+</code></pre>
+
+<p>レイアウトを図示すると次のようになります。</p>
+
+<pre><code class="language-text">                    SwissNameDictionary layout
+                    ┌──────────────────────────────────┐
+   offset 0         │ HeapObject header (map)          │
+                    ├──────────────────────────────────┤
+   PrefixOffset     │ identity hash      (uint32_t)    │  ← 4B
+                    ├──────────────────────────────────┤
+   CapacityOffset   │ capacity           (int32_t)     │  ← 4B
+                    ├──────────────────────────────────┤
+   MetaTablePtr     │ meta_table_ptr     (Tagged)      │  ← ByteArray ptr
+                    ├──────────────────────────────────┤
+   DataTableStart   │ Data Table                       │
+                    │   [key0][val0][key1][val1]...    │  ← 2 * capacity * kTaggedSize
+                    ├──────────────────────────────────┤
+   CtrlTableStart   │ Control Table                    │
+                    │   [c0][c1]...[c_n][copy0]...     │  ← capacity + kGroupWidth bytes
+                    ├──────────────────────────────────┤
+   PropDetailsTable │ Property Details Table           │
+                    │   [d0][d1]...[d_n]               │  ← capacity bytes
+                    └──────────────────────────────────┘
+</code></pre>
+
+<p>Ctrl Table は 1 バイトずつのコントロールバイトが capacity 個並びます。</p>
+
+<pre><code class="language-cpp">// src/objects/swiss-hash-table-helpers.h:171-180
+using ctrl_t = signed char;
+using h2_t = uint8_t;
+
+enum Ctrl : ctrl_t {
+  kEmpty = -128,   // 0b10000000
+  kDeleted = -2,   // 0b11111110
+  kSentinel = -1,  // 0b11111111
+};
+</code></pre>
+
+<p>エントリが使用中の場合、ctrl_t にはハッシュの下位 7 ビット (H2) が入ります。空、削除済み、番兵はそれぞれ MSB を立てた特殊値です。</p>
+
+<p>ハッシュを H1 と H2 に分けるのは、H1 は最初の探索位置 (どのグループから探すか) を決め、H2 は ctrl テーブルに格納してエントリの絞り込みに使うためです。SIMD レジスタに 16 個の ctrl_t を読み込み、<code>_mm_cmpeq_epi8</code> で H2 を一斉に比較すれば、16 個のエントリを 1 命令で照合できます。これが Swiss Table の高速性の正体です。</p>
+
+<h4>Dictionary Mode に落ちるトリガ</h4>
+
+<pre><code class="language-cpp">// src/objects/map-inl.h:291-300
+bool Map::TooManyFastProperties(StoreOrigin store_origin) const {
+  if (UnusedPropertyFields() != 0) return false;
+  if (store_origin != StoreOrigin::kMaybeKeyed) return false;
+  if (is_prototype_map()) return false;
+  int limit = std::max(
+      {v8_flags.fast_properties_soft_limit.value(), GetInObjectProperties()});
+  int external =
+      NumberOfFields(ConcurrencyMode::kSynchronous) - GetInObjectProperties();
+  return external &gt; limit;
+}
+</code></pre>
+
+<p><code>v8_flags.fast_properties_soft_limit</code> のデフォルト値は通常 12 程度です。これを超え、かつ動的キーアクセスでさらに追加されると slow mode に落ちます。</p>
+
+<h3 id="ch4-9">4.9 JSArray のレイアウト</h3>
+
+<pre><code class="language-cpp">// src/objects/js-array.h:25-31, 159-163
+V8_OBJECT class JSArray : public JSObject {
+ public:
+  inline Tagged&lt;Number&gt; length() const;
+  ...
+ public:
+  TaggedMember&lt;Number&gt; length_;
+} V8_OBJECT_END;
+</code></pre>
+
+<p>JSArray は JSObject に length_ を 1 つ追加しただけのオブジェクトです。length は <code>Number</code> 型、つまり Smi または HeapNumber (32bit unsigned int の最大値 2^32 - 1 まで保持可能なので、大きな配列では HeapNumber になる) です。</p>
+
+<pre><code class="language-text">              JSArray layout (圧縮ポインタ 64bit)
+              ┌──────────────────────────────────┐
+   offset 0   │ map_                       (4B)  │
+              ├──────────────────────────────────┤
+   offset 4   │ properties_or_hash_        (4B)  │
+              ├──────────────────────────────────┤
+   offset 8   │ elements_                  (4B)  │  ← FixedArray / FixedDoubleArray
+              ├──────────────────────────────────┤
+   offset 12  │ length_                    (4B)  │
+              ├──────────────────────────────────┤
+   offset 16  │ in-object property 0 ...         │
+              └──────────────────────────────────┘
+</code></pre>
+
+<p>JSArray::kHeaderSize は通常 16 バイトです。</p>
+
+<p>elements の length と JSArray の length は意味的に別物です。<code>arr.length = 100</code> した時点で elements には 4 要素しかなくても、JSArray::length は 100 になります (穴あき配列)。逆に elements 自体は capacity を確保するため push のたびに伸びるけれど length を増やしてもらわないと配列の論理長は変わりません。</p>
+
+<h3 id="ch4-10">4.10 JSArrayBuffer の構造</h3>
+
+<pre><code class="language-cpp">// src/objects/js-array-buffer.h:229-239
+ public:
+  TaggedMember&lt;MaybeObject&gt; views_or_detach_key_;
+  UnalignedValueMember&lt;uintptr_t&gt; raw_byte_length_;
+  UnalignedValueMember&lt;uintptr_t&gt; raw_max_byte_length_;
+  UnalignedValueMember&lt;Address&gt; backing_store_;
+  ExternalPointerMember&lt;kArrayBufferExtensionTag&gt; extension_;
+  uint32_t bit_field_;
+</code></pre>
+
+<p>backing_store はサンドボックス内のヒープには置けない (任意のサイズのため) ので、<code>UnalignedValueMember&lt;Address&gt;</code> という生のポインタとして保持します。<code>bit_field_</code> には is_external, is_detachable, was_detached, is_shared, is_resizable_by_js, is_immutable といったフラグが入ります。</p>
+
+<h3 id="ch4-11">4.11 JSTypedArray の構造</h3>
+
+<pre><code class="language-cpp">// src/objects/js-array-buffer.h:586-590
+ public:
+  UnalignedValueMember&lt;uintptr_t&gt; raw_length_;
+  UnalignedValueMember&lt;Address&gt; external_pointer_;
+  TaggedMember&lt;Object&gt; base_pointer_;
+} V8_OBJECT_END;
+</code></pre>
+
+<p><code>length</code> は要素数 (バイト数ではない)。<code>byte_offset</code> は ArrayBuffer 内の開始バイト位置。<code>base_pointer</code> は on-heap TypedArray のときに backing store の ByteArray を指し、off-heap のときは Smi::zero()。<code>external_pointer</code> は off-heap データへの直接ポインタ。on-heap のときも使われ、base_pointer + external_pointer で計算するための offset として機能します。</p>
+
+<pre><code class="language-cpp">// src/objects/js-array-buffer.h:515-525
+// Note: this is a pointer compression specific optimization.
+// Normally, on-heap typed arrays contain HeapObject value in |base_pointer|
+// field and an offset in |external_pointer|.
+// When pointer compression is enabled we want to combine decompression with
+// the offset addition. In order to do that we add an isolate root to the
+// |external_pointer| value and therefore the data pointer computation can
+// is a simple addition of a (potentially sign-extended) |base_pointer| loaded
+// as Tagged_t value and an |external_pointer| value.
+</code></pre>
+
+<p>base_pointer (32 ビット Tagged) を符号拡張して 64 ビットにした値と、external_pointer の値を加算するだけで実データポインタが得られます。オンヒープでもオフヒープでも同じ機械語パスで動かせるため、TypedArray アクセスのループで分岐がなくなります。</p>
+
+<p><code>kMaxSizeInHeap = 64</code> という閾値があり、64 バイト以下の TypedArray は on-heap で作成されます。それ以上はオフヒープになります。</p>
+

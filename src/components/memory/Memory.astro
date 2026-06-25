@@ -1,0 +1,25 @@
+---
+// Memory — composed from verbatim per-chapter fragments sliced out of the
+// original monolithic index.html. The <article> wrapper is the book boundary;
+// each fragment is one chapter, ready to be split into its own route later.
+import front from "./front.html?raw";
+import intro from "./intro.html?raw";
+import part1 from "./part1.html?raw";
+import part2 from "./part2.html?raw";
+import part3 from "./part3.html?raw";
+import part4 from "./part4.html?raw";
+import part5 from "./part5.html?raw";
+import appendix from "./appendix.html?raw";
+import conclusion from "./conclusion.html?raw";
+---
+<article id="memory-guide" class="chapter">
+<Fragment set:html={front} />
+<Fragment set:html={intro} />
+<Fragment set:html={part1} />
+<Fragment set:html={part2} />
+<Fragment set:html={part3} />
+<Fragment set:html={part4} />
+<Fragment set:html={part5} />
+<Fragment set:html={appendix} />
+<Fragment set:html={conclusion} />
+</article>

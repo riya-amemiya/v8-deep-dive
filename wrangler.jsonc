@@ -1,0 +1,11 @@
+{
+  // Cloudflare Workers static-assets deployment for the built artifact.
+  // `bun run build` emits dist/index.html, then `bun run deploy` (wrangler)
+  // serves it as a static asset. No SSR — the site is a single static page.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "v8-deep-dive",
+  "compatibility_date": "2025-04-01",
+  "assets": {
+    "directory": "./dist"
+  }
+}

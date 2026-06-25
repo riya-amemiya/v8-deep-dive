@@ -1,0 +1,781 @@
+<section id="part3">
+<h2>第 III 部 ガベージコレクション</h2>
+
+<h3>V8 ガベージコレクション 超詳細技術解説</h3>
+
+<p>V8 リポジトリ <code>/home/user/v8</code> を直接読み取って書き起こした濃密な解説書です。すべての主張に対して該当ソース行を併記しました。クラス名・関数名・列挙値は実コードからそのまま引いています。</p>
+
+<h3 id="p3-1">1. アーキテクチャ全景</h3>
+
+<p>V8 は世代別 (generational) ヒープを採用しており、<code>enum class GarbageCollector</code> には三種類の GC が並びます。<code class="file-ref">src/common/globals.h:1763</code> の定義は次の通りです。</p>
+
+<pre><code class="language-cpp">enum class GarbageCollector { SCAVENGER, MARK_COMPACTOR, MINOR_MARK_SWEEPER };
+</code></pre>
+
+<p><code>SCAVENGER</code> — 若い世代を Cheney のセミスペースコピーで回収する Minor GC。<code class="file-ref">src/heap/scavenger.cc</code> の <code>ScavengerCollector::CollectGarbage</code> がエントリです。</p>
+<p><code>MARK_COMPACTOR</code> — 古い世代も含む全ヒープを Mark-Compact する Major GC。<code class="file-ref">src/heap/mark-compact.cc:532</code> の <code>MarkCompactCollector::CollectGarbage</code> がエントリです。</p>
+<p><code>MINOR_MARK_SWEEPER</code> — <code>--minor-ms</code> フラグや sticky mark-bits 構成で使われる、若い世代の mark-sweep。<code class="file-ref">src/heap/minor-mark-sweep.cc:419</code> の <code>MinorMarkSweepCollector::CollectGarbage</code> がエントリです。</p>
+
+<p>実際に走らせる関数は <code>Heap::CollectGarbage</code>(<code class="file-ref">src/heap/heap.cc:1437</code>)で、ここから ① プロローグコールバック ② スタックマーカ設定 ③ <code>PerformGarbageCollection</code>(<code class="file-ref">src/heap/heap.cc:2209</code>)④ エピローグコールバック の順に流れます。<code>PerformGarbageCollection</code> の核は <code class="file-ref">src/heap/heap.cc:2280-2287</code> で、選ばれた <code>GarbageCollector</code> に応じて <code>MarkCompact()</code> / <code>MinorMarkSweep()</code> / <code>Scavenge()</code> の三つに分岐します。</p>
+
+<pre><code class="language-cpp">if (collector == GarbageCollector::MARK_COMPACTOR) {
+  MarkCompact();
+} else if (collector == GarbageCollector::MINOR_MARK_SWEEPER) {
+  MinorMarkSweep();
+} else {
+  DCHECK_EQ(GarbageCollector::SCAVENGER, collector);
+  Scavenge();
+}
+</code></pre>
+
+<p><code>Heap::Scavenge</code>(<code class="file-ref">src/heap/heap.cc:2599</code>)はコメントで明示的に "Implements Cheney's copying algorithm" と書かれており、<code>scavenger_collector_-&gt;CollectGarbage()</code> を呼ぶだけの薄いラッパです。<code>Heap::MarkCompact</code>(<code class="file-ref">heap.cc:2534</code>)は <code>mark_compact_collector()-&gt;Prepare()</code> で準備を行い、続いて <code>MarkCompactPrologue</code> で <code>regexp::ResultsCache</code> や <code>smi_string_cache</code> などのキャッシュを掃除し、本体の <code>mark_compact_collector()-&gt;CollectGarbage()</code> を呼びます。</p>
+
+<h4>1.1 コレクタ選択ヒューリスティクス (<code>SelectGarbageCollector</code>)</h4>
+
+<p><code>Heap::SelectGarbageCollector</code>(<code class="file-ref">src/heap/heap.cc:549</code>)が実際にどの GC を走らせるかを決めます。判定順は次の通りです。</p>
+
+<p>1. <code>gc_reason</code> が <code>kFinalizeMinorMSForMajorGC</code> または <code>kFinalizeConcurrentMinorMS</code> → <code>MINOR_MARK_SWEEPER</code> を返す (<code class="file-ref">heap.cc:552-565</code>)。</p>
+<p>2. リクエストされた <code>AllocationSpace</code> が <code>NEW_SPACE</code> / <code>NEW_LO_SPACE</code> 以外 → <code>MARK_COMPACTOR</code> (<code class="file-ref">heap.cc:568-572</code>)。</p>
+<p>3. <code>v8_flags.gc_global</code> または <code>!use_new_space()</code> → <code>MARK_COMPACTOR</code> (<code class="file-ref">heap.cc:575-578</code>)。</p>
+<p>4. インクリメンタル major marking が進行中 → finalize するため <code>MARK_COMPACTOR</code> を強制 (<code class="file-ref">heap.cc:580-583</code>)。</p>
+<p>5. 若い世代を昇格させる空きが old generation に取れないと予測 → <code>MARK_COMPACTOR</code> を選択 (<code class="file-ref">heap.cc:585-591</code>)。これは <code>gc_compactor_caused_by_oldspace_exhaustion</code> カウンタを増やす分岐です。</p>
+<p>6. それ以外は <code>YoungGenerationCollector()</code> を返す (<code class="file-ref">heap.cc:597</code>)。これは Scavenger または Minor MS のいずれかです。</p>
+
+<h4>1.2 GCFlag と GarbageCollectionReason</h4>
+
+<p><code>enum class GCFlag</code> (<code class="file-ref">src/heap/heap.h:198-205</code>) は以下のビットフラグです。</p>
+
+<pre><code class="language-cpp">enum class GCFlag : uint8_t {
+  kNoFlags = 0,
+  kReduceMemoryFootprint = 1 &lt;&lt; 0,
+  kForced = 1 &lt;&lt; 1,
+  kLastResort = 1 &lt;&lt; 2,
+};
+using GCFlags = base::Flags&lt;GCFlag, uint8_t&gt;;
+</code></pre>
+
+<p><code>kReduceMemoryFootprint</code> が立っているか否かは <code>Heap::ShouldReduceMemory()</code> (<code class="file-ref">src/heap/heap.h:1687</code>)で判定され、Mark-Compact における evacuation candidate の選び方や <code>Sweeper</code> がメモリを OS に返すかどうかなど、後段に大きな影響を与えます。</p>
+
+<p><code>GarbageCollectionReason</code> の正体は <code class="file-ref">src/common/globals.h:1594-1628</code> に列挙された 30 種類弱のラベルで、<code>kAllocationFailure</code> (=1) や <code>kAllocationLimit</code>、<code>kMemoryReducer</code>、<code>kLowMemoryNotification</code>、<code>kSnapshotCreator</code>、<code>kBackgroundAllocationFailure</code>、<code>kCppHeapAllocationFailure</code> などが並びます。<code>Heap::CollectGarbage</code> の引数として渡されるたびに devtools のトレースや Chrome のヒストグラム (<code>gc_compactor_caused_by_request</code>) に記録されます。</p>
+
+<h4>1.3 世代別仮説 (Generational Hypothesis) と二段構えのコスト</h4>
+
+<p>V8 のヒープ階層は若い世代 (<code>NewSpace</code> / <code>NewLargeObjectSpace</code>) と古い世代 (<code>OldSpace</code>、<code>CodeSpace</code>、<code>SharedSpace</code>、<code>TrustedSpace</code>、<code>LargeObjectSpace</code> 等) に分かれます。Scavenger が処理する若い世代の容量は <code>SemiSpaceNewSpace::TotalCapacity()</code> でせいぜい数 MB 〜 数十 MB に押さえられ、ここに対しては高速なコピーコレクションを走らせます。<code class="file-ref">src/heap/scavenger.cc:1577</code> の <code>NumberOfScavengeTasks</code> を見ると <code>kMaxScavengerTasks = 8</code> でタスク数の上限を 8 に切ってあり、若い世代のサイズ(MB 単位)+1 と CPU コア数とこの 8 のうち最小を使う構成になっています。「世代別仮説 (若いオブジェクトはすぐ死ぬ)」が成り立つなら、コピーするコストはほぼ生存オブジェクトに比例するため、若い世代を頻繁に小さく回収するのは合理的です。</p>
+
+<h3 id="p3-2">2. Scavenger (Minor GC, Cheney 流コピー収集)</h3>
+
+<p><code>ScavengerCollector</code> クラス (<code class="file-ref">src/heap/scavenger.h:15</code>) は本体で、内部に Scavenger というワーカクラス (<code class="file-ref">src/heap/scavenger.cc:286</code>) を持ちます。</p>
+
+<h4>2.1 全体フロー: <code>ScavengerCollector::CollectGarbage</code></h4>
+
+<p><code class="file-ref">src/heap/scavenger.cc:1626</code> から始まる関数の骨子は次の通りです。</p>
+
+<p>1. <strong>From/To-space スワップ</strong> — <code>new_space-&gt;SwapSemiSpaces()</code> (<code class="file-ref">scavenger.cc:1634</code>)。<code>new_lo_space()-&gt;Flip()</code> で large young space も裏返します (<code class="file-ref">scavenger.cc:1638</code>)。</p>
+<p>2. <strong>OLD_TO_NEW chunk の事前収集</strong> — <code>OldGenerationMemoryChunkIterator::ForAll</code> で <code>slot_set&lt;OLD_TO_NEW&gt;()</code> / <code>typed_slot_set&lt;OLD_TO_NEW&gt;()</code> / <code>slot_set&lt;OLD_TO_NEW_BACKGROUND&gt;()</code> のいずれかが立っている古い世代のページを <code>old_to_new_chunks</code> に集めます (<code class="file-ref">scavenger.cc:1691-1706</code>)。これは後で並列にスキャンするための work item です。</p>
+<p>3. <strong>保守的スタックスキャン / 精密ピン留め</strong> — <code>is_using_conservative_stack_scanning</code> なら <code>PinObjectsConservative</code> (<code class="file-ref">scavenger.cc:1715</code>)、<code>is_using_precise_pinning</code> なら <code>PinObjectsPrecise</code> を呼びます。「ピン留め」とはスタック由来のオブジェクトを移動させないために自分自身への forwarding を書き、ページを quarantined フラグ付きで残す機構です (<code class="file-ref">scavenger.cc:2651</code> の <code>set_map_word_forwarded(object, kRelaxedStore)</code>)。</p>
+<p>4. <strong>並列ジョブの起動</strong> — <code>ScavengerJobTask</code> (<code class="file-ref">scavenger.cc:706</code>) を <code>V8::GetCurrentPlatform()-&gt;PostJob</code> に渡し、<code>v8::TaskPriority::kUserBlocking</code> でバックグラウンドスレッドを動員します (<code class="file-ref">scavenger.cc:1731-1737</code>)。</p>
+<p>5. <strong>メインスレッドでのルート走査</strong> — <code>RootScavengeVisitor</code> を作り、<code>heap_-&gt;IterateRoots</code> でルートを訪問。<code>SkipRoot::{kExternalStringTable, kGlobalHandles, kTracedHandles, kOldGeneration, kConservativeStack, kReadOnlyBuiltins}</code> をスキップする集合に登録 (<code class="file-ref">scavenger.cc:1748-1751</code>)。これらは後で個別に処理します。</p>
+<p>6. <strong><code>job_handle-&gt;Join()</code></strong> — メインスレッドも残りタスクを引き受けて完了を待つ。Pop / Push を <code>kInterruptThreshold = 128</code> 回ごとに <code>NotifyConcurrencyIncrease</code> する設計です(<code class="file-ref">scavenger.cc:339, 2548-2550</code>)。</p>
+<p>7. <strong>弱グローバルハンドル処理</strong> — <code>IsUnscavengedHeapObjectSlot</code> をコールバックに渡して死んだ参照をクリアします (<code class="file-ref">scavenger.cc:1786-1790</code>)。</p>
+<p>8. <strong>Finalize と sweep の手配</strong> — 大きな young オブジェクトの後処理 (<code>HandleSurvivingNewLargeObjects</code>)、ephemeron 処理 (<code>ScavengerEphemeronProcessor::Process</code>)、外部ポインタテーブルのスイープを行います。</p>
+
+<h4>2.2 Cheney 流コピー: <code>Scavenger::EvacuateObjectDefault</code></h4>
+
+<p>中核の判断は <code>EvacuateObjectDefault</code> (<code class="file-ref">src/heap/scavenger.cc:2109</code>) にあります。</p>
+
+<pre><code class="language-cpp">if (HandleLargeObject(map, object, object_size, object_fields)) [[unlikely]] {
+  return REMOVE_SLOT;
+}
+if (!ShouldBePromoted(object.address())) {
+  if (SemiSpaceCopyObject(map, slot, object, object_size, object_fields)) {
+    return RememberedSetEntryNeeded(heap_, slot);
+  }
+}
+if (PromoteObject&lt;...&gt;(map, slot, object, object_size, object_fields)) {
+  return RememberedSetEntryNeeded(heap_, slot);
+}
+if (SemiSpaceCopyObject(map, slot, object, object_size, object_fields)) {
+  return RememberedSetEntryNeeded(heap_, slot);
+}
+heap()-&gt;FatalProcessOutOfMemory("Scavenger: semi-space copy");
+</code></pre>
+
+<p>つまり「① 大きすぎる場合は LargeObjectSpace へ直接昇格、② 年齢が浅ければ to-space にコピー、③ 古ければ OldSpace に昇格、④ OldSpace 確保に失敗したらフォールバックでコピー、それでも駄目なら OOM」という分岐です。<code>SlotCallbackResult</code> の <code>KEEP_SLOT</code> / <code>REMOVE_SLOT</code> は呼び出し側で OLD_TO_NEW スロットを保持し続けるかどうかの判定に使われます。</p>
+
+<h4>2.3 昇格判定 <code>ShouldBePromoted</code></h4>
+
+<p><code>Scavenger::ShouldBePromoted</code> (<code class="file-ref">scavenger.cc:2080</code>) は <code>SemiSpaceNewSpace::ShouldBePromoted</code> を呼ぶだけで、その実装は <code class="file-ref">src/heap/new-spaces-inl.h:94</code> です。</p>
+
+<pre><code class="language-cpp">bool SemiSpaceNewSpace::ShouldBePromoted(Address object) const {
+  return IsAddressBelowAgeMark(object);
+}
+</code></pre>
+
+<p><code>age_mark_</code> (<code class="file-ref">new-spaces.h:469</code>) は前回 Scavenge 時の to-space top アドレスで、<code>SetAgeMarkAndBelowAgeMarkPageFlags</code> (<code class="file-ref">new-spaces.h:331</code>) で更新されます。あるオブジェクトが「age mark より下のアドレス」つまり「前回の Scavenge 時点で既に存在していたページ上の領域」に居れば、それは既に 1 回 Scavenge を生き延びたオブジェクトなので、今回さらにコピーするより OldSpace へ昇格させたほうがよい、という発想です。これが V8 における「2 回生き延びたら昇格」ヒューリスティクスの源です。</p>
+
+<h4>2.4 アトミックなコピー: <code>TryMigrateObject</code></h4>
+
+<p><code>Scavenger::TryMigrateObject</code> (<code class="file-ref">scavenger.cc:1952</code>) は他スレッドとの競合を CAS で解決する繊細な実装になっています。手順は次の通りです。</p>
+
+<p>1. <code>allocator_.Allocate(space, object_size, ...)</code> で行き先(to-space または OldSpace)を確保。</p>
+<p>2. <code>source-&gt;relaxed_compare_and_swap_map_word_forwarded(MapWord::FromMap(map), target)</code> で「map word を forwarding pointer に CAS」する。失敗 = 既に他スレッドがコピー済みなので、今確保した領域を <code>allocator_.FreeLast</code> で巻き戻して、相手が書いた forwarding を読んでスロットを更新するだけで終わる (<code class="file-ref">scavenger.cc:1973-1982</code>)。</p>
+<p>3. CAS 成功の場合のみ実体をコピー。<code>target-&gt;set_map_word(map, kRelaxedStore)</code> を先に行い、その後 <code>heap()-&gt;CopyBlock(target.address() + kTaggedSize, source.address() + kTaggedSize, object_size.value() - kTaggedSize)</code> でフィールドをコピー (<code class="file-ref">scavenger.cc:1988-1991</code>)。「CAS の後で実体コピー」のは、競合に負けた場合に無駄なコピーが走らないようにするためです。</p>
+<p>4. <code>UpdateHeapObjectReferenceSlot(slot, target)</code> でスロットを更新し、<code>on_success(target)</code> で <code>local_copied_list_</code> / <code>local_promoted_list_</code> のいずれかに追加。</p>
+
+<p><code>local_copied_list_</code> / <code>local_promoted_list_</code> は <code>Scavenger::ScavengedObjectList</code> 型 (<code class="file-ref">scavenger.cc:296-298</code>) で、<code>heap::base::Worklist&lt;ScavengedObjectListEntry, 256&gt;</code> というセグメントサイズ 256 のロックフリー Worklist です。</p>
+
+<h4>2.5 <code>Scavenger::Process</code> — Cheney のスキャン段</h4>
+
+<p><code>Scavenger::Process</code> (<code class="file-ref">scavenger.cc:2535</code>) は <code>ScavengerCopiedObjectVisitor</code> と <code>ScavengerPromotedObjectVisitor</code> を使って "コピー済オブジェクト" を訪問し、その中のスロットを再帰的にコピーします。do-while ループの中で <code>local_copied_list_.Pop</code> と <code>local_promoted_list_.Pop</code> を交互に処理し、<code>kInterruptThreshold = 128</code> ごとに <code>delegate-&gt;NotifyConcurrencyIncrease()</code> を呼んで他のワーカに work-stealing を促す構造です。</p>
+
+<p>Cheney の伝統的な 2 ポインタ (scan ptr / free ptr) スキームはここでは worklist に置き換わっており、to-space を線形に走査する代わりにコピーされた個別オブジェクトを worklist 経由でスキャンします。この変更によって複数スレッドが並列にコピー &amp; スキャンできます。</p>
+
+<h4>2.6 並列スキャン: <code>ScavengerJobTask::ProcessItems</code></h4>
+
+<p><code>ScavengerJobTask::ProcessItems</code> (<code class="file-ref">scavenger.cc:792</code>) は ① <code>ConcurrentScavengePages</code> で <code>old_to_new_chunks_</code> を分割スキャンし(<code class="file-ref">scavenger.cc:809-827</code>)、② <code>scavenger-&gt;Process(delegate)</code> で worklist を捌きます。<code>ConcurrentScavengePages</code> は <code>ParallelWorkItem::TryAcquire</code> で work-stealing するため、並列処理の粒度はページ単位です。</p>
+
+<p><code>ScavengerJobTask::GetMaxConcurrency</code> (<code class="file-ref">scavenger.cc:779</code>) は <code>remaining_memory_chunks_</code> と「現在のワーカ数 + copied_list_.Size() + promoted_list_.Size()」のうち大きい方を希望同時実行数とし、<code>scavengers_-&gt;size()</code> を上限としてクリップします。バッテリ最適化や background 不可なら <code>1</code> に絞ります。</p>
+
+<h4>2.7 Remembered Set との連携</h4>
+
+<p>Scavenger は OldSpace から NewSpace への参照を「全部スキャン」できません。そこで Old-to-New のスロット情報が予め write barrier 経由で <code>RememberedSet&lt;OLD_TO_NEW&gt;</code> に記録されています。Scavenger は scavenge 開始時にこれを舐めて若い世代を保守的に追跡します。Quarantined ページや shared-space への参照などは典型的なケースとして <code>CheckOldToNewSlotForSharedUntyped</code> (<code class="file-ref">scavenger.cc:2607</code>) や <code>CheckOldToNewSlotForSharedTyped</code> (<code class="file-ref">scavenger.cc:2621</code>) で <code>RememberedSet&lt;OLD_TO_SHARED&gt;::Insert&lt;AccessMode::ATOMIC&gt;</code> に分岐させて拾います。</p>
+
+<h3 id="p3-3">3. Major GC (Mark-Compact)</h3>
+
+<p><code>MarkCompactCollector::CollectGarbage</code> (<code class="file-ref">src/heap/mark-compact.cc:532</code>) の本体は驚くほどシンプルで、次のステージを順に呼びます。</p>
+
+<pre><code class="language-cpp">MarkLiveObjects();
+if (auto* cpp_heap = ...) cpp_heap-&gt;ProcessCrossThreadWeakness();
+RecordObjectStats();
+ClearNonLiveReferences();
+VerifyMarking();
+if (auto* cpp_heap = ...) cpp_heap-&gt;FinishMarkingAndProcessWeakness();
+heap_-&gt;memory_measurement()-&gt;FinishProcessing(native_context_stats_);
+Sweep();
+Evacuate();
+Finish();
+</code></pre>
+
+<h4>3.1 Tri-color Marking (white / grey / black)</h4>
+
+<p>V8 のマーキングは三色マーキングで、状態は実装上「ビットマップ上の 1bit + worklist にあるかどうか」で表現されます。</p>
+
+<p><strong>white</strong> — <code>MarkBit</code> が 0 で worklist にも乗っていない → 未到達。</p>
+<p><strong>grey</strong> — <code>MarkBit</code> が 1 だが worklist に積まれているだけで body はまだスキャンされていない。</p>
+<p><strong>black</strong> — <code>MarkBit</code> が 1 でかつ worklist からも取り出されてオブジェクトの中身まで訪問済み。</p>
+
+<p><code>MarkBit</code> の Set/Get は <code class="file-ref">src/heap/marking.h:64-83</code> にあります。アトミック版は <code>base::AsAtomicWord::Relaxed_SetBits(cell_, mask_)</code>、非アトミック版は単純な or です。<code>MarkingBitmap</code> (<code class="file-ref">marking.h:93</code>) はページごとに付属するビットマップで、<code>kLength = (1 &lt;&lt; kPageSizeBits) &gt;&gt; kTaggedSizeLog2</code> ビット、つまり「ページサイズ ÷ kTaggedSize」個のマークビットを持ちます。各 cell は <code>uintptr_t</code> の 64bit です (<code class="file-ref">marking.h:99-105</code>)。</p>
+
+<p>「mark できたか」のテストは <code>MarkingState::TryMark</code> (<code class="file-ref">src/heap/marking-state-inl.h:35</code>) で、原子的に「ビットを 0→1 に遷移できた最初のスレッド」だけが <code>true</code> を返します。<code>MarkingHelper::TryMarkAndPush</code> (<code class="file-ref">src/heap/marking-inl.h:347</code>) はこれを「成功したら worklist にも push する」というポリシーで束ねた、ほぼ全てのマーキング経路の共通関数です。</p>
+
+<pre><code class="language-cpp">bool MarkingHelper::TryMarkAndPush(Heap* heap,
+                                   MarkingWorklists::Local* marking_worklist,
+                                   MarkingState* marking_state,
+                                   WorklistTarget target_worklist,
+                                   Tagged&lt;HeapObject&gt; object) {
+  if (marking_state-&gt;TryMark(object)) {
+    if (V8_LIKELY(target_worklist == WorklistTarget::kRegular)) {
+      marking_worklist-&gt;Push(object);
+    }
+    return true;
+  }
+  return false;
+}
+</code></pre>
+
+<h4>3.2 Marking worklist</h4>
+
+<p><code>MarkingWorklists</code> (<code class="file-ref">src/heap/marking-worklist.h:68</code>) は次の三つの <code>Worklist&lt;Tagged&lt;HeapObject&gt;, 64&gt;</code> を持ちます。</p>
+
+<p><code>default_</code> — 主に使う共有 worklist。</p>
+<p><code>on_hold_</code> (<code class="file-ref">marking-worklist.h:84, 124</code>) — concurrent marker が「new space の linear allocation buffer の中にあるオブジェクト」を一旦置いておくための保留 worklist。</p>
+<p><code>other_</code> — context-per-marking モードで「対象 context 外」用。</p>
+
+<p>per-context モードでは <code>context_worklists_</code> (<code class="file-ref">marking-worklist.h:130</code>) に native context ごとの worklist を作り、<code>SwitchToContext</code> でアクティブな worklist を切り替えながら、メモリ計測 API 用にオブジェクトサイズを context に紐づけて記録します(<code class="file-ref">marking-worklist.h:30-57</code> のコメントに詳細あり)。</p>
+
+<p>スレッドローカル版が <code>MarkingWorklists::Local</code> (<code class="file-ref">marking-worklist.h:143</code>) で、<code>Push</code> / <code>Pop</code> / <code>PopOnHold</code> / <code>MergeOnHold</code> / <code>ShareWork</code> / <code>Publish</code> / <code>PublishWork</code> を持ちます。<code>MergeOnHold</code> は incremental step の境界で <code>on_hold_</code> を <code>default_</code> に統合し、<code>ShareWork</code> は他スレッドが work-stealing できるようにグローバル pool へ放出します。</p>
+
+<h4>3.3 SATB か Dijkstra か</h4>
+
+<p>V8 はインクリメンタル/コンカレント時に <strong>Dijkstra スタイル(挿入バリア)</strong> を採用しています。詳細は <code class="file-ref">src/heap/WRITE_BARRIER.md</code> に書かれており、引用すると次の三つの目的のために write barrier が必要だとあります。</p>
+
+<blockquote>
+<p>Records old-to-new references for the generational GC to work.</p>
+<p>During marking it prevents black-to-white references during incremental/concurrent marking.</p>
+<p>During marking it records old-to-old references (pointers to objects on evacuation candidates)</p>
+</blockquote>
+
+<p>「black-to-white を防ぐ」というのは Dijkstra の不変条件で、<code>host</code>(=black)が <code>value</code>(=white)を新しく指すような書き込みを検出したら <code>value</code> を grey にする(=マークして worklist に積む)、という発想です。これはマーキング中に随時 SATB の "snapshot" を作るのとは違って、現在のヒープスナップショットに基づいて常に grey/black の整合性を保ちます。</p>
+
+<p>ただし new space の LAB(linear allocation buffer)内のオブジェクトに対する処理は SATB 的な要素も含まれます。concurrent marker は LAB 内のオブジェクトを訪問しようとすると <code>PushOnHold</code> でホールド worklist に積み(<code class="file-ref">src/heap/concurrent-marking.cc:438-440</code>)、後で <code>MergeOnHold</code> で main thread が処理する形になります。</p>
+
+<h4>3.4 MarkingBarrier の起動と消滅</h4>
+
+<p><code>IncrementalMarking::StartMarkingMajor</code> (<code class="file-ref">src/heap/incremental-marking.cc:245</code>) で実際に書き込みバリアの「マーキングモード」が起動します。主な手順は次の通りです。</p>
+
+<p>1. <code>heap_-&gt;FreeLinearAllocationAreas()</code> で LAB を解放(<code class="file-ref">incremental-marking.cc:266</code>)。</p>
+<p>2. <code>is_compacting_ = major_collector_-&gt;StartCompaction(StartCompactionMode::kIncremental)</code> で evacuation candidate を選定。</p>
+<p>3. <code>major_collector_-&gt;StartMarking()</code> または schedule 付きで起動。</p>
+<p>4. <code>heap_-&gt;SetIsMarkingFlag(true)</code> で <code>isMarking</code> フラグを立て、生成コード側の write barrier 高速パスを「marking 経路」に切り替えます (<code class="file-ref">incremental-marking.cc:285</code>)。</p>
+<p>5. <code>MarkingBarrier::ActivateAll(heap(), is_compacting_)</code> でローカルヒープ毎の <code>MarkingBarrier</code> をアクティブ化 (<code class="file-ref">marking-barrier.cc:315</code>)。</p>
+<p>6. <code>MarkRoots()</code> でルートをマーキングし、<code>concurrent_marking()-&gt;TryScheduleJob</code> で並列マーカジョブを開始。</p>
+<p>7. <code>incremental_marking_job()-&gt;ScheduleTask()</code> で IdleTask を予約。</p>
+
+<p><code>MarkingBarrier::Write</code> (<code class="file-ref">src/heap/marking-barrier-inl.h:21</code>) が write barrier の本体で、</p>
+
+<pre><code class="language-cpp">void MarkingBarrier::Write(Tagged&lt;HeapObject&gt; host, TSlot slot, Tagged&lt;HeapObject&gt; value) {
+  MarkValue(host, value);
+  if (slot.address() &amp;&amp; (kRecordYoung || IsCompacting(host))) {
+    MarkCompactCollector::RecordSlot&lt;TSlot, kRecordYoung&gt;(host, slot, value);
+  }
+}
+</code></pre>
+
+<p>と、まず <code>MarkValue</code> で grey 化(=<code>TryMark</code> + worklist push)し、続いて <code>RecordSlot</code> で OLD_TO_OLD remembered set への登録(evacuation 中なら slot を移動先に追跡できるよう保存)を行います。<code>MarkValueLocal</code> (<code class="file-ref">marking-barrier-inl.h:94</code>) では minor marking と major marking で処理を分岐させ、minor の場合は値が <code>HeapLayout::InYoungGeneration(value)</code> のときだけマーキングします。</p>
+
+<h4>3.5 Concurrent Marking</h4>
+
+<p><code>ConcurrentMarking</code> (<code class="file-ref">src/heap/concurrent-marking.h:35</code>) は <code>TryScheduleJob</code> (<code class="file-ref">concurrent-marking.cc:646</code>) で <code>JobTaskMajor</code> / <code>JobTaskMinor</code> を <code>V8::GetCurrentPlatform()-&gt;PostJob</code> に投げます。<code>RunMajor</code> (<code class="file-ref">concurrent-marking.cc:361</code>) の中心は次のループです (<code class="file-ref">concurrent-marking.cc:409-472</code>)。</p>
+
+<pre><code class="language-cpp">while (!done) {
+  while (current_marked_bytes &lt; kBytesUntilInterruptCheck &amp;&amp;
+         objects_processed &lt; kObjectsUntilInterruptCheck) {
+    if (!local_marking_worklists.Pop(&amp;object)) { done = true; break; }
+    // ...
+    if ((new_space_top &lt;= addr &amp;&amp; addr &lt; new_space_limit) ||
+        addr == new_large_object) {
+      local_marking_worklists.PushOnHold(object);
+    } else {
+      const auto visited_size = visitor.Visit(map, object);
+      visitor.IncrementLiveBytesCached(...);
+      current_marked_bytes += visited_size;
+    }
+  }
+  if (delegate-&gt;ShouldYield()) break;
+}
+</code></pre>
+
+<p><code>kBytesUntilInterruptCheck = 64 * KB</code> と <code>kObjectsUntilInterruptCheck = 1000</code> (<code class="file-ref">concurrent-marking.cc:365-366</code>) で yield 判定を入れているのが特徴で、メインスレッドの safepoint requested 等に素早く反応します。LAB に居るオブジェクトは <code>PushOnHold</code> に退避され、main thread が <code>MergeOnHold</code> するまで黒くなりません。</p>
+
+<p><code>RescheduleJobIfNeeded</code> (<code class="file-ref">concurrent-marking.h:59</code>) は実行中ジョブのワーカ数や priority を動的に変更するための API で、incremental step の中から繰り返し呼ばれます。</p>
+
+<h4>3.6 Incremental Marking のステップ</h4>
+
+<p><code>IncrementalMarking::Step</code> (<code class="file-ref">src/heap/incremental-marking.cc:779</code>) のキモは ① <code>MergeOnHold</code>、② <code>CppHeapStep</code>、③ <code>major_collector_-&gt;ProcessMarkingWorklist(max_duration, marked_bytes_limit)</code>、④ <code>ShareWork</code> + <code>RescheduleJobIfNeeded</code> の 4 段です。</p>
+
+<p><code>ProcessMarkingWorklist</code> (<code class="file-ref">mark-compact.cc:2318</code>) の本体は次の通り、worklist が空になるか、<code>max_duration</code> 経過するか、<code>max_bytes_to_process</code> を越えるまで visit を続けます。</p>
+
+<pre><code class="language-cpp">while (local_marking_worklists_-&gt;Pop(&amp;object) || local_marking_worklists_-&gt;PopOnHold(&amp;object)) {
+  Tagged&lt;Map&gt; map = object-&gt;map();
+  const auto visited_size = marking_visitor_-&gt;Visit(map, object);
+  MutablePage::FromHeapObject(heap_-&gt;isolate(), object)
+      -&gt;IncrementLiveBytesAtomically(ALIGN_TO_ALLOCATION_ALIGNMENT(visited_size));
+  bytes_processed += visited_size;
+  if ((objects_processed &amp; (kDeadlineCheckInterval - 1)) == 0 &amp;&amp;
+      (TimeTicks::Now() - start &gt; max_duration)) break;
+  if (bytes_processed &gt;= max_bytes_to_process) break;
+}
+</code></pre>
+
+<p><code>AdvanceOnAllocation</code> (<code class="file-ref">incremental-marking.cc:733</code>) は <code>IncrementalMarking::Observer::Step</code> (<code class="file-ref">incremental-marking.cc:94</code>) から呼ばれます。<code>Observer</code> は <code>AllocationObserver</code> のサブクラスで、<code>heap_-&gt;allocator()-&gt;AddAllocationObserver(&amp;old_generation_observer_, &amp;new_generation_observer_)</code> (<code class="file-ref">incremental-marking.cc:316</code>) によって割り当てのたびにマーキングを少しずつ進める仕掛けになっています。マーキングが完了したら <code>stack_guard()-&gt;RequestGC()</code> でメイン JS スレッドに finalize を要求します(<code class="file-ref">incremental-marking.cc:748-749</code>)。</p>
+
+<h4>3.7 MarkLiveObjects のフェーズ分割</h4>
+
+<p><code>MarkCompactCollector::MarkLiveObjects</code> (<code class="file-ref">mark-compact.cc:2582</code>) は以下の小フェーズに分けて GC tracer のスコープを記録します。</p>
+
+<p><code>MC_MARK_FINISH_INCREMENTAL</code> — incremental marking を <code>Stop()</code> して <code>MarkingBarrier::PublishAll(heap_)</code> で各 LocalHeap のローカル worklist をグローバルに統合 (<code class="file-ref">mark-compact.cc:2588-2601</code>)。</p>
+<p><code>MC_MARK_ROOTS</code> — <code>MarkRoots(&amp;root_visitor)</code> (<code class="file-ref">mark-compact.cc:2617</code>)。</p>
+<p><code>MC_MARK_CLIENT_HEAPS</code> — クライアント isolate からの参照を取り込む (<code>MarkObjectsFromClientHeaps</code>、<code class="file-ref">mark-compact.cc:2622</code>)。</p>
+<p><code>MC_MARK_RETAIN_MAPS</code> — <code>v8_flags.retain_maps_for_n_gc</code> の世代分だけ Map を生かす (<code>RetainMaps</code>、<code class="file-ref">mark-compact.cc:2627</code>)。</p>
+<p><code>MC_MARK_FULL_CLOSURE_PARALLEL</code> — <code>parallel_marking_ = true</code> にして <code>MarkTransitiveClosureFixpoint()</code> で並列にマーク完了 (<code class="file-ref">mark-compact.cc:2630-2635</code>)。</p>
+<p><code>MC_MARK_ROOTS</code> (2 回目) — 保守的スタックスキャン (<code>MarkRootsFromConservativeStack</code>、<code class="file-ref">mark-compact.cc:2639</code>)。</p>
+<p><code>MC_MARK_FULL_CLOSURE_SERIAL</code> — シングルスレッドで弱参照含めて閉包を取り直す (<code class="file-ref">mark-compact.cc:2643-2660</code>)。</p>
+
+<p>ephemeron(WeakMap キー → value)の処理は <code>MarkTransitiveClosureFixpoint</code> (<code class="file-ref">mark-compact.cc:2157</code>) が fixpoint まで回し、それでも残れば <code>MarkTransitiveClosureLinear</code> (<code class="file-ref">mark-compact.cc:2264</code>) が <code>key_to_values_</code> という辞書を使った線形時間アルゴリズムでフォールバックします (<code class="file-ref">mark-compact.cc:2652-2653</code>)。</p>
+
+<h4>3.8 Evacuation candidate の選定</h4>
+
+<p><code>MarkCompactCollector::CollectEvacuationCandidates</code> (<code class="file-ref">mark-compact.cc:659</code>) はページごとに <code>(live_bytes_in_page, page)</code> のペアを集め、</p>
+
+<pre><code class="language-cpp">std::sort(pages.begin(), pages.end(), [](const auto&amp; a, const auto&amp; b) { return a.first &lt; b.first; });
+for (size_t i = 0; i &lt; pages.size(); i++) {
+  if ((total_live_bytes + pages[i].first) &lt;= max_evacuated_bytes) {
+    candidate_count++;
+    total_live_bytes += pages[i].first;
+  }
+}
+</code></pre>
+
+<p>という単純な「断片化が大きい順 (=生存バイト数が少ない順) に max_evacuated_bytes まで詰め込む」アルゴリズムです。<code>target_fragmentation_percent</code> と <code>max_evacuated_bytes</code> は <code>ComputeEvacuationHeuristics</code> (<code class="file-ref">mark-compact.cc:606</code>) で動的に決まります。デフォルトでは</p>
+
+<pre><code class="language-cpp">const int kTargetFragmentationPercent = 70;
+const size_t kMaxEvacuatedBytes = v8_flags.compaction_max_evacuated_bytes_mb * MB;
+const float kTargetMsPerArea = .5;
+</code></pre>
+
+<p>(<code class="file-ref">mark-compact.cc:623-628</code>) を使い、メモリ削減モードでは更に攻撃的に <code>compaction_target_fragmentation_percent_for_reduce_memory</code> などへ切り替わります。さらに「圧縮しても新ページ数が削減できない (estimated_released_pages == 0)」場合は candidate_count を 0 に戻して compact-expand サイクルを防ぐ安全装置があります (<code class="file-ref">mark-compact.cc:792-795</code>)。</p>
+
+<p>ページが evacuation candidate に指定されると <code>MemoryChunk::Flag::EVACUATION_CANDIDATE</code> (<code class="file-ref">src/heap/memory-chunk.h:85</code>) フラグが立ち、<code>kSkipEvacuationSlotsRecordingMask</code> の判定で write barrier の挙動が変わります。</p>
+
+<h4>3.9 Evacuate と UpdatePointersAfterEvacuation</h4>
+
+<p><code>MarkCompactCollector::Evacuate</code> (<code class="file-ref">mark-compact.cc:5314</code>) は次の流れです。</p>
+
+<p>1. <code>EvacuatePrologue</code> — 初期化。</p>
+<p>2. <code>EvacuatePagesInParallel</code> — <code>EvacuationAllocator</code> (<code class="file-ref">src/heap/evacuation-allocator.h:21</code>) を用いてバックグラウンドのワーカが evacuation candidate からオブジェクトをコピーする。<code>EvacuationAllocator</code> は <code>MainAllocator</code> を NewSpace / OldSpace / CodeSpace / SharedSpace / TrustedSpace の 5 種類保持し、<code>CompactionSpaceCollection</code> 経由でコピー先ページを取り回します。</p>
+<p>3. <code>UpdatePointersAfterEvacuation</code> — <code>PointersUpdatingJob</code> (<code class="file-ref">mark-compact.cc:5386</code>) で並列にスロット更新。</p>
+<p>4. クリーンアップ — <code>new_space_evacuation_pages_</code> のうち <code>will_be_promoted</code> がついたものは <code>sweeper_-&gt;AddPage(OLD_SPACE, p)</code> で OldSpace に昇格、Minor MS モードでは空 new space ページを <code>SweepEmptyNewSpacePage</code> で free list に戻すか開放します (<code class="file-ref">mark-compact.cc:5335-5350</code>)。<code>promoted_large_pages_</code> も <code>MarkBit::From(...).Clear()</code> でビットを消してから昇格 (<code class="file-ref">mark-compact.cc:5354-5363</code>)。</p>
+<p>5. <code>EvacuationVerifier</code> (<code class="file-ref">src/heap/evacuation-verifier.h</code>) を <code>verify_heap</code> 有効時に走らせる (<code class="file-ref">mark-compact.cc:5373</code>)。</p>
+
+<h4>3.10 Sweep</h4>
+
+<p><code>MarkCompactCollector::Sweep</code> (<code class="file-ref">mark-compact.cc:6328</code>) は ① <code>LO_SPACE</code>、② <code>CODE_LO_SPACE</code>、③ <code>SHARED_LO_SPACE</code> 等のラージスペースを直列に SweepLargeSpace し、④ <code>StartSweepSpace(old_space)</code> ⑤ <code>StartSweepSpace(code_space)</code> 以下を呼び、最後に <code>sweeper_-&gt;StartMajorSweeping()</code> でバックグラウンドの sweeper を起動します。</p>
+
+<p>実際のページ単位スイープは <code>Sweeper::RawSweep</code> (<code class="file-ref">src/heap/sweeper.cc:1167</code>) で、<code>LiveObjectRange(p)</code> がページを舐めながら生きているオブジェクトの隣に <code>free_start..free_end</code> を見つけ、その隙間を <code>FreeAndProcessFreedMemory</code> で free list に登録し、<code>CleanupRememberedSetEntriesForFreedMemory</code> で remembered set のスロットを掃除します。最後に <code>ClearMarkBitsAndHandleLivenessStatistics(p, live_bytes)</code> でビットマップをクリアしてページの live_bytes を確定させます。</p>
+
+<p><code>Sweeper::SweepingMode</code> (<code class="file-ref">sweeper.h:55</code>) は <code>kEagerDuringGC</code> か <code>kLazyOrConcurrent</code> の 2 値で、メインスレッドが GC pause 内に貪欲にスイープするか、background worker に任せてラジー / コンカレントにやるかを切り替えます。</p>
+
+<h3 id="p3-4">4. Minor Mark-Sweep / Sticky Mark Bits</h3>
+
+<p>Minor MS は若い世代の Mark-Sweep ですが、Scavenger と違って「コピーしない」ぶん compaction も基本的に行いません。<code>v8_flags.minor_ms</code> で有効化されます。</p>
+
+<p><code>MinorMarkSweepCollector::CollectGarbage</code> (<code class="file-ref">src/heap/minor-mark-sweep.cc:419</code>) は ① <code>MarkLiveObjects</code> ② <code>cpp_heap-&gt;ProcessCrossThreadWeakness</code> ③ <code>ClearNonLiveReferences</code> ④ <code>Sweep</code> ⑤ <code>Finish</code> の 5 段。<code>MarkLiveObjects</code> (<code class="file-ref">minor-mark-sweep.cc:699</code>) はインクリメンタル minor marking が既に走っていれば <code>Stop()</code> してから <code>DrainMarkingWorklist</code> を呼び、<code>MarkRootsFromConservativeStack</code> でスタックスキャンを行います。</p>
+
+<p><code>DrainMarkingWorklist</code> (<code class="file-ref">minor-mark-sweep.cc:779</code>) の内部ループは</p>
+
+<pre><code class="language-cpp">do {
+  marking_worklists_local-&gt;MergeOnHold();
+  PerformWrapperTracing();
+  while (marking_worklists_local-&gt;Pop(&amp;heap_object)) {
+    Tagged&lt;Map&gt; map = Cast&lt;Map&gt;(*heap_object-&gt;map_slot());
+    const auto visited_size = main_marking_visitor_-&gt;Visit(map, heap_object);
+    main_marking_visitor_-&gt;IncrementLiveBytesCached(
+        MutablePage::FromHeapObject(heap_-&gt;isolate(), heap_object),
+        ALIGN_TO_ALLOCATION_ALIGNMENT(visited_size));
+  }
+} while (remembered_sets.ProcessNextItem(main_marking_visitor_.get()) ||
+         !IsCppHeapMarkingFinished(heap_, marking_worklists_local));
+</code></pre>
+
+<p>となっており、worklist + OLD_TO_NEW remembered set のスキャンを繰り返し fixpoint まで持っていきます。</p>
+
+<h4>4.1 Sticky Mark Bits と StickySpace</h4>
+
+<p>「sticky mark-bits」モード (<code>v8_flags.sticky_mark_bits</code>) は、若い世代と古い世代を物理的に分けるのではなく、<strong>全オブジェクトが同じ OldSpace に居て、マークビットの「生き残った」状態が GC を跨いで残る</strong> という発想です。</p>
+
+<p><code>StickySpace</code> (<code class="file-ref">src/heap/paged-spaces.h:462</code>) は <code>OldSpace</code> のサブクラスで、<code>young_objects_size()</code> = <code>Size() - allocated_old_size_</code> と <code>old_objects_size() = allocated_old_size_</code> を計算し、ページ単位の "young 領域" を区別します。<code>NotifyBlackAreaCreated</code> / <code>NotifyBlackAreaDestroyed</code> で <code>allocated_old_size_</code> を増減 (<code class="file-ref">paged-spaces.h:485-493</code>)、<code>AdjustDifferenceInAllocatedBytes</code> (<code class="file-ref">paged-spaces.cc:604</code>) で差分を反映します。</p>
+
+<p>スティッキマークビットが有効な場合の write barrier 経路は <code>CombinedWriteBarrierInternalForStickyMarkbits</code> (<code class="file-ref">src/heap/heap-write-barrier-inl.h:28-49</code>) です。</p>
+
+<pre><code class="language-cpp">const bool is_marking = host_chunk-&gt;IsMarking();
+if (!HeapLayout::InYoungGeneration(host_chunk, host) &amp;&amp;
+    HeapLayout::InYoungGeneration(value_chunk, value)) {
+  CombinedGenerationalAndSharedBarrierSlow(host, slot.address(), value);
+}
+if (V8_UNLIKELY(is_marking)) {
+  MarkingSlow(host, HeapObjectSlot(slot), value);
+}
+</code></pre>
+
+<p><code>HeapLayout::InYoungGeneration</code> が <code>chunk</code> の <code>STICKY_MARK_BIT_CONTAINS_ONLY_OLD</code> (<code class="file-ref">src/heap/memory-chunk.h:103</code>) ビットを見て、世代の境界を「ページ属性」ではなく「ビットマップの状態」で判断するように切り替わります。</p>
+
+<p>Scavenger と sticky mark-bits は排他で、<code>Scavenger::*</code> 系の <code>DCHECK(!v8_flags.sticky_mark_bits)</code> が随所に入っています (例: <code class="file-ref">scavenger.cc:993</code>)。</p>
+
+<h3 id="p3-5">5. Write Barrier</h3>
+
+<h4>5.1 4 段構成</h4>
+
+<p><code class="file-ref">src/heap/WRITE_BARRIER.md</code> に書かれているとおり、書き込みバリアは 4 段で構成されます。</p>
+
+<p>1. <strong>Fast path (inline)</strong> — <code>host</code> のページに <code>POINTERS_FROM_HERE_ARE_INTERESTING</code> が立っているかを 1 命令でテストし、立っていなければ続きの実行に戻ります。Turbofan 側の生成コードでは <code>kArchAtomicStoreWithWriteBarrier</code> で実装されています。</p>
+<p>2. <strong>Deferred (out-of-line)</strong> — <code>value</code> のページに <code>POINTERS_TO_HERE_ARE_INTERESTING</code> が立っていれば slow path のビルトインを呼ぶ。</p>
+<p>3. <strong>Shared slow path (builtin)</strong> — <code>RecordWriteSaveFP</code> などのビルトインで slot を <code>OLD_TO_NEW</code> slot set に挿入し、マーキング中なら <code>value</code> をマークする。</p>
+<p>4. <strong>C++ slow path</strong> — slot set が <code>malloc()</code> を必要とするときは <code>Heap::InsertIntoRememberedSetFromCode</code> (<code class="file-ref">src/heap/heap.h:1079</code>) に飛ぶ。</p>
+
+<h4>5.2 Combined Write Barrier</h4>
+
+<p>C++ コードからの書き込みは <code>WriteBarrier::CombinedWriteBarrierInternal</code> (<code class="file-ref">src/heap/heap-write-barrier-inl.h:52</code>) を経由します。</p>
+
+<pre><code class="language-cpp">if constexpr (v8_flags.sticky_mark_bits.value()) {
+  CombinedWriteBarrierInternalForStickyMarkbits(host, slot, value, mode);
+  return;
+}
+MemoryChunk* host_chunk = MemoryChunk::FromHeapObject(host);
+if (V8_LIKELY(!host_chunk-&gt;PointersFromHereAreInteresting())) return;
+MemoryChunk* value_chunk = MemoryChunk::FromHeapObject(value);
+if (!value_chunk-&gt;PointersToHereAreInteresting()) return;
+CombinedWriteBarrierInternalSlow(host, host_chunk, slot, value, value_chunk);
+</code></pre>
+
+<p>「<code>host</code> が old で、<code>value</code> が <code>young</code> か <code>shared</code> か <code>evacuation candidate</code>」の場合だけ実際の slow path <code>CombinedWriteBarrierInternalSlow</code> (<code class="file-ref">src/heap/heap-write-barrier.cc:381</code>) に進みます。slow path のメイン:</p>
+
+<pre><code class="language-cpp">const bool pointers_from_here_are_interesting = !host_chunk-&gt;IsYoungOrSharedChunk();
+if (V8_LIKELY(pointers_from_here_are_interesting &amp;&amp; value_chunk-&gt;IsYoungOrSharedChunk())) {
+  CombinedGenerationalAndSharedBarrierSlow(host, slot.address(), value);
+}
+if (V8_UNLIKELY(host_chunk-&gt;IsMarking())) {
+  MarkingSlow(host, HeapObjectSlot(slot), value);
+}
+</code></pre>
+
+<p>「世代越え + 共有越え」の barrier をまとめて入れ、なおかつマーキング中ならマーキング barrier も走らせる、というのが combined の中身です。</p>
+
+<h4>5.3 GenerationalBarrierSlow</h4>
+
+<p><code>WriteBarrier::GenerationalBarrierSlow</code> (<code class="file-ref">heap-write-barrier.cc:404</code>) は最終的に</p>
+
+<pre><code class="language-cpp">if (local_heap-&gt;is_main_thread()) {
+  RememberedSet&lt;OLD_TO_NEW&gt;::Insert&lt;AccessMode::NON_ATOMIC&gt;(
+      host_page, host_chunk-&gt;Offset(slot));
+} else {
+  RememberedSet&lt;OLD_TO_NEW_BACKGROUND&gt;::Insert&lt;AccessMode::ATOMIC&gt;(
+      host_page, host_chunk-&gt;Offset(slot));
+}
+</code></pre>
+
+<p>として、メインスレッドからの書き込みは非アトミック、バックグラウンドからの書き込みはアトミックで <code>OLD_TO_NEW_BACKGROUND</code> slot set に挿入します。後で次回 Scavenge 時に両方が舐められます。</p>
+
+<h4>5.4 初期化書き込みの省略 (Initializing Store)</h4>
+
+<p>WRITE_BARRIER.md は「最も最近に若い世代でアロケートしたオブジェクトへの初期化ストア」では write barrier を省略してよい、と明文化しています。理由は</p>
+
+<p>old-to-new generational barrier が要らない: host 自身が young。</p>
+<p>old-to-old evacuation barrier が要らない: host が young なので OLD_TO_OLD slot は存在しない。</p>
+<p>marking barrier が要らない: concurrent marker は LAB 内オブジェクトを <code>on_hold</code> に積むだけで黒くしないため、black-to-white 違反が起こらない。</p>
+
+<p>このため、Turbofan / Maglev / Sparkplug が生成する初期化コードは <code>SKIP_WRITE_BARRIER</code> を使えます。<code>WriteBarrier::IsRequired()</code> (<code class="file-ref">heap-write-barrier.h:153</code> 付近で V8_VERIFY_WRITE_BARRIERS マクロ下) が真の根源で、debug build では <code>VerifySkippedWriteBarrier</code> で省略が正当だったかを後から検証します (<code class="file-ref">heap.h:1082</code>)。</p>
+
+<h4>5.5 Marking Barrier の中</h4>
+
+<p><code>MarkingBarrier::Write</code> (<code class="file-ref">marking-barrier-inl.h:21</code>) はすでに 3.4 で見ましたが、Indirect pointer 書き込みには専用の <code>MarkingBarrier::Write(Tagged&lt;HeapObject&gt; host, IndirectPointerSlot slot)</code> (<code class="file-ref">marking-barrier.cc:44</code>) があり、サンドボックス内 trusted space に対する書き込みは <code>IsActiveDuringIncrementalMarking</code> のみチェック対象になります。Turbofan 上の opcode は <code>kArchStoreIndirectWithWriteBarrier</code> (WRITE_BARRIER.md L84) です。</p>
+
+<h3 id="p3-6">6. Remembered Set / Slot Set のデータ構造</h3>
+
+<h4>6.1 三階層ビットマップ: bucket / cell / bit</h4>
+
+<p><code>heap::base::BasicSlotSet&lt;SlotGranularity&gt;</code> (<code class="file-ref">src/heap/base/basic-slot-set.h:31</code>) はテンプレートで、<code>v8::internal::SlotSet</code> (<code class="file-ref">src/heap/slot-set.h:127</code>) はこれを <code>SlotGranularity = kTaggedSize</code> で具体化したものです。階層は次の通り(<code class="file-ref">basic-slot-set.h:277-285</code>):</p>
+
+<pre><code class="language-cpp">static constexpr int kCellsPerBucket = 32;
+static constexpr int kCellsPerBucketLog2 = 5;
+static constexpr int kBitsPerCell = 32;
+static constexpr int kBitsPerCellLog2 = 5;
+static constexpr int kBitsPerBucket = kCellsPerBucket * kBitsPerCell;  // 1024
+</code></pre>
+
+<p><code>Bucket</code> は <code>uint32_t cells_[32]</code> を持つ構造体 (<code class="file-ref">basic-slot-set.h:337</code>)。バケットあたり 1024 ビット = 1024 スロット = 8 KB (kTaggedSize=8 想定) を表現します。バケット配列のサイズは「ページサイズ / kTaggedSize / kCellsPerBucket / kBitsPerCell」で、<code>SlotSet::kBucketsRegularPage</code> (<code class="file-ref">slot-set.h:131</code>) で計算されます。</p>
+
+<p>スロットオフセットからのインデックス変換 (<code class="file-ref">basic-slot-set.h:463-468</code>):</p>
+
+<pre><code class="language-cpp">*cell_index = static_cast&lt;int&gt;((slot &gt;&gt; kBitsPerCellLog2) &amp; (kCellsPerBucket - 1));
+*bit_index = static_cast&lt;int&gt;(slot &amp; (kBitsPerCell - 1));
+</code></pre>
+
+<p>つまり「下位 5 bit が bit、その上 5 bit が cell、その上が bucket」というシンプルな分解です。</p>
+
+<h4>6.2 PossiblyEmptyBuckets</h4>
+
+<p><code>PossiblyEmptyBuckets</code> (<code class="file-ref">slot-set.h:35</code>) は「Scavenger が舐めて空になりかけた bucket」を覚えておく side bitmap です。後段のプロモーションでオブジェクトが入って bucket が再び埋まる可能性があるため、Scavenger 後に <code>CheckPossiblyEmptyBuckets</code> (<code class="file-ref">slot-set.h:184</code>) で実際に空ならバケットを <code>ReleaseBucket</code> して <code>free()</code> します。これがメモリ削減に効きます。</p>
+
+<h4>6.3 RememberedSetType 7 種類</h4>
+
+<p><code>enum RememberedSetType</code> (<code class="file-ref">src/heap/mutable-page.h:32-42</code>) の 7 種類:</p>
+
+<table>
+<thead><tr><th>値</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code>OLD_TO_NEW</code></td><td>古い世代 → 若い世代の参照 (generational barrier の出口)</td></tr>
+<tr><td><code>OLD_TO_NEW_BACKGROUND</code></td><td>同上だが background スレッドからの書き込み用</td></tr>
+<tr><td><code>OLD_TO_OLD</code></td><td>evacuation 中に必要な、Compaction で移動する evacuation candidate 上のオブジェクトを指している slot</td></tr>
+<tr><td><code>OLD_TO_SHARED</code></td><td>古い世代 → 共有ヒープ</td></tr>
+<tr><td><code>TRUSTED_TO_CODE</code></td><td>Trusted space → Code space (sandbox 用)</td></tr>
+<tr><td><code>TRUSTED_TO_TRUSTED</code></td><td>Trusted space → Trusted space</td></tr>
+<tr><td><code>TRUSTED_TO_SHARED_TRUSTED</code></td><td>Trusted space → Shared trusted space</td></tr>
+<tr><td><code>SURVIVOR_TO_EXTERNAL_POINTER</code></td><td>若い世代の external pointer table エントリ追跡</td></tr>
+</tbody>
+</table>
+
+<p>各ページ (<code>MutablePage</code>) は <code>slot_set_[NUMBER_OF_REMEMBERED_SET_TYPES]</code> と <code>typed_slot_set_[NUMBER_OF_REMEMBERED_SET_TYPES]</code> の 2 つの配列を持ちます (<code class="file-ref">mutable-page.h:117-141</code>)。<code>AsAtomicPointer::Acquire_Load</code> でロックなしに読めるよう atomic です。<code>typed_slot_set</code> は code のリロケーション情報のように「スロットの解釈に型情報が必要」なケースのためのもので、<code>SlotType</code> (RelocInfo の種類) を保持します。</p>
+
+<h4>6.4 RememberedSet テンプレート</h4>
+
+<p><code>RememberedSet&lt;type&gt;</code> (<code class="file-ref">src/heap/remembered-set.h:89</code>) は <code>AllStatic</code> で、<code>Insert / Iterate / Remove / RemoveRange / CheckNoneInRange / Contains / MergeAndDelete / MergeAndDeleteTyped</code> の static メソッド群を提供します。<code>Insert&lt;AccessMode&gt;</code> (<code class="file-ref">remembered-set.h:94</code>) は</p>
+
+<pre><code class="language-cpp">SlotSet* slot_set = page-&gt;slot_set&lt;type, access_mode&gt;();
+if (slot_set == nullptr) slot_set = page-&gt;AllocateSlotSet(type);
+RememberedSetOperations::Insert&lt;access_mode&gt;(slot_set, slot_offset);
+</code></pre>
+
+<p>と素直で、<code>slot_set</code> が未確保ならその場でアロケートします。<code>MergeAndDelete</code> は OLD_TO_NEW_BACKGROUND の slot set を OLD_TO_NEW にマージする際に使われます。</p>
+
+<h3 id="p3-7">7. スタックスキャン (Conservative vs Precise)</h3>
+
+<h4>7.1 ConservativeStackVisitor</h4>
+
+<p><code>ConservativeStackVisitorBase&lt;ConcreteVisitor&gt;</code> (<code class="file-ref">src/heap/conservative-stack-visitor.h:36</code>) はテンプレートで、<code>VisitPointer</code> (<code>heap::base::StackVisitor</code> から継承) で渡された (内部かもしれない) アドレスに対して <code>FindBasePtr(maybe_inner_ptr, cage_base)</code> を呼んでオブジェクトの先頭を探します。</p>
+
+<pre><code class="language-cpp">Address FindBasePtr(Address maybe_inner_ptr, PtrComprCageBase cage_base) const;
+</code></pre>
+
+<p>実装 (<code class="file-ref">conservative-stack-visitor-inl.h</code>) は、<code>MarkingBitmap::FindPreviousValidObject</code> (<code class="file-ref">marking.h:209-210</code>) を使い、与えられた <code>maybe_inner_ptr</code> を「ページ内で mark bit が立っているなかで maybe_inner_ptr 以下で最大のアドレス」に変換します。ページが iterable なら必ずオブジェクトの先頭になることが保証されます。</p>
+
+<p><code>ConservativeStackVisitor::FilterPage</code> (<code class="file-ref">conservative-stack-visitor.h:88</code>) は</p>
+
+<pre><code class="language-cpp">return v8_flags.sticky_mark_bits || !chunk-&gt;IsFromPage();
+</code></pre>
+
+<p>で「FROM_PAGE 上のオブジェクト(=Scavenger が今コピー中の若いオブジェクト)を保守的に扱うのは危険なので除外」となっています。</p>
+
+<h4>7.2 Precise vs Conservative の選択</h4>
+
+<p>Scavenger 内では <code>Heap::ConservativeStackScanningModeForMinorGC()</code> で <code>StackScanMode::{kNone, kPrecise, kConservative}</code> を選びます。<code>PinObjectsConservative</code> (<code class="file-ref">scavenger.cc:1715</code>)、<code>PinObjectsPrecise</code> (<code class="file-ref">scavenger.cc:1720</code>) で対応する pinning ロジックに分岐し、ピン留めされたオブジェクトは <code>set_map_word_forwarded(object, kRelaxedStore)</code> で「自分を自分にコピー」する forwarding を立てて移動を抑止します (<code class="file-ref">scavenger.cc:2651</code>)。</p>
+
+<h4>7.3 DirectHandle と IndirectHandle</h4>
+
+<p><code>Handle&lt;T&gt;</code> は <code class="file-ref">src/handles/handles.h</code> で定義されており、<code>IndirectHandle</code> は GC 時に参照されるオブジェクトのアドレスが移動しても安全な「ハンドルスコープ上のスロット」経由のインダイレクトな参照、<code>DirectHandle</code> (=V8_ENABLE_DIRECT_HANDLE がオン) は対応する compile-time フラグが立っているときに直接 raw pointer を保持するハンドルです。<code>RootMarkingVisitor::MarkObjectByPointer</code> (<code class="file-ref">mark-compact-inl.h:136</code>) は <code>#ifdef V8_ENABLE_DIRECT_HANDLE</code> で <code>kTaggedNullAddress</code> (null タグ) を素早く弾きます。</p>
+
+<h3 id="p3-8">8. GC Pause: Atomic / Idle / Concurrent / Parallel</h3>
+
+<h4>8.1 Atomic Pause</h4>
+
+<p><code>Heap::PerformGarbageCollection</code> (<code class="file-ref">heap.cc:2209</code>) 内で <code>safepoint_scope.emplace(isolate(), kGlobalSafepointForSharedSpaceIsolate);</code> (<code class="file-ref">heap.cc:2238</code>) と <code>SafepointScope</code> を取得した瞬間に <strong>すべてのスレッドが safepoint に集合</strong> します。これが atomic pause の始まりで、<code>tracer()-&gt;StartInSafepoint(atomic_pause_start_time)</code> (<code class="file-ref">heap.cc:2265</code>) で計測開始。背景スレッドは <code>PauseConcurrentThreadsInClients(collector)</code> (<code class="file-ref">heap.cc:2261</code>) で停止させ、<code>ResumeConcurrentThreadsInClients</code> (<code class="file-ref">heap.cc:2345</code>) で安全に再開します。</p>
+
+<h4>8.2 Concurrent / Parallel の区別</h4>
+
+<p><strong>Concurrent</strong> — mutator (JS スレッド) と同時並行で動くタスク。<code>ConcurrentMarking::TryScheduleJob</code> で <code>kUserVisible</code> か <code>kUserBlocking</code> の <code>JobTask</code> を投げ、<code>ShouldYield</code> で随時譲ります。</p>
+<p><strong>Parallel</strong> — atomic pause 中に main thread と背景タスクが同時に動く形態。<code>ScavengerJobTask</code> (<code class="file-ref">scavenger.cc:706</code>)、<code>PointersUpdatingJob</code> (<code class="file-ref">mark-compact.cc:5386</code>)、<code>ClearTrivialWeakRefJobItem</code> (mark-compact.h:337) などが典型例。</p>
+
+<p>V8 はこれらを使い分けて pause time を縮めます。Scavenger は完全 parallel ですが、incremental marking と組み合わせれば marking の大半が concurrent に行われ、atomic pause は最終フェーズだけになります。</p>
+
+<h4>8.3 Idle 通知</h4>
+
+<p><code>MemoryReducer</code> (<code class="file-ref">src/heap/memory-reducer.h:87</code>) は idle 通知や mutator 割り当て速度をモニタしながら自動的に Major GC を起動するステートマシンです。状態は <code>kUninit / kDone / kWait / kRun</code> の 4 値で、コメントによれば</p>
+
+<blockquote>
+<p>DONE t -&gt; WAIT 0 (now_ms + long_delay_ms) t' happens:</p>
+<p>on context disposal.</p>
+<p>at the end of mark-compact GC initiated by the mutator.</p>
+</blockquote>
+
+<p>など 7 種類の遷移ルールを持ちます。<code>NotifyMarkCompact(committed_memory_before)</code> (<code class="file-ref">memory-reducer.h:161</code>) が <code>Heap::CollectGarbage</code> の中で呼ばれ (<code class="file-ref">heap.cc:1580-1582</code>)、その後 <code>kCommittedMemoryFactor</code> 倍以上に増えたら次の "WAIT" 開始、という具合に長期的メモリ使用量を監視します。</p>
+
+<p><code>Heap::CollectAllAvailableGarbage</code> (<code class="file-ref">heap.cc:1290</code>) はメモリ圧迫時の "last resort" で、<code>kMaxNumberOfAttempts = 7</code>、<code>kMinNumberOfAttempts = 2</code> 回の GC を回しながら <code>num_roots()</code> が安定するまで <code>kReduceMemoryFootprint</code> 付きで <code>CollectGarbage</code> を繰り返します。</p>
+
+<h4>8.4 Concurrent Allocation</h4>
+
+<p>V8 にはバックグラウンドスレッドからの並行アロケーションがあります。各 LocalHeap は自分用の LAB (Linear Allocation Buffer) を持ち、<code>MainAllocator</code> (<code class="file-ref">src/heap/main-allocator.h</code>) 経由で取得します。アロケーション中に世代越えの書き込みが発生する場合、<code>OLD_TO_NEW_BACKGROUND</code> slot set に <strong>アトミックに</strong> スロットを追加することで、メインスレッドと衝突しないようにしています(前述 <code>GenerationalBarrierSlow</code>、<code class="file-ref">heap-write-barrier.cc:411-417</code>)。</p>
+
+<h3 id="p3-9">9. CppGC との統合 (Unified Heap)</h3>
+
+<p>V8 はブラウザ統合のため C++ オブジェクト (DOM など) も含めた "unified heap" を管理します。中核は <code class="file-ref">src/heap/cppgc-js/cpp-heap.h:40</code> の</p>
+
+<pre><code class="language-cpp">class V8_EXPORT_PRIVATE CppHeap final : public cppgc::internal::HeapBase,
+                                        public v8::CppHeap,
+                                        public cppgc::internal::StatsCollector::AllocationObserver,
+                                        public cppgc::internal::GarbageCollector { ... };
+</code></pre>
+
+<p>V8 と cppgc 双方で marking と sweeping を協調動作させるための API がここに集まっています。</p>
+
+<p>主要メソッド (<code class="file-ref">cpp-heap.h:137-152</code>):</p>
+
+<p><code>InitializeMarking(CollectionType, schedule)</code></p>
+<p><code>StartMarking()</code> — V8 側の <code>MarkCompactCollector::StartMarking</code> から呼ばれる (<code class="file-ref">incremental-marking.cc:307-312</code>)。</p>
+<p><code>AdvanceMarking(max_duration, marked_bytes_limit, stack_state)</code> — incremental step で呼ばれる。</p>
+<p><code>EnterFinalPause(stack_state)</code> — atomic pause 開始時 (<code class="file-ref">mark-compact.cc:2610</code>)。</p>
+<p><code>EnterProcessGlobalAtomicPause()</code> — グローバルロックを取って cross-thread roots を最終マーキング (<code class="file-ref">mark-compact.cc:2650</code>)。</p>
+<p><code>FinishMarkingAndProcessWeakness()</code> — 弱参照クリア (<code class="file-ref">mark-compact.cc:552</code>)。</p>
+<p><code>CompactAndSweep()</code> — atomic pause 内で C++ ヒープの compaction と sweep (<code class="file-ref">heap.cc:2331</code> 等)。</p>
+
+<p><code>CrossHeapRememberedSet</code> (<code class="file-ref">src/heap/cppgc-js/cross-heap-remembered-set.h</code>) と <code>UnifiedHeapMarkingState</code> (<code class="file-ref">unified-heap-marking-state.h</code>) は V8 オブジェクトと C++ オブジェクトの相互参照を追跡し、両者のマーキングが同じ fixpoint で完了するよう "wrapper tracing" のループを回します。<code>IsCppHeapMarkingFinished</code> チェックが <code>MinorMarkSweepCollector::DrainMarkingWorklist</code> (<code class="file-ref">minor-mark-sweep.cc:805-806</code>) や <code>MarkCompactCollector::MarkLiveObjects</code> (<code class="file-ref">mark-compact.cc:2658</code>) に出てくるのはこのためです。</p>
+
+<h3 id="p3-10">10. ヒューリスティクス / トリガー / コントローラ</h3>
+
+<h4>10.1 HeapController による Old Generation Limit</h4>
+
+<p><code>MemoryController&lt;V8HeapTrait&gt;</code> (<code class="file-ref">src/heap/heap-controller.h:44-66</code>) は <code>GrowingFactor(isolate, physical_memory, max_heap_size, gc_speed, mutator_speed, growing_mode)</code> で次の Major GC までに old generation がどれくらい増えてよいかを決定します。</p>
+
+<pre><code class="language-cpp">static constexpr double kMinGrowingFactor = 1.1;
+static constexpr double kMaxGrowingFactor = 4.0;
+static constexpr double kConservativeGrowingFactor = 1.3;
+static constexpr double kTargetMutatorUtilization = 0.97;
+</code></pre>
+
+<p>(<code class="file-ref">heap-controller.h:20-23</code>)</p>
+
+<p><code>kTargetMutatorUtilization = 0.97</code> というのが「全体時間の 97% は mutator(=JS 実行)に使いたい」というアダプティブヒューリスティクスの基本パラメータで、GC 速度 (<code>gc_speed</code>) と allocation 速度 (<code>mutator_speed</code>) の比から動的に成長係数を計算します。<code>DynamicGrowingFactor(gc_speed, mutator_speed, max_factor)</code> (<code class="file-ref">heap-controller.h:61</code>) の戻り値が <code>[kMinGrowingFactor, kMaxGrowingFactor]</code> にクランプされます。</p>
+
+<p><code>HeapLimits</code> (<code class="file-ref">heap-controller.h:103</code>) は <code>using_initial_limit_</code>、<code>old_generation_allocation_limit_</code>、<code>global_allocation_limit_</code> を atomic で保持しつつ、<code>UpdateAllocationLimits</code>、<code>ShrinkAllocationLimitIfNotConfigured</code>、<code>SetAllocationLimit</code>、<code>MaybeResetMaximumSizes</code> でこれらを更新します。<code>kMarginForSmallHeaps = 32 * MB</code> (<code class="file-ref">heap-controller.h:162</code>) が「小さなヒープでもマージンを取りすぎないため」のセーフティで、<code>old_generation_overshoot_margin()</code> などはここを最小値とします。</p>
+
+<h4>10.2 アロケーション失敗 → GC 連鎖</h4>
+
+<p><code>HeapAllocator::AllocateRawSlowPath</code> (<code class="file-ref">src/heap/heap-allocator.cc:199</code>) はアロケーション失敗時に呼ばれます。</p>
+
+<pre><code class="language-cpp">if (retry_mode == AllocationRetryMode::kLightRetry) {
+  RetryCustomAllocateLight(allocate, allocation, GarbageCollectionReason::kAllocationFailure);
+} else {
+  DCHECK_EQ(retry_mode, AllocationRetryMode::kRetryOrFail);
+  RetryCustomAllocateOrFail(allocate, allocation, GarbageCollectionReason::kAllocationFailure);
+}
+</code></pre>
+
+<p><code>kLightRetry</code> ならば軽い GC (Scavenger) を一度試して再試行、<code>kRetryOrFail</code> なら GC を昇格させながら最終的に <code>CollectAllAvailableGarbage</code> まで呼んでもダメなら <code>FatalProcessOutOfMemory</code> (<code class="file-ref">heap.cc:6629</code>) に至ります。</p>
+
+<h4>10.3 GarbageCollectionPrologue / Epilogue</h4>
+
+<p><code>Heap::CollectGarbage</code> のステージごとに</p>
+
+<p><code>CallGCPrologueCallbacks(gc_type, gc_callback_flags, GCTracer::Scope::HEAP_EXTERNAL_PROLOGUE)</code> — 外部 API 経由のコールバック (<code class="file-ref">heap.cc:1509</code>)。</p>
+<p><code>GarbageCollectionPrologue(gc_reason, gc_callback_flags)</code> — 内部準備 (<code class="file-ref">heap.cc:1536</code>)。</p>
+<p><code>PerformGarbageCollection(collector, gc_reason, collector_reason)</code> — 本体 (<code class="file-ref">heap.cc:1554</code>)。</p>
+<p><code>GarbageCollectionEpilogue(collector)</code> — 内部後処理 (<code class="file-ref">heap.cc:1573</code>)。</p>
+<p><code>CallGCEpilogueCallbacks(gc_type, gc_callback_flags, ...)</code> — 外部後コールバック (<code class="file-ref">heap.cc:1617</code>)。</p>
+<p><code>RecomputeLimits(collector)</code> — 次の閾値を再計算 (<code class="file-ref">heap.cc:1600</code>)。</p>
+
+<p>があり、prologue/epilogue は API ユーザーが追加できる「GC コールバック」と内部処理を区別しています。</p>
+
+<h4>10.4 GCTracer のスコープ階層</h4>
+
+<p><code>GCTracer::Scope::ScopeId</code> (<code class="file-ref">src/heap/gc-tracer.h:129</code>) は <code>TRACER_SCOPES(DEFINE_SCOPE)</code> マクロで展開されて 100 個近いスコープを並べる仕組みで、<code>FIRST_INCREMENTAL_SCOPE = MC_INCREMENTAL</code>、<code>LAST_TOP_MC_SCOPE = MC_SWEEP</code> などの境界定数を提供します。これにより <code>SCAVENGER_SCAVENGE_ROOTS</code>、<code>MC_MARK_FULL_CLOSURE_PARALLEL</code>、<code>MC_EVACUATE_COPY</code> などのフェーズごとの所要時間が個別にヒストグラム化されます。</p>
+
+<h3 id="p3-11">11. すべてをつなぐ: 一回の Major GC の擬似コード</h3>
+
+<p>最後に上記のすべてを束ねた擬似コードで、<code>v8_flags.incremental_marking</code> がオンの場合の典型的な major GC の流れを書きます。実コードは前述の行番号を参照してください。</p>
+
+<pre><code class="language-text">// Phase A: Concurrent / Incremental marking (mutator と並行)
+when allocation observer fires:
+  IncrementalMarking::AdvanceOnAllocation()       // incremental-marking.cc:733
+    Step(max_duration, max_bytes_to_process, kV8)
+      local_marking_worklists_-&gt;MergeOnHold()
+      CppHeapStep(...)
+      MarkCompactCollector::ProcessMarkingWorklist(...)  // mark-compact.cc:2318
+        while pop(obj):
+          map = obj-&gt;map()
+          visited_size = marking_visitor_-&gt;Visit(map, obj)
+          page-&gt;IncrementLiveBytesAtomically(visited_size)
+      local_marking_worklists_-&gt;ShareWork()
+      concurrent_marking_-&gt;RescheduleJobIfNeeded(MARK_COMPACTOR)
+    if IsMajorMarkingComplete():
+      stack_guard()-&gt;RequestGC()                  // incremental-marking.cc:749
+
+// Phase B: Stack guard が反応してメインスレッドが finalize へ
+Heap::CollectGarbage(OLD_SPACE, kFinalizeMarkingViaStackGuard):
+  collector = SelectGarbageCollector(...)          // -&gt; MARK_COMPACTOR
+  // Prologue, callbacks, etc.
+  PerformGarbageCollection(MARK_COMPACTOR, ...):
+    CompleteSweepingFull(kMajorGC)
+    safepoint_scope.emplace(isolate(), kGlobalSafepointForSharedSpaceIsolate)
+    PauseConcurrentThreadsInClients(MARK_COMPACTOR)
+    FreeLinearAllocationAreas()
+    MarkCompact():
+      mark_compact_collector_-&gt;Prepare()
+      MarkCompactCollector::CollectGarbage():
+        MarkLiveObjects():
+          incremental_marking-&gt;Stop()
+          MarkingBarrier::PublishAll(heap_)
+          MarkRoots(&amp;root_visitor)
+          MarkObjectsFromClientHeaps()
+          RetainMaps()
+          parallel_marking_ = true
+          MarkTransitiveClosureFixpoint()         // 並列にマーキング完了
+          parallel_marking_ = false
+          MarkRootsFromConservativeStack(&amp;root_visitor)
+          if !MarkTransitiveClosureFixpoint(): MarkTransitiveClosureLinear()
+          MarkingBarrier::DeactivateAll(heap_)
+          epoch_++
+        cpp_heap-&gt;ProcessCrossThreadWeakness()
+        RecordObjectStats()
+        ClearNonLiveReferences()
+        VerifyMarking()
+        cpp_heap-&gt;FinishMarkingAndProcessWeakness()
+        Sweep():
+          for space in {OLD_SPACE, CODE_SPACE, SHARED_SPACE, TRUSTED_SPACE}:
+            StartSweepSpace(space)
+          sweeper_-&gt;StartMajorSweeping()
+        Evacuate():
+          EvacuatePrologue()
+          EvacuatePagesInParallel()
+          UpdatePointersAfterEvacuation()
+          // promote / sweep / release new-space pages
+          EvacuateEpilogue()
+        Finish()
+    ResumeConcurrentThreadsInClients(...)
+  // Epilogue callbacks
+  if collector == MARK_COMPACTOR:
+    memory_reducer_-&gt;NotifyMarkCompact(committed_memory_before)
+  RecomputeLimits(MARK_COMPACTOR)
+</code></pre>
+
+<p>このうち atomic pause に含まれるのは <code>safepoint_scope.emplace(...)</code> から <code>ResumeConcurrentThreadsInClients(...)</code> までです。Sweep の大半はその後 background でラジーに進みます。</p>
+
+<h3 id="p3-12">12. 重要ファイルの一覧</h3>
+
+<p>ここまでで参照したファイルを目的別に並べると次の通りです (発表資料の参考文献用)。</p>
+
+<p>全体エントリと選択 — <code class="file-ref">src/heap/heap.h:198, 270, 549, 978, 2209</code>、<code class="file-ref">src/heap/heap.cc:549, 1246, 1437, 2209, 2534, 2599</code></p>
+<p>GarbageCollector / Reason — <code class="file-ref">src/common/globals.h:1594, 1763</code></p>
+<p>Scavenger — <code class="file-ref">src/heap/scavenger.h:15</code>、<code class="file-ref">src/heap/scavenger.cc:286, 1626, 1952, 2005, 2028, 2080, 2109, 2535, 2607</code></p>
+<p>New space と age mark — <code class="file-ref">src/heap/new-spaces.h:300-389</code>、<code class="file-ref">src/heap/new-spaces-inl.h:80-96</code></p>
+<p>Mark-Compact — <code class="file-ref">src/heap/mark-compact.h:58-469</code>、<code class="file-ref">src/heap/mark-compact.cc:326-808, 2157-2671, 5314-6395</code></p>
+<p>Marking 共通 — <code class="file-ref">src/heap/marking.h:19-289</code>、<code class="file-ref">src/heap/marking-state.h</code>、<code class="file-ref">src/heap/marking-state-inl.h</code>、<code class="file-ref">src/heap/marking-inl.h:282-360</code>、<code class="file-ref">src/heap/marking-visitor.h</code>、<code class="file-ref">src/heap/marking-visitor-inl.h:45-150</code></p>
+<p>Marking worklist — <code class="file-ref">src/heap/marking-worklist.h:18-200</code></p>
+<p>Incremental marking — <code class="file-ref">src/heap/incremental-marking.h:34-207</code>、<code class="file-ref">src/heap/incremental-marking.cc:139-902</code>、<code class="file-ref">src/heap/incremental-marking-job.h</code></p>
+<p>Concurrent marking — <code class="file-ref">src/heap/concurrent-marking.h:35-123</code>、<code class="file-ref">src/heap/concurrent-marking.cc:361-877</code></p>
+<p>Marking barrier — <code class="file-ref">src/heap/marking-barrier.h:27-119</code>、<code class="file-ref">src/heap/marking-barrier-inl.h:21-117</code>、<code class="file-ref">src/heap/marking-barrier.cc:315-413</code></p>
+<p>Write barrier — <code class="file-ref">src/heap/WRITE_BARRIER.md</code>、<code class="file-ref">src/heap/heap-write-barrier.h:69-260</code>、<code class="file-ref">src/heap/heap-write-barrier-inl.h:28-104</code>、<code class="file-ref">src/heap/heap-write-barrier.cc:369-418</code></p>
+<p>Remembered Set / Slot Set — <code class="file-ref">src/heap/remembered-set.h:25-170</code>、<code class="file-ref">src/heap/slot-set.h:35-200</code>、<code class="file-ref">src/heap/base/basic-slot-set.h:25-468</code>、<code class="file-ref">src/heap/mutable-page.h:32-194</code></p>
+<p>Minor mark-sweep — <code class="file-ref">src/heap/minor-mark-sweep.cc:419-807</code></p>
+<p>Sticky space — <code class="file-ref">src/heap/paged-spaces.h:462-499</code>、<code class="file-ref">src/heap/paged-spaces.cc:602-607</code></p>
+<p>Sweeper — <code class="file-ref">src/heap/sweeper.h:37-300</code>、<code class="file-ref">src/heap/sweeper.cc:1167-1280</code></p>
+<p>Evacuation — <code class="file-ref">src/heap/evacuation-allocator.h:21-64</code>、<code class="file-ref">src/heap/evacuation-verifier.h</code>、<code class="file-ref">src/heap/mark-compact.cc:5314-5380</code></p>
+<p>Memory chunk flags — <code class="file-ref">src/heap/memory-chunk.h:35-145</code></p>
+<p>Conservative stack scan — <code class="file-ref">src/heap/conservative-stack-visitor.h:36-104</code></p>
+<p>Memory reducer — <code class="file-ref">src/heap/memory-reducer.h:23-216</code></p>
+<p>Heap controller — <code class="file-ref">src/heap/heap-controller.h:19-285</code></p>
+<p>Heap allocator — <code class="file-ref">src/heap/heap-allocator.cc:85-228</code></p>
+<p>CppHeap integration — <code class="file-ref">src/heap/cppgc-js/cpp-heap.h:40-180</code>、<code class="file-ref">src/heap/cppgc-js/cross-heap-remembered-set.h</code>、<code class="file-ref">src/heap/cppgc-js/unified-heap-marking-*.h</code></p>
+
+<p>これらを発表資料の「もっと深く知りたい人へ」ページの脚注として並べると、V8 GC の全貌を読者が掘り進められる地図になります。</p>
+
+<h3 id="p3-13">13. 補足: MarkingVisitorBase と各オブジェクト型の特別扱い</h3>
+
+<p><code>MarkingVisitorBase&lt;ConcreteVisitor&gt;</code> (<code class="file-ref">src/heap/marking-visitor.h:46</code>) は <code>ConcurrentHeapVisitor</code> を継承し、オブジェクト種別ごとに特殊な処理を持つマーキングビジターのテンプレートです。汎用の <code>VisitPointer(host, slot)</code> (<code class="file-ref">marking-visitor.h:114</code>) は <code>VisitPointersImpl(host, p, p + 1)</code> 経由で <code>ProcessStrongHeapObject</code> (<code class="file-ref">marking-visitor-inl.h:61</code>) を呼びますが、特定の型については個別の <code>Visit*</code> が存在します。代表例:</p>
+
+<p><code>VisitDescriptorArray</code> / <code>VisitDescriptorArrayStrongly</code> (<code class="file-ref">marking-visitor.h:83-88</code>) — Descriptor array は弱参照を含むため <code>MarkingProgressTracker</code> で部分マーキングしながら、<code>epoch_</code> を使って世代を跨いで分割訪問します。<code>MarkCompactCollector</code> の <code>epoch_++</code> (<code class="file-ref">mark-compact.cc:2670</code>) はこれと連動します。</p>
+<p><code>VisitEphemeronHashTable</code> (<code class="file-ref">marking-visitor.h:89</code>) — <code>EphemeronHashTable</code> (<code>Map</code>-<code>Value</code> 対 + 弱キー) は <code>local_weak_objects_-&gt;current_ephemerons_local.Push(Ephemeron{key, value})</code> で ephemeron worklist に積み、<code>ProcessEphemeron</code> (<code class="file-ref">mark-compact.cc:2392</code>) で fixpoint をとります。</p>
+<p><code>VisitJSFunction</code> (<code class="file-ref">marking-visitor.h:94</code>) — bytecode flushing の対象判定に使う。<code>code_flush_mode_</code> (<code class="file-ref">marking-visitor.h:53</code>) が立っていれば実行カウンタを <code>code_flushing_increase_</code> だけ増やします。</p>
+<p><code>VisitMap</code> (<code class="file-ref">marking-visitor.h:98</code>) — Map のレシーバ slot は special weak で扱うため、<code>MarkingHelper::TryMarkAndPush</code> ではなく独自の transitions array 処理経路 (<code>local_weak_objects_-&gt;transition_arrays_local.Push</code>、<code class="file-ref">mark-compact-inl.h:114</code>) を通る。</p>
+<p><code>VisitWeakCell</code> (<code class="file-ref">marking-visitor.h:106</code>) — <code>JSWeakRef</code> や <code>FinalizationRegistry</code> のセル。weak で繋がっている value はマークせず、対象が死んだら finalization callback を発火させるための worklist に積みます。</p>
+
+<p><code>MarkingVisitor</code> 系は ① <code>MainMarkingVisitor</code> (<code>MarkCompactCollector</code> のメインスレッド用)、② <code>ConcurrentMarkingVisitor</code> (<code class="file-ref">concurrent-marking.cc:375</code>)、③ <code>YoungGenerationMarkingVisitor</code> (<code class="file-ref">src/heap/young-generation-marking-visitor.h</code>)、④ <code>ReferenceSummarizerMarkingVisitor</code> (デバッグ用) と並ぶ多態階層になっており、<code>isolate_in_background_</code> フラグや <code>should_keep_ages_unchanged_</code> の有無で挙動を微調整します。</p>
+
+<h3 id="p3-14">14. 補足: Object Promotion と Page Promotion</h3>
+
+<p>V8 の昇格 (promotion) には 2 種類あります。</p>
+
+<h4>14.1 オブジェクト単位の昇格 (Scavenger)</h4>
+
+<p><code>Scavenger::PromoteObject</code> (<code class="file-ref">scavenger.cc:2028</code>) は <code>TryMigrateObject</code> で OldSpace に新規アロケートしてコピーする方式です。コピー単位は当然オブジェクトサイズです。コピー後 <code>local_promoted_list_.Push({target, map, object_size})</code> でプロモート済 worklist に積み、<code>ScavengerPromotedObjectVisitor</code> が後で訪問して内部スロットを更新します。プロモートされたオブジェクトのうち pointer を持つフィールドは <code>RememberedSet&lt;OLD_TO_NEW&gt;</code> への登録が必要かどうかを <code>RememberedSetEntryNeeded</code> (<code class="file-ref">scavenger.cc:2092</code>) が判定します。</p>
+
+<h4>14.2 ページ単位の昇格 (Page Promotion)</h4>
+
+<p>新空間のページがあるしきい値以上の生存率を持つ場合、<code>MarkCompactCollector</code> は new space のページを丸ごと old space に「昇格」させます。これは <code>MarkCompactCollector::Evacuate</code> の <code>EvacuateClean-Up</code> フェーズ (<code class="file-ref">mark-compact.cc:5330-5350</code>) の中で、<code>p-&gt;will_be_promoted()</code> が true なページに対して <code>sweeper_-&gt;AddPage(OLD_SPACE, p)</code> を行うことで実現されます。さらにラージページは <code>MarkCompactCollector::promoted_large_pages_</code> に積まれ、<code>MarkBit::From(...).Clear()</code> で先頭オブジェクトのマークビットを消した上で <code>marking_progress_tracker().ResetIfEnabled()</code> で進捗トラッカをリセットします (<code class="file-ref">mark-compact.cc:5354-5363</code>)。</p>
+
+<p>ページ単位の昇格はオブジェクトをコピーせずページのメタデータだけ書き換えるため、生存率の高いページに対してはオブジェクト単位コピーよりずっと安価です。</p>
+
+<h3 id="p3-15">15. 補足: 「保守的」と「精密」の選び方</h3>
+
+<p>V8 は基本的にスタック上のポインタを「精密」に扱おうとします。理由は</p>
+
+<p>精密マーキングなら mark-and-sweep だけでなく compaction も完全に行える。</p>
+<p>偶然 word サイズの整数値がたまたまヒープアドレスに見える場合の "偽のルート" を発生させない。</p>
+
+<p>ところがインライン化されたコードが最適化された結果、レジスタアロケータが「ある時点でどの値が tagged pointer か」を完全に決められない場面が現実にあります。そこで <code>Heap::ConservativeStackScanningModeForMinorGC()</code> や <code>embedder_stack_state_ == StackState::kMayContainHeapPointers</code> のチェック (<code class="file-ref">heap.cc:604</code>) が走り、必要な場面だけ <code>ConservativeStackVisitor</code> で「これっぽいアドレスは全部ピン留め」する戦略に切り替わります。</p>
+
+<p>この hybrid アプローチが <code>PinObjectsConservative</code> / <code>PinObjectsPrecise</code> の使い分けの理由で、Scavenger でも <code>MarkCompactCollector::PinPreciseRootsIfNeeded()</code> でも同じ思想が使われます。「ピン留めされたオブジェクト」は <code>MapWord::IsForwardingAddress</code> がたまたま自分自身を指している状態で、quarantined ページに残るため Sweeper が後ほどラジーにスイープすることになっています。</p>
+
+<h3 id="p3-16">16. まとめ</h3>
+
+<p>V8 のガベージコレクションは、(1) 若い世代の Scavenger による Cheney 流コピー、(2) 旧世代の Mark-Compact (Major GC)、(3) その変種である Minor MS / Sticky mark bits、(4) これらすべてを支える Write Barrier / Remembered Set / Marking Bitmap / Marking Worklist という共通基盤、(5) Concurrent Marking と Incremental Marking による pause time の削減、(6) CppGC とのユニファイドヒープ統合、(7) アダプティブヒューリスティクスによるトリガリング、という多層構造で成立しています。一つの GC サイクルだけでも <code>Heap::CollectGarbage → SelectGarbageCollector → PerformGarbageCollection → (MarkCompact|MinorMarkSweep|Scavenge) → 個別コレクタの CollectGarbage → 数十のフェーズ</code> という入れ子で動き、各レイヤがマイクロ秒単位のチューニングポイントを持っています。発表ではこの多層構造を「アロケーション速度を maximize しつつ pause time を 1 ms に抑える、ということを 8 種類のリメンバードセットと 4 段の write barrier で実現している」というメタメッセージに昇華するのが効果的だと思われます。</p>
+
+</section>
+

@@ -1,0 +1,71 @@
+<section class="epilogue" id="epilogue">
+<h2>むすび ― ここまで読んだあなたへ</h2>
+
+<p>5 章 16,000 行を読了されたあなたは、もはや V8 の主要な内部実装をすべて把握しているはずです。 Tagged Pointer のビットレイアウト、Hidden Class の遷移、ElementsKind の格上げ、Scavenger と Mark-Compact、Torque のコンパイルパイプライン、配列の Copy-on-Write、Protector による楽観的最適化、これらが互いにどう連携して JavaScript の高速実行を実現しているかが見通せるようになりました。</p>
+
+<h3>各章で得たもの</h3>
+
+<div class="learning-card">
+<div class="card">
+<h3>第 1 章で得たもの</h3>
+<p>V8 の全体地図。 Tagged Pointer・HeapObject・Map・JSObject・ElementsKind・String 階層・Pointer Compression・Sandbox・Heap Spaces・Orinoco GC・実行パイプライン・Inline Cache まで、語る上で必要な語彙すべてを取得しました。</p>
+</div>
+<div class="card">
+<h3>第 2 章で得たもの</h3>
+<p>メモリ管理の精密な像。 Page と MemoryChunk の構造、Free List 分類、Scavenger の Cheney アルゴリズム、Write Barrier の動作、Remembered Set、Conservative Stack Scan、CppGC、そして Sandbox の脅威モデルまでを把握しました。</p>
+</div>
+<div class="card">
+<h3>第 3 章で得たもの</h3>
+<p>V8 ビルトインを読み書きする力。 Torque の型システム、transient 型、Witness パターン、Bailout 設計、constexpr と if constexpr による特殊化、そして CSA / TSA への変換と機械語生成まで、ビルトイン実装の全層を理解しました。</p>
+</div>
+<div class="card">
+<h3>第 4 章で得たもの</h3>
+<p>具体オブジェクトの実装観。 配列という JavaScript で最も基本的なデータ型が、内部では 13 種類以上の Kind に分かれて多段最適化されていることを知り、Hole の表現、Dictionary mode への降格、Copy-on-Write、容量拡大則まで、設計上の判断すべてに理由があることを確認しました。</p>
+</div>
+<div class="card">
+<h3>第 5 章で得たもの</h3>
+<p>最適化の現実的な姿。 flat 一つの実装に、ElementsKind の利用、FastJSArrayWitness の Recheck、Protector のチェック、二パス設計、明示スタック、Bailout の分類が全部詰め込まれており、4 倍超の高速化は単発の魔法ではなく多くの工夫の積層であることを理解しました。</p>
+</div>
+</div>
+
+<h3>次に学ぶとよいトピック</h3>
+
+<p>本書ではあえて踏み込まなかった、または駆け足になった領域があります。 興味の方向に応じて以下のトピックを追ってみてください。</p>
+
+<dl>
+<dt>WebAssembly インテグレーション</dt>
+<dd>V8 は Wasm 実行も担います。 Liftoff (ベースラインコンパイラ) と TurboFan の Wasm パイプライン、Wasm GC、SIMD、Resizable ArrayBuffer 連携などが該当します。</dd>
+
+<dt>Maglev コンパイラの中身</dt>
+<dd>Sparkplug と TurboFan の中間に位置する Maglev は、Tier-Up の効率化を主眼に設計されています。 Maglev IR・SSA・register allocation の実装は <code class="file-ref">src/maglev/</code> 配下です。</dd>
+
+<dt>TurboShaft の Reducer Chain</dt>
+<dd>TurboFan の Sea of Nodes を置き換える TurboShaft は、Reducer の連鎖で最適化を表現します。 第 3 章で簡単に触れた `BuiltinPipeline::OptimizeBuiltin` を起点に <code class="file-ref">src/compiler/turboshaft/</code> を探索すると深く学べます。</dd>
+
+<dt>Liftoff / Sparkplug の Bytecode Mapping</dt>
+<dd>Ignition Bytecode を直接機械語に落とす Sparkplug は、Bytecode 1 命令が機械語 1 ブロックに対応するシンプルな設計です。 第 1 章で触れたこの仕組みは <code class="file-ref">src/baseline/</code> 配下にあります。</dd>
+
+<dt>V8 内部のテストとファジング</dt>
+<dd>本書では各実装のテスト位置を脚注で示しました。 mjsunit、cctest、unittest、test262 連携、ClusterFuzz、規模感のあるテスト戦略は実装そのものに匹敵する複雑さがあります。</dd>
+
+<dt>Embedded Snapshot と Custom Builds</dt>
+<dd>mksnapshot がどう scratch から V8 のヒープを構築するか、Custom Snapshot で起動時間を改善する手法、Embedder API でこれをどう活用するかは、Node.js や Cloudflare Workers のパフォーマンスチューニングに直結します。</dd>
+</dl>
+
+<h3>外部リソース</h3>
+
+<p>本書は V8 ソースコードを一次資料として書かれていますが、二次資料も併用するとさらに理解が深まります。</p>
+
+<ul>
+<li><a href="https://v8.dev/blog">V8 公式ブログ</a> 最新の最適化・機能追加情報。 ElementsKind 解説や Pointer Compression 解説など、本書の各章と直接対応する記事があります。</li>
+<li><a href="https://v8.dev/docs">V8 公式ドキュメント</a> 内部実装のリファレンス。 Sandbox、Torque、Embedded Builtins などのページが豊富です。</li>
+<li><a href="https://tc39.es/ecma262/">ECMAScript 仕様</a> V8 が実装している言語仕様の一次資料。 本書で取り上げた抽象操作 (ArraySpeciesCreate、IsArray、FlattenIntoArray など) はすべてここで定義されています。</li>
+<li><a href="https://chromium-review.googlesource.com/q/project:v8/v8">Chromium Gerrit (V8)</a> 実装変更のレビュー履歴。 V8 への新しい変更とその議論を追跡できます。</li>
+</ul>
+
+<h3>謝辞</h3>
+
+<p>本書は V8 のソースコードを書いてくれている V8 チームと、ECMAScript 仕様を整備している TC39 への深い敬意のもとに執筆されています。 また、各章の元となる解説記事を執筆された方々に感謝します。</p>
+
+<p>ここまでお読みいただきありがとうございました。 V8 を読み続け、書き続けるすべての方の助けになれば幸いです。</p>
+</section>

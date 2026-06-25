@@ -1,0 +1,25 @@
+<h2 id="section-9">9. Bailout の分類</h2>
+
+<p><code>CalculateFlattenedLengthFast</code> と <code>TryFastFlat</code> の中で <code>goto Bailout</code> が発火する箇所を分類すると以下のとおりです。</p>
+
+<table>
+<thead>
+<tr><th>分類</th><th>該当行</th><th>説明</th></tr>
+</thead>
+<tbody>
+<tr><td>Map 変異検出</td><td>行 86、行 217、行 291</td><td><code>fastOW.Recheck() otherwise goto Bailout</code>。<code>FastJSArrayForReadWitness.Recheck</code> の中で <code>stable.map != map</code> または <code>IsNoElementsProtectorCellInvalid()</code> を検知します。これは getter コールバック内で <code>Object.setPrototypeOf</code> などにより形が変わるケースを補足するためです。</td></tr>
+<tr><td>Length 切り詰め検出</td><td>行 87、行 218、行 292</td><td><code>if (index &gt;= fastOW.Get().length) goto Bailout</code>。getter 内で <code>arr.length = 3</code> のように長さを縮めた場合に補足します。<code>regress-crbug-1507416.js</code> の TestShrink ケースが該当します。</td></tr>
+<tr><td>Smi オーバーフロー</td><td>行 102、113、122、128、151、行 232、234、306、307</td><td><code>math::TrySmiAdd</code> / <code>math::TrySmiSub</code> の <code>otherwise goto Bailout</code>。length 計算と target / source index 進行で使われます。Smi は 32 ビット環境で 31 ビット幅なので非常に大きい結果配列で発火し得ますが、深さ 1024 の制限が事前に効くので実際の発火頻度は低めです。</td></tr>
+<tr><td>スタック溢れ</td><td>行 129、行 308</td><td><code>if (stack.length &gt;= kMaxFlatFastStackEntries) goto Bailout</code>。深さ 1024 を超える入れ子で発火します。サイクル <code>a.push(a)</code> がこれを引きます。</td></tr>
+<tr><td>Cast 失敗系</td><td>行 77、99、111、120、137、167-168、187、189、208、230、242、269-270、282、304、316、341-343</td><td>多岐にわたります。<code>Cast&lt;FastJSArrayForRead&gt;(source)</code>、子要素 <code>Cast&lt;FastJSArrayForRead&gt;(element)</code>、<code>Cast&lt;Smi&gt;(elementArray.length)</code>、currentLength、スタックポップ時の再キャスト、<code>Cast&lt;Smi&gt;(sourceLength)</code>、<code>Cast&lt;FastJSArrayForCopy&gt;(receiver)</code> など。走査中に ElementsKind が遷移して <code>FastJSArray*</code> 型ガードを満たさなくなった、または length が Smi 範囲外になった、もしくは入力 receiver が proxy だった、などのケースを捕捉します。</td></tr>
+<tr><td>Proxy 専用の早期 bailout</td><td>行 143、248、322</td><td><code>if (currentDepth &gt; 0 &amp;&amp; Is&lt;JSProxy&gt;(element)) goto Bailout</code>。depth &gt; 0 でかつ要素がプロキシだと、その要素は <code>IsArray</code> で配列に化ける可能性があり (<code>runtime::ArrayIsArray</code> は proxy 内部のターゲットを判定する)、fast path では proxy のトラップを発火させたくないため slow path に投げます。depth == 0 のときは要素はそのままコピーされるだけで配列扱いされないので、proxy でも bailout しません。</td></tr>
+<tr><td>配列長一致の最終整合性確認</td><td>行 274、行 348</td><td><code>if (targetIndex != flattenedLength) goto Bailout</code>。第一パスで計算した長さと第二パスで実際に書き込んだ件数が一致しなかった場合の最後の安全弁です。</td></tr>
+<tr><td>Double 配列第二パスの境界チェック</td><td>行 249-250</td><td><code>if (Convert&lt;intptr&gt;(targetIndex) &gt;= doubleElements.length_intptr) goto Bailout</code></td></tr>
+<tr><td>通常パスの境界チェック</td><td>行 323-324</td><td><code>if (Convert&lt;intptr&gt;(targetIndex) &gt;= vector.fixedArray.length_intptr) goto Bailout</code></td></tr>
+</tbody>
+</table>
+
+<p><code>FlattenIntoArrayFast</code> 側 (行 352-435) の Bailout は <code>(Number, Number)</code> 引数を取って <code>targetIndex</code> と <code>smiSourceIndex</code> を呼び出し元に返し、<code>FlattenIntoArray</code> の label Bailout (行 508-512) で受け取ってその進捗から slow path を再開する設計になっており、走査済みの要素を再走査しないでよくする工夫です。発火点は行 363 (source が FastJSArray でない)、行 372 (Recheck 失敗)、行 376 (length 切り詰め) です。</p>
+
+<hr/>
+

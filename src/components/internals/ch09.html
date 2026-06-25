@@ -1,0 +1,485 @@
+<h2 id="ch9">第9章 Heap Spaces とメモリレイアウト</h2>
+
+<h3 id="ch9-1">9.1 Heap 全体構造と Space の分類</h3>
+
+<p>V8 のヒープは <code>src/heap/heap.h</code> をルートとして、複数の Space から構成されています。<code>Heap</code> クラスは 1 つの Isolate に対して 1 つ存在し、内部に最大 13 種類の <code>BaseSpace</code> を所有しています。</p>
+
+<pre><code class="language-cpp">// src/heap/heap.h:2150-2162
+NewSpace* new_space_ = nullptr;
+OldSpace* old_space_ = nullptr;
+CodeSpace* code_space_ = nullptr;
+SharedSpace* shared_space_ = nullptr;
+OldLargeObjectSpace* lo_space_ = nullptr;
+CodeLargeObjectSpace* code_lo_space_ = nullptr;
+NewLargeObjectSpace* new_lo_space_ = nullptr;
+SharedLargeObjectSpace* shared_lo_space_ = nullptr;
+ReadOnlySpace* read_only_space_ = nullptr;
+TrustedSpace* trusted_space_ = nullptr;
+SharedTrustedSpace* shared_trusted_space_ = nullptr;
+TrustedLargeObjectSpace* trusted_lo_space_ = nullptr;
+SharedTrustedLargeObjectSpace* shared_trusted_lo_space_ = nullptr;
+</code></pre>
+
+<p>Space の正準的な定義は <code>src/common/globals.h:1441-1467</code> の <code>enum AllocationSpace</code> に存在します。</p>
+
+<pre><code class="language-cpp">enum AllocationSpace {
+  RO_SPACE,       // Immortal, immovable and immutable objects,
+  NEW_SPACE,      // Young generation space for regular objects.
+  OLD_SPACE,      // Old generation regular object space.
+  CODE_SPACE,     // Old generation code object space, marked executable.
+  SHARED_SPACE,   // Space shared between multiple isolates. Optional.
+  TRUSTED_SPACE,  // Space for trusted objects. Outside sandbox.
+  SHARED_TRUSTED_SPACE,     // Trusted space but for shared objects.
+  NEW_LO_SPACE,             // Young generation large object space.
+  LO_SPACE,                 // Old generation large object space.
+  CODE_LO_SPACE,            // Old generation large code object space.
+  SHARED_LO_SPACE,          // Space shared between multiple isolates.
+  SHARED_TRUSTED_LO_SPACE,  // Like TRUSTED_SPACE but for shared large objects.
+  TRUSTED_LO_SPACE,         // Like TRUSTED_SPACE but for large objects.
+  ...
+};
+</code></pre>
+
+<p>各 Space の役割は以下のとおりです。NEW_SPACE は Scavenger (コピー型 GC) または MinorMS (Minor Mark-Sweep) によって短命オブジェクトを管理するための若い世代の空間です。OLD_SPACE は生存期間が長くなったオブジェクトを保持する古い世代の空間で、Mark-Compact によって管理されます。CODE_SPACE は JIT コンパイルしたマシンコード (<code>InstructionStream</code> オブジェクト) を保持する実行可能ページの空間で、書き込み可能なヒープ領域とは別の <code>CodeRange</code> 上に配置されます。</p>
+
+<p>V8 12 系以降に明確化されたのが Trusted Space と Sandbox の分離です。<code>TRUSTED_SPACE</code> はサンドボックスの外側 (攻撃者から書き換え不可能な領域) に配置され、<code>SharedFunctionInfo</code> や <code>BytecodeArray</code> 等、攻撃者に書き換えられると即座にサンドボックスエスケープに繋がるオブジェクトを保持します。<code>SHARED_SPACE</code> は Atomics 経由でやり取りされる文字列など、同一プロセス内の複数 Isolate 間で共有される領域です。</p>
+
+<p>LO_SPACE 系列は <code>kMaxRegularHeapObjectSize</code> を超えるサイズの巨大オブジェクト (典型的にはページサイズの半分以上) を保持します。これらの空間ではオブジェクトは GC 中も決して移動しません。これは巨大オブジェクトをコピーするコストが大きすぎることと、ポインタ更新を避けるためです。</p>
+
+<h3 id="ch9-2">9.2 ページとチャンク</h3>
+
+<p>V8 のヒープはページ単位で管理されます。ページサイズは次のように定義されています。</p>
+
+<pre><code class="language-cpp">// src/base/build_config.h:64-83
+// Number of bits to represent the page size for paged spaces.
+#if defined(V8_HOST_ARCH_PPC64) &amp;&amp; !defined(V8_OS_AIX)
+constexpr int kPageSizeBits = 19;
+#elif defined(ENABLE_HUGEPAGE)
+constexpr int kHugePageBits = 21;
+constexpr int kHugePageSize = 1 &lt;&lt; kHugePageBits;
+constexpr int kPageSizeBits = kHugePageBits;
+#else
+constexpr int kPageSizeBits = 18;
+#endif
+
+constexpr int kRegularPageSize = 1 &lt;&lt; kPageSizeBits;
+</code></pre>
+
+<p>通常の x64/ARM64 Linux では <code>kPageSizeBits = 18</code>、すなわち <code>kRegularPageSize = 1 &lt;&lt; 18 = 262144 = 256KB</code> です。PPC Linux では 512KB、HugePages が有効な場合は 2MB に切り替わります。</p>
+
+<pre><code class="language-cpp">// src/common/globals.h:713-720
+// Maximum object size that gets allocated into regular pages. Objects larger
+// than that size are allocated in large object space and are never moved in
+// memory.
+//
+// Current value: half of the page size.
+constexpr int kMaxRegularHeapObjectSize = (1 &lt;&lt; (kPageSizeBits - 1));
+</code></pre>
+
+<p><code>kPageSizeBits - 1</code> であることから、デフォルトでは 128KB がレギュラーオブジェクトの上限となります。これを超えると LO_SPACE に送られます。「半分」になっているのは、ページの後半に必ず 1 つのオブジェクトが空けて配置できるようにし、断片化を抑制するためです。</p>
+
+<h4>MemoryChunk と PageMetadata の分離</h4>
+
+<p>V8 11 系以降、メモリチャンクのデータレイアウトは大きく変わりました。<code>MemoryChunk</code> 構造体はページの先頭にあるメタデータであり、最小限のフラグだけを持ち、本格的なメタデータは別の <code>MutablePage</code> に分離されています。</p>
+
+<pre><code class="language-cpp">// src/heap/memory-chunk.h:42-57
+// A chunk of memory of any size.
+//
+// For the purpose of the V8 sandbox the chunk can reside in either trusted or
+// untrusted memory. Most information can actually be found on the corresponding
+// metadata object that can be retrieved via `Metadata()` and its friends.
+class V8_EXPORT_PRIVATE MemoryChunk final {
+</code></pre>
+
+<p><code>MemoryChunk</code> が持つフラグは <code>enum Flag</code> として 1 ワード (<code>uintptr_t</code>) に詰め込まれます。</p>
+
+<pre><code class="language-cpp">// src/heap/memory-chunk.h:56-98
+enum Flag : uintptr_t {
+  NO_FLAGS = 0u,
+  IN_WRITABLE_SHARED_SPACE = 1u &lt;&lt; 0,
+  POINTERS_TO_HERE_ARE_INTERESTING = 1u &lt;&lt; 1,
+  POINTERS_FROM_HERE_ARE_INTERESTING = 1u &lt;&lt; 2,
+  FROM_PAGE = 1u &lt;&lt; 3,
+  TO_PAGE = 1u &lt;&lt; 4,
+  INCREMENTAL_MARKING = 1u &lt;&lt; 5,
+  BLACK_ALLOCATED = 1u &lt;&lt; 6,
+  LARGE_PAGE = 1u &lt;&lt; 7,
+  EVACUATION_CANDIDATE = 1u &lt;&lt; 8,
+  NEW_SPACE_BELOW_AGE_MARK = 1u &lt;&lt; 9,
+</code></pre>
+
+<p><code>POINTERS_TO_HERE_ARE_INTERESTING</code> と <code>POINTERS_FROM_HERE_ARE_INTERESTING</code> の 2 フラグが特に重要で、write barrier の高速パス判定に使われます。</p>
+
+<p>なぜ <code>MemoryChunk</code> 本体は最小限なのかというと、V8 Sandbox が有効な場合、ページ先頭のメタデータはサンドボックスの内側にあり攻撃者から書き換え可能だからです。高速パスで必要な最小限のフラグだけを保持し、実際の重要なメタデータ (owner、slot_set、marking_bitmap など) は、サンドボックス外の trusted memory に置かれた <code>BasePage</code> / <code>MutablePage</code> 側に格納されています。</p>
+
+<h4>MemoryChunk から Metadata への遷移</h4>
+
+<pre><code class="language-cpp">// src/heap/memory-chunk.h:309-336
+#ifdef V8_ENABLE_SANDBOX
+  static uint32_t MetadataTableIndex(Address chunk_address);
+
+  V8_INLINE static IsolateGroup::BasePageTableEntry* MetadataTableAddress() {
+    return IsolateGroup::current()-&gt;metadata_pointer_table();
+  }
+  ...
+#else  // !V8_ENABLE_SANDBOX
+  static constexpr intptr_t MetadataOffset() {
+    return offsetof(MemoryChunk, metadata_);
+  }
+#endif
+
+#ifdef V8_ENABLE_SANDBOX
+  uint32_t metadata_index_;
+#else
+  BasePage* metadata_;
+#endif
+</code></pre>
+
+<p>Sandbox 無効なら Metadata への素直なポインタを持ちます。Sandbox 有効なら 32 ビット index を保持し、<code>IsolateGroup</code> のメタデータポインタテーブルを経由して引きます。テーブル本体は trusted memory にあるため、サンドボックス内のメモリ破壊では index は書き換わってもポインタ自体は改竄されません。</p>
+
+<h4>アライメントとアドレス計算</h4>
+
+<p>ページは <code>kPageSizeBits</code> 単位でアラインされるので、<code>MemoryChunk</code> のアドレスはオブジェクトのアドレスから単純にビットマスクで導出できます。</p>
+
+<pre><code class="language-cpp">// src/heap/memory-chunk.h:145-176
+static constexpr Address BaseAddress(Address a) {
+  return a &amp; ~kAlignmentMask;
+}
+
+V8_INLINE static MemoryChunk* FromAddress(Address addr) {
+  return reinterpret_cast&lt;MemoryChunk*&gt;(BaseAddress(addr));
+}
+
+template &lt;typename HeapObject&gt;
+V8_INLINE static MemoryChunk* FromHeapObject(Tagged&lt;HeapObject&gt; object) {
+  return FromAddress(object.ptr());
+}
+
+private:
+  static constexpr intptr_t kAlignment =
+      (static_cast&lt;uintptr_t&gt;(1) &lt;&lt; kPageSizeBits);
+  static constexpr intptr_t kAlignmentMask = kAlignment - 1;
+</code></pre>
+
+<p>任意のヒープオブジェクトから所属するチャンクを O(1) で算出できます。</p>
+
+<h4>MutablePage と Remembered Set</h4>
+
+<pre><code class="language-cpp">// src/heap/mutable-page.h:32-42
+enum RememberedSetType {
+  OLD_TO_NEW,
+  OLD_TO_NEW_BACKGROUND,
+  OLD_TO_OLD,
+  OLD_TO_SHARED,
+  TRUSTED_TO_CODE,
+  TRUSTED_TO_TRUSTED,
+  TRUSTED_TO_SHARED_TRUSTED,
+  SURVIVOR_TO_EXTERNAL_POINTER,
+  NUMBER_OF_REMEMBERED_SET_TYPES
+};
+</code></pre>
+
+<p>これらは write barrier 経由で記録されるスロットセットの種類です。<code>OLD_TO_NEW</code> は古い世代から新しい世代への参照、<code>OLD_TO_OLD</code> は evacuation candidate に向かう参照、<code>OLD_TO_SHARED</code> は共有ヒープへの参照、<code>TRUSTED_TO_CODE</code> は信頼空間からコードオブジェクトへの参照、と用途別に分かれています。</p>
+
+<h4>Marking Bitmap</h4>
+
+<pre><code class="language-cpp">// src/heap/marking.h:99-114
+static constexpr uint32_t kBitsPerCell = sizeof(CellType) * kBitsPerByte;
+static constexpr uint32_t kBitsPerCellLog2 =
+    base::bits::CountTrailingZeros(kBitsPerCell);
+...
+// The length is the number of bits in this bitmap.
+static constexpr size_t kLength = ((1 &lt;&lt; kPageSizeBits) &gt;&gt; kTaggedSizeLog2);
+
+static constexpr size_t kCellsCount =
+    (kLength + kBitsPerCell - 1) &gt;&gt; kBitsPerCellLog2;
+</code></pre>
+
+<p>ページサイズが 256KB (<code>1 &lt;&lt; 18</code>)、Tagged Size が 4 byte (<code>kTaggedSizeLog2 = 2</code>) なので、ビットマップの長さは <code>(1 &lt;&lt; 18) &gt;&gt; 2 = 65536 bit</code> となります。これは 1 bit per kTaggedSize で、ページ内の全 tagged 位置に対応します。CellType が <code>uintptr_t</code> (64 ビット) なら、Cells の数は <code>65536 / 64 = 1024</code> 個、サイズは <code>1024 * 8 = 8192 byte = 8KB</code> となります。</p>
+
+<h4>Page レイアウト全体図</h4>
+
+<pre><code class="language-text">+0          +sizeof(MemoryChunk)     area_start_                       area_end_
+|           |                        |                                 |
+v           v                        v                                 v
++-----------+------------------------+---------------------------------+
+| MemoryChunk header (with flags)    |       Allocatable area          |
+| + MutablePage metadata             |   (objects, free spaces)        |
+| + MarkingBitmap (8KB)              |                                 |
+| + slot_set_ ptrs, etc.             |                                 |
++-----------+------------------------+---------------------------------+
+\_________________ kRegularPageSize (256 KB) ____________________________/
+^
+| kPageSizeBits aligned
+</code></pre>
+
+<p><code>ObjectStartOffsetInDataPage()</code> は <code>sizeof(MemoryChunk)</code> を double alignment (8 byte) に切り上げた位置からオブジェクトが配置可能になります。コードページは特別で、<code>ObjectStartOffsetInCodePage()</code> が <code>kCodeAlignment</code> (通常 64 byte) に整列されます。これは CPU の I-cache 行アラインに合わせるためです。</p>
+
+<h3 id="ch9-3">9.3 New Space (Young Generation)</h3>
+
+<p>V8 の若い世代には 2 種類の実装があります。<code>SemiSpaceNewSpace</code> (Scavenger 用、デフォルト) と <code>PagedSpaceForNewSpace</code> (MinorMS 用) です。</p>
+
+<pre><code class="language-cpp">// src/heap/new-spaces.h:35
+enum SemiSpaceId { kFromSpace = 0, kToSpace = 1 };
+</code></pre>
+
+<p><code>SemiSpace</code> は連続したページから構成され、<code>SemiSpaceNewSpace</code> は from-space と to-space の 2 つを持ちます。</p>
+
+<pre><code class="language-cpp">// src/heap/new-spaces.h:445-451
+// The semispaces.
+SemiSpace to_space_;
+SemiSpace from_space_;
+
+// Bump pointer for allocation.
+Address allocation_top_ = kNullAddress;
+</code></pre>
+
+<p>Scavenger は Cheney's algorithm を採用しています。アロケーションは to_space に対する bump pointer で行います。GC 時に from_space と to_space を swap し、生き残ったオブジェクトを from から to にコピーします。</p>
+
+<h4>サイズの初期値と最大値</h4>
+
+<pre><code class="language-cpp">// src/heap/heap.cc:4827-4851
+size_t Heap::DefaultMinSemiSpaceSize() {
+  return RoundUp(512 * KB, NormalPage::kPageSize);
+}
+
+size_t Heap::DefaultMaxSemiSpaceSize(uint64_t physical_memory) {
+  if (v8_flags.minor_ms) {
+    static constexpr size_t kMinorMsMaxCapacity = 72 * MB;
+    return RoundUp(kMinorMsMaxCapacity, NormalPage::kPageSize);
+  }
+
+  static constexpr size_t kScavengerDefaultMaxCapacity = 32 * MB;
+  size_t max_semi_space_size = kScavengerDefaultMaxCapacity;
+
+#if defined(ANDROID)
+  if (!IsHighEndAndroid(physical_memory)) {
+    static constexpr size_t kAndroidNonHighEndMaxCapacity = 8 * MB;
+    max_semi_space_size = kAndroidNonHighEndMaxCapacity;
+  }
+#endif
+
+  return RoundUp(max_semi_space_size, NormalPage::kPageSize);
+}
+</code></pre>
+
+<p>Scavenger なら最小 512KB、最大 32MB が 1 つの semi space のサイズです。両方合わせると new space は最大 64MB です。MinorMS なら最大 72MB です。低スペック Android では 8MB に制限されます。</p>
+
+<h4>Allocation Folding と Inline Allocation</h4>
+
+<p>JIT コンパイルされたコードは、新しい世代へのアロケーションをインラインアロケーションで行います。Turbofan の場合、<code>allocation_top_</code> を直接インクリメントする assembly 命令列がインライン化され、<code>allocation_limit_</code> を超えなければ slow path に落ちません。これにより、シンプルなオブジェクト生成は数命令で完了します。</p>
+
+<p>Allocation Folding はさらに進んだ最適化で、コンパイラが複数のアロケーションを 1 つにまとめる最適化です。たとえば <code>new Array(3)</code> で配列とそのバッキングストアを別々にアロケートする代わりに、両者の合計サイズで 1 度だけ bump pointer を進め、その中に両方のオブジェクトを配置します。</p>
+
+<h3 id="ch9-4">9.4 Old Space と FreeList</h3>
+
+<p>Old Space は Mark-Compact GC で管理される長命オブジェクトの空間です。Scavenger によって young 世代で 2 回生き残ったオブジェクトが promote されます。</p>
+
+<h4>FreeList の構造</h4>
+
+<p>Old Space では bump pointer allocation の代わりに free list を使います。</p>
+
+<pre><code class="language-cpp">// src/heap/free-list.h:319-330
+// Categories boundaries generated with:
+// perl -E '
+//      @cat = (24, map {$_*16} 2..16, 48, 64);
+//      while ($cat[-1] &lt;= 32768) {
+//        push @cat, $cat[-1]*2
+//      }
+//      say join ", ", @cat;
+//      say "\n", scalar @cat'
+static constexpr int kNumberOfCategories = 24;
+static constexpr unsigned int categories_min[kNumberOfCategories] = {
+    24,  32,  48,  64,  80,  96,   112,  128,  144,  160,   176,   192,
+    208, 224, 240, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
+</code></pre>
+
+<p>24 個のサイズカテゴリがあり、<code>24, 32, 48, ..., 256</code> が precise category (16 バイト刻み)、それを超えると 256, 512, 1024, ... と 2 倍刻みになります。各カテゴリは独立した連結リストで、サイズリクエストに対して best fit に近い形でリストを引きます。</p>
+
+<pre><code class="language-cpp">// src/heap/free-list.h:332-346
+FreeListCategoryType SelectFreeListCategoryType(
+    size_t size_in_bytes) override {
+  if (size_in_bytes &lt;= kPreciseCategoryMaxSize) {
+    if (size_in_bytes &lt; categories_min[1]) return 0;
+    return static_cast&lt;FreeListCategoryType&gt;(size_in_bytes &gt;&gt; 4) - 1;
+  }
+  for (int cat = (kPreciseCategoryMaxSize &gt;&gt; 4) - 1; cat &lt; last_category_;
+       cat++) {
+    if (size_in_bytes &lt; categories_min[cat + 1]) {
+      return cat;
+    }
+  }
+  return last_category_;
+}
+</code></pre>
+
+<p>precise 領域では <code>size_in_bytes &gt;&gt; 4</code> でカテゴリインデックスが即座に計算でき、O(1) です。</p>
+
+<h4>Compaction</h4>
+
+<p>Old Space では fragmenting を解消するために compaction を行います。<code>EVACUATION_CANDIDATE</code> フラグが立ったページのオブジェクトが、別ページに退避 (evacuate) されます。退避前後でオブジェクトのアドレスが変わるため、ポインタ更新が必要です。これは write barrier で記録された <code>OLD_TO_OLD</code> slot set を使って行われます。</p>
+
+<h3 id="ch9-5">9.5 Large Object Space</h3>
+
+<p><code>kMaxRegularHeapObjectSize</code> (通常 128KB) を超えるオブジェクトは Large Object Space に配置されます。LO Space の特徴は、1 つの大きなオブジェクトに対して、ちょうどそのサイズを収める 1 つの <code>LargePage</code> が割り当てられます。GC で決して移動しません。</p>
+
+<p>LO Space には 3 種類あります。<code>NewLargeObjectSpace</code> (若い世代の大型)、<code>OldLargeObjectSpace</code> (古い世代の大型)、<code>CodeLargeObjectSpace</code> (コードの大型) です。Sandbox 有効時はさらに <code>TrustedLargeObjectSpace</code> 等が追加されます。</p>
+
+<h3 id="ch9-6">9.6 Code Space と CodeRange</h3>
+
+<p>Code Space は実行可能なマシンコード (<code>InstructionStream</code>) を保持します。これは特殊な空間で、書き込み権限と実行権限の切り替え (W^X) が必要です。</p>
+
+<pre><code class="language-cpp">// src/heap/code-range.h:82-112
+// A code range is a virtual memory cage that may contain executable code.
+//
+// +---------+---------+-----------------  ~~~  -+
+// |   RW    |   ...   |     ...                 |
+// +---------+---------+------------------ ~~~  -+
+// ^                   ^
+// base                allocatable base
+//
+// &lt;------------------&gt;&lt;-------------------------&gt;
+//   non-allocatable       allocatable region
+//   region
+</code></pre>
+
+<p>CodeRange は near call ジャンプ範囲内にコードを配置するために必要です。</p>
+
+<pre><code class="language-cpp">// src/common/globals.h:514-518
+#elif V8_TARGET_ARCH_X64
+constexpr size_t kMaximalCodeRangeSize =
+    (COMPRESS_POINTERS_BOOL &amp;&amp; !V8_EXTERNAL_CODE_SPACE_BOOL) ? 128 * MB
+                                                             : 512 * MB;
+</code></pre>
+
+<p>x64 では最大 512MB の CodeRange を取れます。x64 の <code>near call</code> 命令は RIP 相対 32 ビット signed offset、つまり ±2GB の範囲を呼べますが、組み込みビルトイン (embedded blob) と Code Space の両方が ±2GB に収まるように CodeRange を配置する必要があります。これにより、Builtin 呼び出しを「短い near call」で実装できます。</p>
+
+<h3 id="ch9-7">9.7 ReadOnly Space と Snapshot</h3>
+
+<p>ReadOnly Space は不変オブジェクト (読み取り専用ロート、空文字列、シングルトン Map 等) を保持します。</p>
+
+<pre><code class="language-cpp">// src/heap/read-only-heap.h:36-42
+class ReadOnlyHeap final {
+ public:
+  static constexpr size_t kEntriesCount =
+      static_cast&lt;size_t&gt;(RootIndex::kReadOnlyRootsCount);
+
+  explicit ReadOnlyHeap(ReadOnlySpace* ro_space);
+  ~ReadOnlyHeap();
+</code></pre>
+
+<p>ReadOnly Heap はほぼ確実に同一プロセス内の全 Isolate 間で共有されます。これは読み取り専用なので競合しないこと、メモリ削減効果が大きいことが理由です。</p>
+
+<p>V8 起動時、<code>SnapshotData</code> から <code>ReadOnlySpace</code> をデシリアライズして組み立てます。Snapshot は Isolate を素早く立ち上げるために、各種ロートオブジェクトを事前にシリアライズしておく仕組みです。</p>
+
+<h3 id="ch9-8">9.8 Shared Heap</h3>
+
+<p>Shared Heap は複数の Isolate 間で共有される領域です。Worker 間の <code>SharedArrayBuffer</code> で渡される文字列など、Isolate 間で同時参照される可能性のあるオブジェクトを保持します。</p>
+
+<p>Shared Heap 管理の重要なポイントは「per-isolate heap vs shared heap」の参照管理です。per-isolate のオブジェクトが shared heap のオブジェクトを参照する場合、<code>OLD_TO_SHARED</code> という専用 remembered set に記録されます。</p>
+
+<pre><code class="language-cpp">// src/heap/mutable-page.cc:77-79
+} else if (IsAnyWritableSharedSpace(space)) {
+  // We need to track pointers into the SHARED_SPACE for OLD_TO_SHARED.
+  flags_to_set |= MemoryChunk::POINTERS_TO_HERE_ARE_INTERESTING;
+}
+</code></pre>
+
+<p>これにより per-isolate ヒープから shared ヒープへの参照は全て slot set に記録され、独立した GC が共存できます。</p>
+
+<h3 id="ch9-9">9.9 Write Barrier</h3>
+
+<p>Write Barrier はヒープ書き込み時に GC に変更を通知する仕組みです。</p>
+
+<pre><code class="language-text">V8 uses a write barrier to inform the GC about changes to the heap by the mutator.
+A write barrier is emitted for heap stores like `host.field = value`.
+The write barrier is required for multiple purposes:
+* Records old-to-new references for the generational GC to work.
+* During marking it prevents black-to-white references during incremental/concurrent marking.
+* During marking it records old-to-old references (pointers to objects on evacuation candidates)
+
+The generational barrier is always enabled, while the other barriers are only enabled while incremental/concurrent marking is running.
+</code></pre>
+
+<h4>高速パスの実装</h4>
+
+<pre><code class="language-cpp">// src/heap/heap-write-barrier-inl.h:51-80
+void WriteBarrier::CombinedWriteBarrierInternal(Tagged&lt;HeapObject&gt; host,
+                                                HeapObjectSlot slot,
+                                                Tagged&lt;HeapObject&gt; value,
+                                                WriteBarrierMode mode) {
+  ...
+  MemoryChunk* host_chunk = MemoryChunk::FromHeapObject(host);
+  // Fast path: Marking is off and the host objects is either in the young
+  // generation or shared space, for which we don't require remembered sets.
+  if (V8_LIKELY(!host_chunk-&gt;PointersFromHereAreInteresting())) {
+    return;
+  }
+
+  MemoryChunk* value_chunk = MemoryChunk::FromHeapObject(value);
+  // Old to old writes can bail out when marking is off.
+  if (!value_chunk-&gt;PointersToHereAreInteresting()) {
+    return;
+  }
+
+  CombinedWriteBarrierInternalSlow(host, host_chunk, slot, value, value_chunk);
+}
+</code></pre>
+
+<p>これが write barrier の fast path です。重要なのは 2 つのフラグチェックです。第一に、host オブジェクトのページが「ここから出ていく参照を記録する必要があるか」を示すフラグ。これが立っていなければ即 return。第二に、value オブジェクトのページが「ここへの参照を気にするか」(つまり若い世代か、共有領域か、マーキング中か) を示すフラグ。立っていなければ即 return。両方のフラグが立っている場合のみ slow path に落ちます。</p>
+
+<h4>Initializing Store 最適化</h4>
+
+<pre><code class="language-text">A write barrier can also be omitted when storing into the *most recent young allocation*.
+This is often called an *initializing store*.
+The host object must have been allocated in young generation and no potential GC point
+(e.g. an allocation, a stack guard check) may have occurred between the allocation and the store.
+</code></pre>
+
+<p>直近の若い世代アロケーションに対する書き込みでは write barrier を省略できます。これは大きな最適化で、Object Literal の初期化のように「allocate→fill」する一般的パターンの barrier が全部消えます。</p>
+
+<h3 id="ch9-10">9.10 Allocation Site と Pretenuring</h3>
+
+<p><code>AllocationSite</code> は「あるアロケーション地点で生成されたオブジェクトの行く末」を追跡するフィードバックオブジェクトです。</p>
+
+<pre><code class="language-cpp">// src/objects/allocation-site.h:23-34
+V8_OBJECT class AllocationSite : public HeapObject {
+ public:
+  static const uint32_t kMaximumArrayBytesToPretransition = 8 * 1024;
+
+  enum PretenureDecision {
+    kUndecided = 0,
+    kDontTenure = 1,
+    kMaybeTenure = 2,
+    kTenure = 3,
+    kLastPretenureDecisionValue = kTenure
+  };
+</code></pre>
+
+<p>Pretenure Decision は 4 状態を取ります。<code>kUndecided</code> (未判定)、<code>kDontTenure</code> (若い世代に確保)、<code>kMaybeTenure</code> (保留)、<code>kTenure</code> (最初から古い世代に確保) です。</p>
+
+<h4>Pretenuring の動作</h4>
+
+<pre><code class="language-cpp">// src/heap/pretenuring-handler.cc:30-42
+double GetPretenuringRatioThreshold(size_t new_space_capacity) {
+  static constexpr double kScavengerPretenureRatio = 0.80;
+  ...
+}
+</code></pre>
+
+<p>Scavenger では 80% の生存率が pretenure の閾値です。ある allocation site で作られたオブジェクトの 80% 以上が若い GC を生き残ったら、短命じゃないと判定して以降は最初から古い世代に確保します。</p>
+
+<h4>AllocationMemento</h4>
+
+<p><code>AllocationSite</code> のフィードバック収集は <code>AllocationMemento</code> を使います。<code>AllocationMemento</code> はオブジェクトの直後に配置される小さなオブジェクトで、生成元の <code>AllocationSite</code> を指します。Scavenge 時に、若いオブジェクトが移動するとmemento が見つかり、生き残ったオブジェクト数 (<code>memento_found_count</code>) が更新されます。生成時に作られた memento の総数 (<code>memento_create_count</code>) と比較することで、生存率が算出されます。</p>
+
+<p>ビットフィールドは次のように定義されています。</p>
+
+<pre><code class="language-cpp">// src/objects/allocation-site.h:79-83
+using MementoFoundCountBits = base::BitField&lt;int, 0, 26&gt;;
+using PretenureDecisionBits = base::BitField&lt;PretenureDecision, 26, 3&gt;;
+using DeoptDependentCodeBit = base::BitField&lt;bool, 29, 1&gt;;
+</code></pre>
+
+<p><code>pretenure_data_</code> フィールドの 32 ビット中、下位 26 ビットに <code>memento_found_count</code>、bit 26-28 (3 ビット) に <code>PretenureDecision</code>、bit 29 に <code>deopt_dependent_code</code> を詰めています。これにより 1 つの 32 ビット atomic 変数で全フィードバックが管理されます。</p>
+

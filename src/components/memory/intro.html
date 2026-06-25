@@ -1,0 +1,198 @@
+<section id="intro">
+<blockquote>
+<p>対象 V8 (<code>/home/user/v8</code>) 現行 main ブランチを実地に読み解いて作成</p>
+<p>用途 登壇資料の参考文献</p>
+</blockquote>
+
+<p>本書は V8 JavaScript エンジンのメモリ管理機構について、ソースコードを直接読み解いた上で網羅的に解説した技術ドキュメントです。Tagged Pointer のビットレイアウトから GC アルゴリズム、JIT のコード配置、Sandbox によるメモリ保護まで、低レイヤから高レイヤまで一貫した視点で記述しています。各章は独立して読むことが可能で、すべての主張に対して該当ソースファイルと行番号を併記しています。</p>
+
+<h2>全体構成</h2>
+
+<p>第 I 部「オブジェクト表現とタグ付きポインタ」 Tagged Pointer、SMI エンコーディング、HeapObject レイアウト、Pointer Compression、Map (Hidden Class)、プロパティストレージモード</p>
+<p>第 II 部「ヒープ構造とメモリ空間」 Heap 全体、Page と MemoryChunk、Young/Old/RO/LO Generation、Allocation メカニズム、CodeRange と仮想メモリケージ、V8 Sandbox の概観</p>
+<p>第 III 部「ガベージコレクション」 Scavenger (Cheney)、Mark-Compact、Minor MS、Sticky Mark Bits、Write Barrier、Remembered Set、Conservative Stack Scanning、CppGC との統合、アダプティブヒューリスティクス</p>
+<p>第 IV 部「最適化機構」 Inline Cache、Hidden Class Transition、Sparkplug/Maglev/TurboFan、Deoptimization、V8 Sandbox 詳細、External/Trusted/Code Pointer Table、Embedded Builtins、Handle API</p>
+<p>第 V 部「オブジェクトのメモリ表現」 String の階層 (Seq/Cons/Sliced/Thin/External/Internalized)、JSArray と ElementsKind、FixedArray/FixedDoubleArray、JSArrayBuffer/TypedArray、HeapNumber、BigInt、JSObject レイアウト</p>
+
+<h2>全体俯瞰図</h2>
+
+<pre><code class="language-text">┌─────────────────────────────────────────────────────────────────┐
+│                         V8 Isolate                              │
+│                                                                 │
+│  ┌────────────────────────────┐  ┌───────────────────────────┐  │
+│  │           Heap             │  │     Read-only Heap        │  │
+│  │ ┌────────────────────────┐ │  │  (複数 Isolate で共有)    │  │
+│  │ │ NewSpace (Scavenger)   │ │  │  Map、定数、builtin Code  │  │
+│  │ │ OldSpace (Mark-Compact)│ │  └───────────────────────────┘  │
+│  │ │ CodeSpace (executable) │ │                                 │
+│  │ │ TrustedSpace (Sandbox 外)│                                 │
+│  │ │ LargeObjectSpace       │ │                                 │
+│  │ └────────────────────────┘ │                                 │
+│  └────────────────────────────┘                                 │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │              Sandbox (通常 1 TB の予約領域)              │    │
+│  │ ┌───────────┐ ┌─────────────────────────────────────┐   │    │
+│  │ │ Guard 32GB│ │ PtrCompr cage 4GB                   │   │    │
+│  │ │ (PROT_NONE)│ │  (NewSpace, OldSpace, CodeSpace,   │   │    │
+│  │ └───────────┘ │   RO 等が全部この中)                │   │    │
+│  │               │  ArrayBuffer の backing store       │   │    │
+│  │               └─────────────────────────────────────┘   │    │
+│  │ ┌───────────┐                                           │    │
+│  │ │ Guard 32GB│ Sandbox 末尾                              │    │
+│  │ └───────────┘                                           │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │           Sandbox の外側 (信頼できる領域)                │    │
+│  │  TrustedRange (Code, BytecodeArray, DeoptimizationData) │    │
+│  │  External Pointer Table (512MB)                         │    │
+│  │  Trusted Pointer Table  (64MB)                          │    │
+│  │  Code Pointer Table     (128MB、write-protected)        │    │
+│  │  JSDispatchTable        (leaptiering、write-protected)  │    │
+│  │  Embedded Builtins (ELF/PE の .text セクション)         │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre>
+
+<h2>重要数値早見表</h2>
+
+<h3>Tagged Pointer / SMI</h3>
+<table>
+<thead><tr><th>項目</th><th>値</th><th>出典</th></tr></thead>
+<tbody>
+<tr><td><code>kHeapObjectTag</code></td><td>1 (0b01)</td><td><code class="file-ref">include/v8-internal.h:57</code></td></tr>
+<tr><td><code>kWeakHeapObjectTag</code></td><td>3 (0b11)</td><td><code class="file-ref">include/v8-internal.h:58</code></td></tr>
+<tr><td><code>kSmiTag</code></td><td>0 (0b0)</td><td><code class="file-ref">include/v8-internal.h:65</code></td></tr>
+<tr><td><code>kForwardingTag</code></td><td>0b00 (2 bit)</td><td><code class="file-ref">include/v8-internal.h:62</code></td></tr>
+<tr><td>32-bit / PtrCompr Smi 範囲</td><td>-2^30 〜 2^30-1</td><td><code>SmiTagging&lt;4&gt;</code></td></tr>
+<tr><td>64-bit 非圧縮 Smi 範囲</td><td>-2^31 〜 2^31-1</td><td><code>SmiTagging&lt;8&gt;</code></td></tr>
+<tr><td><code>kTaggedSize</code> (PtrCompr 有効)</td><td>4</td><td><code class="file-ref">src/common/globals.h:567</code></td></tr>
+<tr><td><code>kSystemPointerSize</code> (64bit)</td><td>8</td><td><code class="file-ref">src/common/globals.h</code></td></tr>
+</tbody>
+</table>
+
+<h3>Heap / Page / Space</h3>
+<table>
+<thead><tr><th>項目</th><th>値</th><th>出典</th></tr></thead>
+<tbody>
+<tr><td><code>kPageSizeBits</code> (x64/arm64)</td><td>18</td><td><code class="file-ref">src/base/build_config.h:80</code></td></tr>
+<tr><td><code>kRegularPageSize</code></td><td>256 KB</td><td><code class="file-ref">src/base/build_config.h:83</code></td></tr>
+<tr><td><code>kMaxRegularHeapObjectSize</code></td><td>128 KB</td><td><code class="file-ref">src/common/globals.h:720</code></td></tr>
+<tr><td><code>kPtrComprCageReservationSize</code></td><td>4 GB</td><td><code class="file-ref">include/v8-internal.h:167</code></td></tr>
+<tr><td><code>kDefaultMinHeapSize</code></td><td>256 MB</td><td><code class="file-ref">src/heap/heap.h:313</code></td></tr>
+<tr><td><code>kDefaultMaxHeapSize</code> (64bit)</td><td>4 GB</td><td><code class="file-ref">src/heap/heap.h:315</code></td></tr>
+<tr><td><code>DefaultMinSemiSpaceSize</code></td><td>512 KB</td><td><code class="file-ref">src/heap/heap.cc:4828</code></td></tr>
+<tr><td>Scavenger Max semi-space</td><td>32 MB</td><td><code class="file-ref">src/heap/heap.cc:4840</code></td></tr>
+<tr><td>MinorMS Max semi-space</td><td>72 MB</td><td><code class="file-ref">src/heap/heap.cc:4835</code></td></tr>
+<tr><td>FreeList カテゴリ数</td><td>24</td><td><code class="file-ref">src/heap/free-list.h:327</code></td></tr>
+<tr><td>FreeList 最小ブロック</td><td>3 * kTaggedSize</td><td><code class="file-ref">src/heap/free-list.h:310</code></td></tr>
+<tr><td>LargePage 最大 (Code)</td><td>512 MB</td><td><code class="file-ref">src/heap/large-page.h:18</code></td></tr>
+<tr><td><code>kMaximalCodeRangeSize</code> (x64)</td><td>128 / 512 MB</td><td><code class="file-ref">src/common/globals.h:515</code></td></tr>
+<tr><td><code>kMaximalTrustedRangeSize</code></td><td>1 GB</td><td><code class="file-ref">src/common/globals.h:531</code></td></tr>
+</tbody>
+</table>
+
+<h3>Sandbox / Pointer Tables</h3>
+<table>
+<thead><tr><th>項目</th><th>値</th><th>出典</th></tr></thead>
+<tbody>
+<tr><td><code>kSandboxSize</code> (通常 64bit)</td><td>1 TB</td><td><code class="file-ref">include/v8-internal.h:226</code></td></tr>
+<tr><td><code>kSandboxSize</code> (Android/RISC-V)</td><td>128 GB</td><td><code class="file-ref">include/v8-internal.h:219</code></td></tr>
+<tr><td><code>kSandboxSize</code> (iOS)</td><td>16 GB</td><td><code class="file-ref">include/v8-internal.h:221</code></td></tr>
+<tr><td><code>kSandboxGuardRegionSize</code></td><td>32 GB + 32 GB</td><td><code class="file-ref">include/v8-internal.h:296</code></td></tr>
+<tr><td><code>kAdditionalTrailingGuardRegionSize</code></td><td>288 GB - 32 GB</td><td><code class="file-ref">include/v8-internal.h:312</code></td></tr>
+<tr><td><code>kSmiAddressRange</code></td><td>4 GB</td><td><code class="file-ref">src/sandbox/sandbox.h:77</code></td></tr>
+<tr><td><code>kSandboxMinimumReservationSize</code></td><td>8 GB</td><td><code class="file-ref">include/v8-internal.h:271</code></td></tr>
+<tr><td><code>kExternalPointerTableReservationSize</code></td><td>512 MB</td><td><code class="file-ref">include/v8-internal.h:329</code></td></tr>
+<tr><td><code>kTrustedPointerTableReservationSize</code></td><td>64 MB</td><td><code class="file-ref">include/v8-internal.h:900</code></td></tr>
+<tr><td><code>kCodePointerTableReservationSize</code></td><td>128 MB</td><td><code class="file-ref">include/v8-internal.h:942</code></td></tr>
+<tr><td><code>kMaxSafeBufferSizeForSandbox</code></td><td>32 GB - 1</td><td><code class="file-ref">include/v8-internal.h:281</code></td></tr>
+<tr><td><code>kCodePointerHandleMarker</code></td><td>0x1</td><td><code class="file-ref">include/v8-internal.h:958</code></td></tr>
+</tbody>
+</table>
+
+<h3>Map / Object</h3>
+<table>
+<thead><tr><th>項目</th><th>値</th><th>出典</th></tr></thead>
+<tbody>
+<tr><td><code>Map::kSize</code> (PtrCompr 有効)</td><td>約 40 バイト</td><td><code class="file-ref">src/objects/map.h:1255</code></td></tr>
+<tr><td><code>Map::kSize</code> (PtrCompr 無効)</td><td>約 80 バイト</td><td>同上</td></tr>
+<tr><td><code>kMaxNumberOfDescriptors</code></td><td>1020</td><td><code class="file-ref">src/objects/property-details.h:249</code></td></tr>
+<tr><td><code>kMaxNumberOfTransitions</code></td><td>1536</td><td><code class="file-ref">src/objects/transitions.h:150</code></td></tr>
+<tr><td><code>kMaxElementsForLinearSearch</code></td><td>32</td><td><code class="file-ref">src/objects/transitions.h:319</code></td></tr>
+<tr><td><code>JSObject::kMaxInObjectProperties</code></td><td>252</td><td><code class="file-ref">src/objects/js-objects.h:1035</code></td></tr>
+<tr><td><code>JSObject::kMaxInstanceSize</code></td><td>255 * kTaggedSize</td><td><code class="file-ref">src/objects/js-objects.h:966</code></td></tr>
+<tr><td><code>kSwissNameDictionaryInitialCapacity</code></td><td>4</td><td><code class="file-ref">src/common/globals.h:3015</code></td></tr>
+<tr><td><code>AllocationSite::kMaximumArrayBytesToPretransition</code></td><td>8 KB</td><td><code class="file-ref">src/objects/allocation-site.h:25</code></td></tr>
+</tbody>
+</table>
+
+<h3>String</h3>
+<table>
+<thead><tr><th>項目</th><th>値</th><th>出典</th></tr></thead>
+<tbody>
+<tr><td><code>String::kMaxLength</code> (64bit)</td><td>(1&lt;&lt;29) - 24 ≈ 536M</td><td><code class="file-ref">include/v8-primitive.h:129</code></td></tr>
+<tr><td><code>String::kMaxLength</code> (32bit)</td><td>(1&lt;&lt;28) - 16 ≈ 268M</td><td>同上</td></tr>
+<tr><td><code>ConsString::kMinLength</code></td><td>13</td><td><code class="file-ref">src/objects/string.h:1076</code></td></tr>
+<tr><td><code>SlicedString::kMinLength</code></td><td>13</td><td><code class="file-ref">src/objects/string.h:1181</code></td></tr>
+<tr><td><code>String::kMaxHashCalcLength</code></td><td>16383</td><td><code class="file-ref">src/objects/string.h:541</code></td></tr>
+<tr><td><code>String::kMaxOneByteCharCode</code></td><td>0xFF</td><td><code class="file-ref">src/objects/string.h:525</code></td></tr>
+<tr><td><code>String::kMaxCodePoint</code></td><td>0x10FFFF</td><td><code class="file-ref">src/objects/string.h:529</code></td></tr>
+<tr><td><code>kZeroHash</code></td><td>27</td><td><code class="file-ref">src/strings/string-hasher.h</code></td></tr>
+<tr><td><code>kHoleNanInt64</code></td><td>0xFFF7FFFF'FFF7FFFF</td><td><code class="file-ref">src/common/globals.h:2136</code></td></tr>
+</tbody>
+</table>
+
+<h3>Array / TypedArray / ArrayBuffer</h3>
+<table>
+<thead><tr><th>項目</th><th>値</th><th>出典</th></tr></thead>
+<tbody>
+<tr><td><code>JSArray::kPreallocatedArrayElements</code></td><td>4</td><td><code class="file-ref">src/objects/js-array.h:129</code></td></tr>
+<tr><td><code>kMaxArrayLength</code></td><td>2^32-1</td><td><code class="file-ref">src/objects/js-array.h:142</code></td></tr>
+<tr><td><code>kMaxFastArrayLength</code> (通常)</td><td>32 MiB</td><td><code class="file-ref">src/objects/js-array.h:148</code></td></tr>
+<tr><td><code>kElementsKindBits</code></td><td>6</td><td><code class="file-ref">src/objects/elements-kind.h:193</code></td></tr>
+<tr><td><code>kMaxFixedArrayCapacity</code> (通常)</td><td>128 M</td><td><code class="file-ref">src/objects/fixed-array.h:33</code></td></tr>
+<tr><td><code>JSTypedArray::kMaxSizeInHeap</code></td><td>64 バイト</td><td><code class="file-ref">src/objects/js-array-buffer.h:560</code></td></tr>
+<tr><td><code>JSArrayBuffer::kMaxByteLength</code> (sandbox)</td><td>32 GB - 1</td><td><code class="file-ref">src/objects/js-array-buffer.h:32</code></td></tr>
+<tr><td><code>JSArrayBuffer::kMaxByteLength</code> (64bit 非 sandbox)</td><td>2^53 - 1</td><td>同上</td></tr>
+</tbody>
+</table>
+
+<h3>IC / Compiler / Deoptimizer</h3>
+<table>
+<thead><tr><th>項目</th><th>値</th><th>出典</th></tr></thead>
+<tbody>
+<tr><td><code>DEFAULT_MAX_POLYMORPHIC_MAP_COUNT</code></td><td>4</td><td><code class="file-ref">src/flags/flag-definitions.h:3238</code></td></tr>
+<tr><td><code>--invocation-count-for-feedback-allocation</code></td><td>8</td><td><code class="file-ref">src/flags/flag-definitions.h:1137</code></td></tr>
+<tr><td><code>--invocation-count-for-maglev</code></td><td>400 (Android 1000)</td><td><code class="file-ref">src/flags/flag-definitions.h:1140</code></td></tr>
+<tr><td><code>--invocation-count-for-maglev-osr</code></td><td>100</td><td><code class="file-ref">src/flags/flag-definitions.h</code></td></tr>
+<tr><td><code>--invocation-count-for-turbofan</code></td><td>3000</td><td><code class="file-ref">src/flags/flag-definitions.h:1148</code></td></tr>
+<tr><td><code>--invocation-count-for-osr</code></td><td>500</td><td><code class="file-ref">src/flags/flag-definitions.h</code></td></tr>
+<tr><td><code>Deoptimizer::kMaxNumberOfEntries</code></td><td>16384</td><td><code class="file-ref">src/deoptimizer/deoptimizer.h:167</code></td></tr>
+<tr><td><code>BytecodeArray::kMaxSize</code></td><td>512 MB</td><td><code class="file-ref">src/objects/bytecode-array.h:137</code></td></tr>
+<tr><td><code>Interpreter::kDispatchTableSize</code></td><td>3 * 256 = 768</td><td><code class="file-ref">src/interpreter/interpreter.h:113</code></td></tr>
+<tr><td><code>kReservedCodeRangePages</code> (Windows)</td><td>1</td><td><code class="file-ref">src/common/globals.h:524</code></td></tr>
+</tbody>
+</table>
+
+<h3>GC</h3>
+<table>
+<thead><tr><th>項目</th><th>値</th><th>出典</th></tr></thead>
+<tbody>
+<tr><td><code>kTargetMutatorUtilization</code></td><td>0.97</td><td><code class="file-ref">src/heap/heap-controller.h:20</code></td></tr>
+<tr><td><code>kMinGrowingFactor</code></td><td>1.1</td><td><code class="file-ref">src/heap/heap-controller.h:20</code></td></tr>
+<tr><td><code>kMaxGrowingFactor</code></td><td>4.0</td><td><code class="file-ref">src/heap/heap-controller.h:21</code></td></tr>
+<tr><td><code>kConservativeGrowingFactor</code></td><td>1.3</td><td><code class="file-ref">src/heap/heap-controller.h:22</code></td></tr>
+<tr><td><code>kInterruptThreshold</code> (Scavenger)</td><td>128</td><td><code class="file-ref">src/heap/scavenger.cc:339</code></td></tr>
+<tr><td><code>kBytesUntilInterruptCheck</code> (ConcMark)</td><td>64 KB</td><td><code class="file-ref">src/heap/concurrent-marking.cc:365</code></td></tr>
+<tr><td><code>kObjectsUntilInterruptCheck</code> (ConcMark)</td><td>1000</td><td><code class="file-ref">src/heap/concurrent-marking.cc:366</code></td></tr>
+<tr><td>MarkingBitmap セル数/ページ</td><td>1024 cells (8 KB)</td><td><code class="file-ref">src/heap/marking.h:108</code></td></tr>
+<tr><td>Slot Set 1 bucket</td><td>1024 bit</td><td><code class="file-ref">src/heap/base/basic-slot-set.h:283</code></td></tr>
+<tr><td><code>kMaxScavengerTasks</code></td><td>8</td><td><code class="file-ref">src/heap/scavenger.cc:1577</code></td></tr>
+<tr><td><code>kTargetFragmentationPercent</code> (MC)</td><td>70</td><td><code class="file-ref">src/heap/mark-compact.cc:623</code></td></tr>
+<tr><td><code>kMarginForSmallHeaps</code></td><td>32 MB</td><td><code class="file-ref">src/heap/heap-controller.h:162</code></td></tr>
+</tbody>
+</table>
+</section>
+

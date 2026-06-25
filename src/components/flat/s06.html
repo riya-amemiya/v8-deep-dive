@@ -1,0 +1,28 @@
+<h2 id="section-6">6. CalculateFlattenedLengthFast の詳細</h2>
+
+<h3 id="section-6-1">6.1 PACKED 数値配列での早期短絡</h3>
+
+<p>行 66-69 はソース全体が <code>PACKED_SMI_ELEMENTS</code> または <code>PACKED_DOUBLE_ELEMENTS</code> の場合、要素を一切走査せずに <code>sourceLength</code> をそのまま返します。</p>
+
+<pre><code class="language-torque">if (sourceKind == ElementsKind::PACKED_SMI_ELEMENTS ||
+    sourceKind == ElementsKind::PACKED_DOUBLE_ELEMENTS) {
+  return FlattenedLengthResult{length: sourceLength, targetKind: sourceKind};
+}
+</code></pre>
+
+<p>これが安全な理由は二点です。第一に、Packed 派生の <code>FixedDoubleArray</code> および <code>FixedArray&lt;Smi&gt;</code> には JSArray も JSProxy も格納できません。Smi は immediate な数値、float64 はビット列で、サブ配列が PACKED_SMI ならその全要素は Smi であり、PACKED_DOUBLE ならその全要素は <code>float64_or_undefined_or_hole</code> のいずれかです。したがって <code>depth &gt; 0</code> でも再帰する必要がなく、長さをそのまま結果に積めばよいことになります。第二に、Packed の場合 <code>array.length</code> と実要素数は厳密に一致します。</p>
+
+<p>サブ配列短絡の経路 (行 108-125) も同じパターンで、要素 element が PACKED_SMI または PACKED_DOUBLE の JSArray なら <code>seenSmi = true</code> / <code>seenDouble = true</code> を立てて <code>subLen = elementArray.length</code> を加算するだけで済ませます。</p>
+
+<p>HOLEY 派生をこの短絡から外している (行 62-65 のコメントが述べる) 理由は二つあります。第一に、Holey 派生では穴 (<code>TheHole</code> / <code>kDoubleHole</code>) が物理的に格納されており、その分 <code>length</code> は穴も数えてしまいます。仕様 <code>FlattenIntoArray</code> は <code>HasProperty</code> が false ならインデックスを丸ごとスキップするため、Holey 配列で <code>subLen = array.length</code> を採用すると flat 結果の長さを過大に算出してしまい、2 パス目で確保した <code>FixedArray/FixedDoubleArray</code> の末尾に穴が残った状態で <code>NewJSArray</code> を返すか、<code>targetIndex != flattenedLength</code> の不変条件 (行 274、行 348) で <code>goto Bailout</code> してしまうことになります。第二に、<code>V8_ENABLE_UNDEFINED_DOUBLE</code> 機能が有効な場合、HOLEY_DOUBLE_ELEMENTS では <code>FixedDoubleArray</code> に <code>undefined</code> ビットパターンが直接格納できるようになりました。これが Packed Double と誤分類されると、2 パス目の <code>UnsafeCast&lt;Number&gt;(element)</code> (行 252) で <code>element</code> が <code>Undefined</code> のときにキャストが失敗します。<code class="file-ref">test/mjsunit/regress/regress-crbug-488366773.js</code> がこの crash 修正の regression test で、<code>Object.defineProperty(a, '1', { get: function() {} })</code> 後に <code>a.slice()</code> で Holey Double を作り、<code>.flat()</code> で <code>undefined</code> を含んだ結果が返ることを確かめています。</p>
+
+<h3 id="section-6-2">6.2 target ElementsKind の判定</h3>
+
+<p><code>seenSmi</code>、<code>seenDouble</code>、<code>seenObject</code> の 3 つの bool フラグ (行 72-74) で走査中に観測した leaf 要素の型を記録します。降下中に要素 element が JSArray なら子に潜るので type は問わず、子に潜らないケースでは行 144-150 で type 判定を行います。<code>!IsNumber(element)</code> なら <code>seenObject</code>、<code>!TaggedIsSmi(element)</code> (つまり <code>IsNumber</code> かつ <code>!Smi</code> なので HeapNumber) なら <code>seenDouble</code>、<code>TaggedIsSmi(element)</code> なら <code>seenSmi</code> というカスケードです。</p>
+
+<p>最終決定は行 174-180 で、<code>seenObject</code> なら <code>PACKED_ELEMENTS</code>、それ以外で <code>seenDouble</code> なら <code>PACKED_DOUBLE_ELEMENTS</code>、それ以外 <code>PACKED_SMI_ELEMENTS</code> を選びます。これは ElementsKind の格納能力の包含関係に基づいています。Object スロットは任意の tagged ポインタを保持できるため Smi も Double (HeapNumber) も格納可能で最広、Double は Smi の値を float64 として保持できるので Smi より広く、Smi は最狭です。</p>
+
+<p>このロジックは <code class="file-ref">test/mjsunit/array-flat-elements-kind.js</code> で網羅的にテストされています。<code>[[1],[1.1]].flat()</code> は SMI と double を含むサブ配列の混合で結果は DOUBLE 配列、<code>[[1],[[1.1]]].flat()</code> は外側 SMI と内側に double 配列を含むため depth 1 でネスト配列 (JSArray) が leaf として残り、結果は OBJECT が必要、<code>[[1, "hello"]].flat()</code> は 文字列を含むため OBJECT、というロジックが fast path の <code>seenObject</code> / <code>seenDouble</code> フラグで正しく検出されるよう設計されています。</p>
+
+<hr/>
+

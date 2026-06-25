@@ -1,0 +1,320 @@
+<h2 id="chapter7">第7章 配列メソッドのV8内部実装</h2>
+
+<h3 id="sec7-1">7.1 Array.prototype.mapの3層構造</h3>
+
+<p>Torque で書かれた <code>Array.prototype.map</code> を見ながら、3層構造の典型例を観察します。<code class="file-ref">src/builtins/array-map.tq:259</code> がエントリポイントです。</p>
+
+<pre><code class="language-torque">transitioning javascript builtin ArrayMap(
+    js-implicit context: NativeContext, receiver: JSAny)(...arguments): JSAny {
+  try {
+    RequireObjectCoercible(receiver, 'Array.prototype.map');
+    const o: JSReceiver = ToObject_Inline(context, receiver);
+    const len: Number = GetLengthProperty(o);
+    if (arguments.length == 0) goto TypeError;
+    const callbackfn = Cast&lt;Callable&gt;(arguments[0]) otherwise TypeError;
+    const thisArg: JSAny = arguments[1];
+
+    let array: JSReceiver;
+    let k: Number = 0;
+    try {
+      if (IsArraySpeciesProtectorCellInvalid()) goto SlowSpeciesCreate;
+      const o: FastJSArrayForRead = Cast&lt;FastJSArrayForRead&gt;(receiver)
+          otherwise SlowSpeciesCreate;
+      const smiLength: Smi = Cast&lt;Smi&gt;(len)
+          otherwise SlowSpeciesCreate;
+
+      return FastArrayMap(o, smiLength, callbackfn, thisArg)
+          otherwise Bailout;
+    } label SlowSpeciesCreate {
+      array = ArraySpeciesCreate(context, receiver, len);
+    } label Bailout(output: JSArray, kValue: Smi) deferred {
+      array = output;
+      k = kValue;
+    }
+
+    return ArrayMapLoopContinuation(o, callbackfn, thisArg, array, o, k, len);
+  } label TypeError deferred {
+    ThrowCalledNonCallable(arguments[0]);
+  }
+}
+</code></pre>
+
+<p>このコードを読み解くと、fast path に入る条件として3点が要求されています。第一に ArraySpeciesProtector が無効化されていないこと (Symbol.species を改変していないこと)。第二に receiver が FastJSArrayForRead にキャスト可能であること。第三に length が Smi であること。これらが揃った場合だけ <code>FastArrayMap</code> が呼ばれます。失敗時は <code>ArrayMapLoopContinuation</code> (仕様通りの愚直なループ) にフォールバックします。</p>
+
+<p><code>FastArrayMap</code> の本体は <code class="file-ref">array-map.tq:221</code> 以降にあります。重要な構造体として <code>Vector</code> が <code class="file-ref">array-map.tq:96</code> で定義されています。</p>
+
+<pre><code class="language-torque">struct Vector {
+  macro StoreResult(implicit context: Context)(index: Smi,
+                       result: JSAny): void {
+    typeswitch (result) {
+      case (s: Smi): {
+        this.fixedArray.objects[index] = s;
+      }
+      case (s: HeapNumber): {
+        this.onlySmis = false;
+        this.fixedArray.objects[index] = s;
+      }
+      case (s: Undefined): {
+        this.onlySmis = false;
+        this.onlyNumbers = false;
+        ...
+      }
+      case (s: JSAnyNotNumberOrUndefined): {
+        this.onlySmis = false;
+        this.onlyNumbers = false;
+        this.onlyNumbersAndUndefined = false;
+        this.fixedArray.objects[index] = s;
+      }
+    }
+  }
+  ...
+}
+</code></pre>
+
+<p>Vector はループ中に「これまで見た結果値の種類」をフラグで追跡します。callback の返り値が常に Smi であれば PACKED_SMI、常に Number (Smi または HeapNumber) であれば PACKED_DOUBLE、それ以外なら PACKED_ELEMENTS という具合に、ループ終了時に最も適したターゲット Kind を決定します。Vector の <code>CreateJSArray</code> (同ファイル 101 行目以降) で最終的な配列を組み立てます。</p>
+
+<pre><code class="language-torque">macro CreateJSArray(implicit context: Context)(validLength: Smi): JSArray {
+  ...
+  let kind: ElementsKind = ElementsKind::PACKED_SMI_ELEMENTS;
+  if (!this.onlySmis) {
+    if (this.onlyNumbers) {
+      kind = ElementsKind::PACKED_DOUBLE_ELEMENTS;
+    } else if (this.onlyNumbersAndUndefined) {
+      kind = ElementsKind::HOLEY_DOUBLE_ELEMENTS;
+    } else {
+      kind = ElementsKind::PACKED_ELEMENTS;
+    }
+  }
+
+  if (this.skippedElements || Convert&lt;intptr&gt;(validLength) &lt; length) {
+    kind = FastHoleyElementsKind(kind);
+  }
+  ...
+}
+</code></pre>
+
+<p>ここが V8 の真骨頂で、map の結果配列の Kind を「実行中に見た値だけ」から最適決定します。仕様としてはコールバックがどんな値を返すかは事前に分かりませんが、実際には結果が全部数値であることが多く、その場合は HeapNumber を経由しない PACKED_DOUBLE が生まれるため、結果配列のメモリと後の操作が劇的に高速化されます。</p>
+
+<p>途中で bail out した場合 (<code>fastOW.Recheck()</code> が失敗するなど) は HOLEY 系に切り替わります。バイパスされたインデックスがあるためです。</p>
+
+<h3 id="sec7-2">7.2 deopt continuation</h3>
+
+<p><code>map</code>、<code>filter</code>、<code>reduce</code>、<code>forEach</code> などは TurboFan / Maglev が積極的にインライン化します。インライン化された fast path 中に deopt (型ガード違反、stack overflow、protector 無効化など) が発生したとき、bytecode に戻るのではなく直接 builtin の途中から実行を再開するため、各 .tq ファイルの先頭に <code>XxxLoopEagerDeoptContinuation</code> と <code>XxxLoopLazyDeoptContinuation</code> という2つの builtin が定義されています。</p>
+
+<p>例えば <code class="file-ref">src/builtins/array-map.tq:36-60</code> の <code>ArrayMapLoopLazyDeoptContinuation</code> は、callback を呼んだ直後に deopt が起きた場合のために「結果を出力配列に書いてから loop の続きへ」というセマンティクスをこの continuation が表現します。</p>
+
+<pre><code class="language-torque">transitioning javascript builtin ArrayMapLoopLazyDeoptContinuation(
+    js-implicit context: NativeContext, receiver: JSAny)(callback: JSAny,
+    thisArg: JSAny, array: JSAny, initialK: JSAny, length: JSAny,
+    result: JSAny): JSAny {
+  ...
+  FastCreateDataProperty(outputArray, numberK, result);
+  numberK = numberK + 1;
+  return ArrayMapLoopContinuation(...);
+}
+</code></pre>
+
+<p>ここで <code>result</code> は「callback を呼んだ直後の戻り値」で、deopt がそのタイミングで起きたので「結果を出力配列に書いてから loop の続きへ」というセマンティクスをこの continuation が表現します。</p>
+
+<h3 id="sec7-3">7.3 Array.prototype.filter</h3>
+
+<p><code class="file-ref">src/builtins/array-filter.tq:96</code> の <code>FastArrayFilter</code> も map と似た構造ですが、結果配列の最終長さがコールバックの返り値次第なので、<code>FastJSArray</code> を使って末尾に append していきます。フィルタが通った要素を順次積み、最後に length を確定させる形で、結果が極端に小さい場合でも capacity の浪費がないようになっています。</p>
+
+<pre><code class="language-torque">fastOutputW.EnsureArrayPushable() otherwise goto Bailout(k, to);
+
+for (; k &lt; len; k++) {
+  fastOW.Recheck() otherwise goto Bailout(k, to);
+  ...
+  const value: JSAny = fastOW.LoadElementNoHole(k) otherwise continue;
+  const result: JSAny =
+      Call(context, callbackfn, thisArg, value, k, fastOW.Get());
+  if (ToBoolean(result)) {
+    try {
+      fastOutputW.Recheck() otherwise SlowStore;
+      if (fastOutputW.Get().length != to) goto SlowStore;
+      fastOutputW.Push(value) otherwise SlowStore;
+    } label SlowStore {
+      FastCreateDataProperty(fastOutputW.stable, to, value);
+    }
+    to = to + 1;
+  }
+}
+</code></pre>
+
+<p><code>FastFilterSpeciesCreate</code> (同ファイル 135 行目) は ArraySpeciesProtector が有効で receiver が FastJSArray の場合に「receiver と同じ ElementsKind の長さ 0 配列」を即座にアロケートし、<code>ArraySpeciesCreate</code> の重い JS-callable subclass 検査経路をスキップします。</p>
+
+<h3 id="sec7-4">7.4 Array.prototype.flat ― 2 パス方式</h3>
+
+<p><code class="file-ref">src/builtins/array-flat.tq</code> (610 行) は構造が独特です。「先に flatten 後の長さと target kind を計算してから、最終的なバッキングストアを 1 回だけアロケート」する 2 パス方式を採用しています。</p>
+
+<p>第1パスでは <code>CalculateFlattenedLengthFast</code> (<code class="file-ref">array-flat.tq:54</code>) が、ソース配列を再帰的に走査して「最終的に何要素になるか」と「結果の ElementsKind は何か」を事前に計算します。再帰のスタックは爆発しないように <code>kMaxFlatFastStackEntries = 3072</code> の手書きスタックで管理し、深さ 1024 を超えると bail out します。</p>
+
+<p>特筆すべきは、ソースが PACKED_SMI_ELEMENTS や PACKED_DOUBLE_ELEMENTS であれば、子要素を走査する必要すらないという最適化です。</p>
+
+<pre><code class="language-torque">if (sourceKind == ElementsKind::PACKED_SMI_ELEMENTS ||
+    sourceKind == ElementsKind::PACKED_DOUBLE_ELEMENTS) {
+  return FlattenedLengthResult{length: sourceLength, targetKind: sourceKind};
+}
+</code></pre>
+
+<p>PACKED な数値配列は中に他の配列を含むことが不可能なため、長さがそのまま結果の長さになり、Kind も維持されます。</p>
+
+<p>第1パスで結果長と Kind が決まれば、第2パスでは事前確保した正しいサイズの FixedArray にコピーするだけです。realloc が不要になるためアロケーションが1回で済み、メモリ局所性も保たれます。失敗時は <code>FlattenIntoArraySlow</code> (<code class="file-ref">array-flat.tq:438</code>) が ECMA-262 仕様の <code>FlattenIntoArray</code> をそのまま <code>HasProperty</code> / <code>GetProperty</code> / <code>FastCreateDataProperty</code> で実装したパスに落ちます。</p>
+
+<h3 id="sec7-5">7.5 sort ― PowerSort</h3>
+
+<p>V8 の <code>Array.prototype.sort</code> の実装は予想に反して <code>src/builtins/</code> 直下ではなく、<code class="file-ref">third_party/v8/builtins/array-sort.tq</code> (1614 行) にあります。冒頭のコメントで</p>
+
+<pre><code class="language-text">// This file implements a stable, adaptive merge sort variant called PowerSort.
+//
+// It was first implemented in python and this Torque implementation
+// is based on the current version:
+//
+// https://github.com/python/cpython/blob/master/Objects/listobject.c
+</code></pre>
+
+<p>と明言されているとおり、これは CPython の list.sort と同じ PowerSort アルゴリズムを Torque に移植したものです。PowerSort は TimSort の派生型で、入力データの中にすでに整列している連続部分 (run) を見つけ出して活用する適応的なマージソートです。過去には TimSort、それ以前は QuickSort でしたが、現行は PowerSort に置き換わっています。</p>
+
+<p>特に注目すべき点は次の通りです。比較関数が未指定の場合は ECMA-262 が要求するデフォルトの文字列比較に従いますが、配列が PACKED_SMI なら整数として高速に比較できる専用パス <code>SortCompareDefault</code> (<code class="file-ref">array-sort.tq:378</code>) があります。</p>
+
+<pre><code class="language-torque">transitioning builtin SortCompareDefault(
+    context: Context, comparefn: JSAny, x: JSAny, y: JSAny): Number {
+  dcheck(comparefn == Undefined);
+
+  if (TaggedIsSmi(x) &amp;&amp; TaggedIsSmi(y)) {
+    return SmiLexicographicCompare(UnsafeCast&lt;Smi&gt;(x), UnsafeCast&lt;Smi&gt;(y));
+  }
+
+  const xString = ToString_Inline(x);
+  const yString = ToString_Inline(y);
+
+  return StringCompare(xString, yString);
+}
+</code></pre>
+
+<p>比較関数なしのときに Smi 対 Smi で <code>SmiLexicographicCompare</code> を直接呼ぶことで、文字列化のコスト (<code>ToString</code>) を完全に回避します。これが <code>[1,2,3,...].sort()</code> が爆速になる主因です。</p>
+
+<p>閾値 <code>kMaxBinaryInsertionSortLength</code> 以下の小さな run は BinaryInsertionSort で直接整列されます (<code class="file-ref">src/objects/js-array.h:139</code> の <code>kMaxInlineSortLength = 16</code>)。比較中にユーザーコードが配列を変更する可能性があるため、各マージステップごとに work_array と原配列の整合性をチェックしています。これは仕様の要求事項で、ユーザーの comparefn が副作用を持つ場合の正当性確保のためです。</p>
+
+<p><code>SortState</code> という HeapObject (<code class="file-ref">third_party/v8/builtins/array-sort.tq:25</code>) が PowerSort の状態を保持し、ユーザコードの呼び出しによる脱最適化に備えて initial_receiver_map と initial_receiver_length を抱えています。<code>CheckAccessor</code> (同ファイル 90 行目) は user comparefn 後の再キャストで、FastDoubleElements / FastSmiElements / FastObjectElements の3 specialization に分岐します。</p>
+
+<h3 id="sec7-6">7.6 push と pop の C++ Builtin</h3>
+
+<p><code class="file-ref">src/builtins/builtins-array.cc:505</code> の <code>BUILTIN(ArrayPush)</code> は前述のとおり、まず receiver が fast な JSArray かを確認し、引数の Kind 集合を見て事前に Transition を行い、その後 ElementsAccessor の Push に処理を委任します。ElementsAccessor は Kind ごとに特化したヘルパクラスで、<code class="file-ref">src/objects/elements.cc:668</code> 以降にテンプレートで定義されています。</p>
+
+<pre><code class="language-cpp">class FastSmiOrObjectElementsAccessor
+    : public FastElementsAccessor&lt;...&gt;
+class FastDoubleElementsAccessor : public FastElementsAccessor&lt;...&gt;
+class DictionaryElementsAccessor : public ElementsAccessorBase&lt;...&gt;
+</code></pre>
+
+<p>それぞれが Push、Pop、Add、Remove、Splice などの操作を Kind 専用の効率的なループで実装しています。</p>
+
+<p><code>pop</code> は <code>BUILTIN(ArrayPop)</code> (<code class="file-ref">builtins-array.cc:628</code>) で、<code>IsJSArrayFastElementMovingAllowed</code> を確認した後 <code>ElementsAccessor::Pop</code> を呼びます。</p>
+
+<pre><code class="language-cpp">inline bool IsJSArrayFastElementMovingAllowed(Isolate* isolate,
+                                              Tagged&lt;JSArray&gt; receiver) {
+  Tagged&lt;NativeContext&gt; context = receiver-&gt;GetCreationContext().value();
+  Tagged&lt;Map&gt; map = receiver-&gt;map();
+  if (V8_LIKELY(map-&gt;prototype() == context-&gt;initial_array_prototype()) &amp;&amp;
+      Protectors::IsNoElementsIntact(isolate)) {
+    return true;
+  }
+  return V8_LIKELY(JSObject::PrototypeHasNoElements(isolate, receiver));
+}
+</code></pre>
+
+<p>NoElementsProtector の状態が fast path 採用に直接影響します。</p>
+
+<h3 id="sec7-7">7.7 shift と unshift がなぜ遅いか</h3>
+
+<p><code>shift</code> (先頭要素を取り除いて返す) と <code>unshift</code> (先頭に要素を追加する) は他の操作と違い、配列の全要素を1つずつずらす必要があるため、長さ N に対して O(N) のコストがかかります。<code class="file-ref">src/builtins/array-shift.tq:11</code> の Torque fast path は</p>
+
+<pre><code class="language-torque">const newLength = array.length - 1;
+
+if (Convert&lt;intptr&gt;(newLength + newLength + kMinAddedElementsCapacity) &lt;
+    array.elements.length_intptr) {
+  goto Runtime;
+}
+
+if (newLength &gt; kMaxCopyElements) goto Runtime;
+
+const result = witness.LoadElementOrUndefined(0);
+witness.ChangeLength(newLength);
+witness.MoveElements(0, 1, Convert&lt;intptr&gt;(newLength));
+witness.StoreHole(newLength);
+return result;
+</code></pre>
+
+<p><code>witness.MoveElements(0, 1, newLength)</code> がこの O(N) 操作の正体です。N が大きい場合 (<code>kMaxCopyElements = 100</code>) は left-trim という別アプローチに切り替えるために C++ runtime にテイルコールします。前述のとおり LeftTrimFixedArray はヘッダだけ動かして物理コピーを避ける GC 連携の手段です。</p>
+
+<h3 id="sec7-8">7.8 concat と Fast_ArrayConcat</h3>
+
+<p><code class="file-ref">src/builtins/builtins-array.cc:1712</code> の <code>Fast_ArrayConcat</code> は次の条件をすべて満たすときだけ高速パスを取ります。</p>
+
+<pre><code class="language-cpp">if (!Protectors::IsIsConcatSpreadableLookupChainIntact(isolate)) {
+  return {};
+}
+...
+for (int i = 0; i &lt; n_arguments; i++) {
+  Tagged&lt;Object&gt; arg = (*args)[i];
+  if (!IsJSArray(arg)) return {};
+  if (!HasOnlySimpleReceiverElements(isolate, Cast&lt;JSObject&gt;(arg))) {
+    return {};
+  }
+  if (!Cast&lt;JSObject&gt;(arg)-&gt;HasFastElements()) {
+    return {};
+  }
+  ...
+}
+return ElementsAccessor::Concat(isolate, args, n_arguments, result_len);
+</code></pre>
+
+<p>IsConcatSpreadableProtector と ArraySpeciesProtector が両方有効、すべての引数が fast elements を持つ JSArray、合計 length が FixedArray の上限以内。これらが揃えば、ElementsAccessor が Kind を統合 (<code>UnionElementsKindUptoSize</code>) して結果バッキングを一発確保し、各ソースから memcpy 風にコピーします。</p>
+
+<p>ひとつでも条件を満たさないと <code>Slow_ArrayConcat</code> (<code class="file-ref">builtins-array.cc:1454</code>) に落ちます。slow path は ArrayConcatVisitor (<code class="file-ref">builtins-array.cc:822</code>) を使い、引数を1つずつ仕様準拠で展開していくため、桁違いに遅くなります。</p>
+
+<h3 id="sec7-9">7.9 slice ― CloneFastJSArray</h3>
+
+<p>slice はベースの実装が Torque (<code class="file-ref">src/builtins/array-slice.tq</code>) にありますが、引数なしまたは <code>slice(0)</code> のケースには CloneFastJSArray 専用ビルトインで一発で複製します (<code class="file-ref">array-slice.tq:180</code>)。</p>
+
+<pre><code class="language-torque">if ((start == Undefined || TaggedEqual(start, SmiConstant(0))) &amp;&amp;
+    end == Undefined) {
+  typeswitch (receiver) {
+    case (a: FastJSArrayForCopy): {
+      return CloneFastJSArray(context, a);
+    }
+    case (JSAny): {
+    }
+  }
+}
+</code></pre>
+
+<p>Maglev でも <code>TryReduceArrayPrototypeSlice</code> (<code class="file-ref">src/maglev/maglev-graph-builder.cc:9294</code>) が start=0, end=undefined の特殊ケースをインライン化します。</p>
+
+<h3 id="sec7-10">7.10 reverse, indexOf, includes, every, some</h3>
+
+<p>reverse は <code class="file-ref">src/builtins/array-reverse.tq:9</code> で <code>FastArrayReverse&lt;Elements, T&gt;</code> というテンプレートマクロを <code>FixedArray</code> 用と <code>FixedDoubleArray</code> 用に specialize しています。</p>
+
+<pre><code class="language-torque">macro FastArrayReverse&lt;Elements : type extends FixedArrayBase, T: type&gt;(
+    implicit context: Context)(elements: FixedArrayBase, length: Smi): void {
+  let lower: Smi = 0;
+  let upper: Smi = length - 1;
+
+  while (lower &lt; upper) {
+    const lowerValue: T = LoadElement&lt;Elements, T&gt;(elements, lower);
+    const upperValue: T = LoadElement&lt;Elements, T&gt;(elements, upper);
+    StoreElement&lt;Elements&gt;(elements, lower, upperValue);
+    StoreElement&lt;Elements&gt;(elements, upper, lowerValue);
+    ++lower;
+    --upper;
+  }
+}
+</code></pre>
+
+<p>indexOf と includes は Torque ではなく CSA で手書きされており、SIMD 命令への分岐があります (第10章で詳述)。</p>
+
+<p>every と some は callback の返り値が boolean に丸められた瞬間 break するシンプルな構造です。</p>
+
+<hr>
+

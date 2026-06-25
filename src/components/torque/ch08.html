@@ -1,0 +1,232 @@
+<h2 id="chapter-8">第 8 章 高速化テクニック</h2>
+
+<p>Torque の真価は「ECMA262 仕様準拠を保ったまま最速のビルトインを作れる」点にあります。本章では具体的なテクニックを <code>src/builtins/</code> の実例とともに見ます。</p>
+
+<h3 id="sec-8-1">8.1 Fast/Slow Path 分離</h3>
+
+<p>最も基本的なパターンは、「ホットケース (fast path) と一般ケース (slow path) を try-label で分離する」ことです。<code class="file-ref">src/builtins/array-foreach.tq:90-126</code> の <code>ArrayForEach</code> がその典型例です。</p>
+
+<pre><code class="language-torque">transitioning javascript builtin ArrayForEach(
+    js-implicit context: NativeContext, receiver: JSAny)(...arguments): JSAny {
+  try {
+    RequireObjectCoercible(receiver, 'Array.prototype.forEach');
+    const o: JSReceiver = ToObject_Inline(context, receiver);
+    const len: Number = GetLengthProperty(o);
+    if (arguments.length == 0) goto TypeError;
+    const callbackfn = Cast&lt;Callable&gt;(arguments[0]) otherwise TypeError;
+    const thisArg: JSAny = arguments[1];
+
+    let k: Number = 0;
+    try {
+      return FastArrayForEach(o, len, callbackfn, thisArg) otherwise Bailout;
+    } label Bailout(kValue: Smi) deferred {
+      k = kValue;
+    }
+
+    return ArrayForEachLoopContinuation(
+        o, callbackfn, thisArg, Undefined, o, k, len, Undefined);
+  } label TypeError deferred {
+    ThrowCalledNonCallable(arguments[0]);
+  }
+}
+</code></pre>
+
+<p><code>FastArrayForEach</code> が成功すれば fast path、<code>Bailout(kValue)</code> が呼ばれれば slow path に <code>kValue</code> を渡して <code>ArrayForEachLoopContinuation</code> でゆっくり仕様準拠ループします。<code>deferred</code> 修飾でスローパスは寒い経路に配置され、TurboFan は <code>Bailout</code> に達するブランチを末尾に追いやります。</p>
+
+<h3 id="sec-8-2">8.2 FastJSArrayWitness パターン</h3>
+
+<p><code class="file-ref">src/objects/js-array.tq:230-345</code> の <code>FastJSArrayWitness</code> 構造体は、「JSArray が fast path であり続けることを観測している」状態を表す struct です。</p>
+
+<pre><code class="language-torque">struct FastJSArrayWitness {
+  macro Recheck(): void labels CastError {
+    if (this.stable.map != this.map) goto CastError;
+    if (IsNoElementsProtectorCellInvalid()) goto CastError;
+    this.unstable = %RawDownCast&lt;FastJSArray&gt;(this.stable);
+  }
+  macro LoadElementNoHole(...) labels FoundHole { ... }
+  macro Push(value: JSAny): void labels Failed { ... }
+  // ...
+  const stable: JSArray;
+  unstable: FastJSArray;
+  const map: Map;
+  const hasDoubles: bool;
+  const hasSmis: bool;
+  arrayIsPushable: bool;
+}
+</code></pre>
+
+<p><code>stable</code> は普通の <code>JSArray</code>、<code>unstable</code> は transient な <code>FastJSArray</code> です。ループ中に callback 呼び出しで JS コードが走る可能性がある場合、その直後に <code>Recheck()</code> を呼んで「まだ Map が変わっていないか」「<code>NoElementsProtector</code> がまだ有効か」を確認します。</p>
+
+<p><code>Map</code> 等価性のチェックだけで「ElementsKind は変わってない」「プロトタイプは依然 Initial Array Prototype」と推論できる点は、<code>Map</code> が ElementsKind とプロトタイプの両方を hash 経由で内包するからです。これが V8 の Hidden Class 設計の基本不変条件です。</p>
+
+<h3 id="sec-8-3">8.3 ElementsKind 分岐と単調昇格</h3>
+
+<p><code class="file-ref">src/builtins/array-map.tq:96-170</code> の <code>Vector::CreateJSArray</code> は、observed value をもとに最適な elements kind を選びます。</p>
+
+<pre><code class="language-torque">let kind: ElementsKind = ElementsKind::PACKED_SMI_ELEMENTS;
+if (!this.onlySmis) {
+  if (this.onlyNumbers) kind = ElementsKind::PACKED_DOUBLE_ELEMENTS;
+  else if (this.onlyNumbersAndUndefined) kind = ElementsKind::HOLEY_DOUBLE_ELEMENTS;
+  else kind = ElementsKind::PACKED_ELEMENTS;
+}
+if (this.skippedElements || Convert&lt;intptr&gt;(validLength) &lt; length) {
+  kind = FastHoleyElementsKind(kind);
+}
+const map: Map = LoadJSArrayElementsMap(kind, LoadNativeContext(context));
+</code></pre>
+
+<p>これにより、<code>[1, 2, 3].map(x =&gt; x * 2)</code> のように同じ型の数値だけを返す map では <code>PACKED_SMI_ELEMENTS</code> の高密度配列が選ばれ、メモリ使用量と GC 圧力が最小化されます。</p>
+
+<p><code>StoreResult</code> メソッドが各 typeswitch で <code>onlySmis</code>、<code>onlyNumbers</code>、<code>onlyNumbersAndUndefined</code> フラグを下げていくのは、Smi → Double → Object、PACKED → HOLEY の単調遷移を実現するためです。</p>
+
+<h3 id="sec-8-4">8.4 deferred ラベル</h3>
+
+<p><code>label Bailout(...) deferred { ... }</code> の <code>deferred</code> 修飾はコードキャッシュ局所性のヒントです。</p>
+
+<p>CSAGenerator は対応する <code>CodeAssemblerLabel</code> を <code>kDeferred</code> で作成します。TurboFan はこのフラグを見て、寒い経路を関数末尾に配置し、命令キャッシュの fast path 占有率を上げます。</p>
+
+<h3 id="sec-8-5">8.5 typeswitch のコンパイル</h3>
+
+<p><code>typeswitch (o) { case (Smi): ... case (HeapNumber): ... case (Object): ... }</code> は、内部的には連続した <code>BranchIfSmi</code>、<code>IsHeapNumber</code> 等のテストに展開されます。Torque は最も具体的な型から順にテストするように case 順を保ち、union 型のメンバ全網羅性を検査します。</p>
+
+<h3 id="sec-8-6">8.6 tail call</h3>
+
+<p><code>return tail Foo(...)</code> のように <code>tail</code> を付けると、TurboFan に「stack frame を再利用してジャンプして良い」ヒントを渡します。CallBuiltinInstruction の <code>is_tailcall</code> が true になり、CSA 側で <code>TailCallStubBuiltin</code> 等に展開されます。</p>
+
+<p><code class="file-ref">array-shift.tq:107-109</code> の Runtime ラベル経由の tail call が好例です。</p>
+
+<pre><code class="language-torque">} label Runtime {
+  tail ArrayShift(
+      context, LoadTargetFromFrame(), Undefined,
+      Convert&lt;int32&gt;(arguments.actual_count), kInvalidDispatchHandle);
+}
+</code></pre>
+
+<h3 id="sec-8-7">8.7 constexpr 特殊化</h3>
+
+<p><code>src/builtins/builtins-typedarray-*.tq</code> などで使われるパターンで、ElementsKind を constexpr 型パラメータで受けて特殊化されたビルトインを生成します。</p>
+
+<pre><code class="language-torque">macro Foo&lt;Kind: constexpr ElementsKind&gt;(...): ... {
+  if constexpr (Kind == ElementsKind::UINT8_ELEMENTS) {
+    // 専用パス
+  } else { ... }
+}
+</code></pre>
+
+<p>mksnapshot 実行時に枝刈りされるため、生成 builtin は分岐なしの専用コードになります。</p>
+
+<h3 id="sec-8-8">8.8 prototype 汚染チェックと Protector cell</h3>
+
+<p>V8 はあるグローバル状態 (<code>%Array.prototype%</code> がいじられていない、<code>%TypedArray.prototype%.@@iterator</code> がいじられていない、etc.) を Protector cell として持ち、これが有効な間は fast path を採れる、という前提のコードがあります。</p>
+
+<p>主要な Protector とそれを参照するイディオムは以下です。</p>
+
+<p><code>IsNoElementsProtectorCellInvalid</code> は <code>Object.prototype</code> などのチェーン上に数値インデックス要素が存在しないことを保証します。</p>
+
+<p><code>IsArraySpeciesProtectorCellInvalid</code> は <code>Array[Symbol.species]</code> が改造されていないことを保証します。</p>
+
+<p><code>IsIsConcatSpreadableProtectorCellInvalid</code> は <code>@@isConcatSpreadable</code> のフックが置かれていないことを保証します。</p>
+
+<p><code>IsArrayIteratorProtectorCellInvalid</code> は <code>Array.prototype[Symbol.iterator]</code> が改造されていないことを保証します。</p>
+
+<p><code>IsPromiseSpeciesProtectorCellInvalid</code>、<code>IsPromiseThenProtectorCellInvalid</code>、<code>IsRegExpSpeciesProtectorCellInvalid</code> 等の同型の Protector がそれぞれの Builtin で参照されています。</p>
+
+<p>Cast の段階で Protector が一度確認されれば、<code>FastJSArray</code>、<code>FastJSArrayForCopy</code> などの型を持ち回している間はその不変条件が型情報として保たれます。</p>
+
+<h3 id="sec-8-9">8.9 write barrier 省略</h3>
+
+<p>新規アロケーション中の初期化や、Old Space に既に置かれた値の格納時など、write barrier が不要なケースで Torque は自動的に省略します。明示的に <code>UNSAFE_SKIP_WRITE_BARRIER</code> を渡すこともできます。</p>
+
+<pre><code class="language-torque">StoreFixedArrayElement(resultElements, indexOut++, newElement, UNSAFE_SKIP_WRITE_BARRIER);
+</code></pre>
+
+<p>これは <code>array-slice.tq:84-86</code> の hot path で実測効くサイズの定数倍を稼ぐ重要な微最適化です。</p>
+
+<h3 id="sec-8-10">8.10 typed-array-slice の memmove 直接呼び出し</h3>
+
+<p>TypedArray の slice では、ElementsKind が同じで buffer も同じでない場合に限り、要素をひとつずつ touch せず libc の <code>memmove</code> を直接呼び出します。</p>
+
+<pre><code class="language-torque">// /home/user/v8/src/builtins/typed-array-slice.tq:33-63
+const countBytes: uintptr = destInfo.CalculateByteLength(count) otherwise unreachable;
+const startOffset: uintptr = destInfo.CalculateByteLength(k) otherwise unreachable;
+const srcPtr: RawPtr = src.data_ptr + Convert&lt;intptr&gt;(startOffset);
+
+if (IsSharedArrayBuffer(src.buffer)) {
+  // SABs need a relaxed memmove to preserve atomicity.
+  typed_array::CallCRelaxedMemmove(dest.data_ptr, srcPtr, countBytes);
+} else {
+  typed_array::CallCMemmove(dest.data_ptr, srcPtr, countBytes);
+}
+</code></pre>
+
+<p><code>src.data_ptr</code> は TypedArray が指す ArrayBuffer の生ポインタを直接掴むフィールドで、tag のない裸の RawPtr 型として Torque から参照できます。</p>
+
+<h3 id="sec-8-11">8.11 AttachedJSTypedArrayWitness と indirect call</h3>
+
+<p>TypedArray ループ用の Witness は、ループ毎の RecheckIndex で「length が縮んでいないか」「依然 attached か」を 1 回だけ検証する設計です。</p>
+
+<pre><code class="language-torque">// /home/user/v8/src/builtins/typed-array.tq:233-267
+struct AttachedJSTypedArrayWitness {
+  macro RecheckIndex(index: uintptr): void labels DetachedOrOutOfBounds { ... }
+  macro Load(implicit context: Context)(k: uintptr): JSAny {
+    const lf: LoadNumericFn = this.loadfn;
+    return lf(this.unstable, k);
+  }
+  stable: JSTypedArray;
+  unstable: AttachedJSTypedArray;
+  loadfn: LoadNumericFn;
+}
+</code></pre>
+
+<p><code>loadfn</code> は ElementsKind に応じて選ばれた専用ビルトイン (たとえば <code>LoadTypedElement&lt;Uint8Elements&gt;</code>) で、これがクロージャ的に持ち回されることで、ループ本体は kind の分岐なしに <code>loadfn(array, k)</code> の indirect call 1 発で要素にアクセスできます。</p>
+
+<h3 id="sec-8-12">8.12 feedback 付き呼び出し</h3>
+
+<p><code class="file-ref">src/builtins/iterator.tq:83-122</code> の <code>GetIteratorWithFeedback</code> は、<code>for-of</code> などイテレーション呼び出し時に Inline Cache を経由するパターンです。</p>
+
+<pre><code class="language-torque">transitioning builtin GetIteratorWithFeedback(
+    context: Context, receiver: JSAny, loadSlot: TaggedIndex,
+    callSlot: TaggedIndex,
+    maybeFeedbackVector: Undefined|FeedbackVector): JSAny {
+  let iteratorMethod: JSAny;
+  typeswitch (maybeFeedbackVector) {
+    case (Undefined): {
+      iteratorMethod = GetProperty(receiver, IteratorSymbolConstant());
+    }
+    case (feedback: FeedbackVector): {
+      iteratorMethod = LoadIC(
+          context, receiver, IteratorSymbolConstant(), loadSlot, feedback);
+    }
+  }
+  // ...
+}
+</code></pre>
+
+<p><code>LoadIC</code> 経由のロードによって monomorphic / polymorphic な feedback が貯まり、後続の Turbofan inline で活きてきます。</p>
+
+<h3 id="sec-8-13">8.13 Lazy Deopt Continuation</h3>
+
+<p><code class="file-ref">src/builtins/array-map.tq:8-60</code> には <code>ArrayMapPreLoopLazyDeoptContinuation</code>、<code>ArrayMapLoopEagerDeoptContinuation</code>、<code>ArrayMapLoopLazyDeoptContinuation</code> という、Turbofan が <code>Array.prototype.map</code> を inline 化して最適化したコードが deopt された場合の continuation が並んでいます。</p>
+
+<pre><code class="language-torque">transitioning javascript builtin ArrayMapLoopLazyDeoptContinuation(
+    js-implicit context: NativeContext, receiver: JSAny)(callback: JSAny,
+    thisArg: JSAny, array: JSAny, initialK: JSAny, length: JSAny,
+    result: JSAny): JSAny {
+  // 型を強制的に絞り込む
+  const jsreceiver = Cast&lt;JSReceiver&gt;(receiver) otherwise unreachable;
+  // ...
+
+  // callback の戻り値 result を抱えてここに突入する
+  FastCreateDataProperty(outputArray, numberK, result);
+  numberK = numberK + 1;
+
+  return ArrayMapLoopContinuation(
+      jsreceiver, callbackfn, thisArg, outputArray, jsreceiver, numberK,
+      numberLength);
+}
+</code></pre>
+
+<p>ここでの「Lazy Deopt」は、Turbofan が最適化した callback が呼出後に deopt されたとき、callback の戻り値 <code>result</code> を抱えてここに突入する仕組みで、最適化前提を捨てた後でも仕様アルゴリズムを途中から正しく再開できるようになっています。</p>
+
+<hr>
+

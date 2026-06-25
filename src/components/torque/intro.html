@@ -1,0 +1,30 @@
+<h1>V8 Torque 完全解説</h1>
+
+<nav class="toc">
+<h2>目次</h2>
+<ol>
+<li>第 1 章 Torque とは何か</li>
+<li>第 2 章 全体アーキテクチャとコンパイルパイプライン</li>
+<li>第 3 章 言語仕様 (構文要素の全網羅)</li>
+<li>第 4 章 V8 オブジェクトモデルと Torque (Tagged ポインタ、Map、Sandbox)</li>
+<li>第 5 章 Torque コンパイラの内部 (Earley、AST、TypeOracle、CFG)</li>
+<li>第 6 章 CodeStubAssembler と TurboShaft Assembler への統合</li>
+<li>第 7 章 ビルドシステム (GN、Bazel、mksnapshot、embedded blob)</li>
+<li>第 8 章 高速化テクニック</li>
+<li>第 9 章 代表的ビルトインの実装パターン</li>
+<li>第 10 章 デバッグツールと開発体験</li>
+<li>第 11 章 テスト戦略</li>
+<li>第 12 章 まとめと発展トピック</li>
+<li>付録 A 参考リンクとファイル一覧</li>
+<li>付録 B 用語集</li>
+</ol>
+</nav>
+
+<p>本書は V8 のドメイン特化言語 (DSL) である Torque について、登壇資料の参考文献として利用できる粒度の解説をまとめたものです。文中の引用は本リポジトリの <code>/home/user/v8</code> を一次資料とし、ファイルパスと行番号を併記します。</p>
+
+<p>本書のスコープは以下の通りです。</p>
+
+<p>V8 がなぜ Torque という新しい言語を必要としたかという背景にはじまり、Torque の構文の細部、型システム、宣言の種類、制御フロー、ラベル、ジェネリクス、constexpr、transient 型、アノテーションといった言語仕様を概観します。続いて V8 のオブジェクトモデルである Tagged pointer 表現、HeapObject、Map、Instance Type、Elements Kind、Reference / Slice、Pointer Compression、Sandbox、Write Barrier といったメモリレイヤーを Torque がどのように扱っているかを解説します。さらに Torque コンパイラ自身の内部実装としてパース、AST、二段階宣言、型推論、ImplementationVisitor、中間表現 (Instruction)、CFG、コード生成 (CSAGenerator / CCGenerator / TSAGenerator) を取り上げ、それらが torque-generated ディレクトリ配下にどのような C++ ソースを吐くかを示します。最後に CodeStubAssembler および TurboShaft Assembler への接続、<code>BUILD.gn</code> のビルド統合と mksnapshot を経て embedded blob に焼き込まれるまでの流れ、Torque が実現する高速化のテクニック、そして <code>Array.prototype.forEach</code> や <code>Array.prototype.map</code>、<code>Promise.prototype.then</code>、<code>Iterator.from</code> などの典型実装をコード片を引きながら紹介します。</p>
+
+<hr>
+
