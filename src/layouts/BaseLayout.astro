@@ -1,6 +1,5 @@
 ---
-import css from "../styles/global.css?raw";
-import sidebarScript from "../scripts/sidebar.js?raw";
+import "../styles/global.css";
 ---
 
 <!DOCTYPE html>
@@ -9,10 +8,62 @@ import sidebarScript from "../scripts/sidebar.js?raw";
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>V8 Engine Deep Dive — 完全解説アーティファクト</title>
-<style set:html={css}></style>
 </head>
 <body>
 <slot />
-<script is:inline set:html={sidebarScript}></script>
+<script>
+  // --- Mobile navigation drawer ---
+  const body = document.body;
+  const toggle = document.getElementById("nav-toggle");
+  const backdrop = document.getElementById("nav-backdrop");
+  const openNav = () => body.setAttribute("data-nav", "open");
+  const closeNav = () => body.removeAttribute("data-nav");
+  toggle?.addEventListener("click", () =>
+    body.getAttribute("data-nav") === "open" ? closeNav() : openNav(),
+  );
+  backdrop?.addEventListener("click", closeNav);
+  document.addEventListener("keydown", (e) => e.key === "Escape" && closeNav());
+  document.querySelectorAll(".sidebar a").forEach((a) =>
+    a.addEventListener("click", () => {
+      if (window.matchMedia("(max-width: 1024px)").matches) closeNav();
+    }),
+  );
+
+  // --- Code block language labels ---
+  document.querySelectorAll('pre code[class*="language-"]').forEach((code) => {
+    const lang = (code.className.match(/language-(\w+)/) || [])[1];
+    if (lang && code.parentElement?.tagName === "PRE") {
+      code.parentElement.setAttribute("data-lang", lang);
+    }
+  });
+
+  // --- Sidebar scroll-spy ---
+  const links = Array.from(document.querySelectorAll(".sidebar a[href^='#']"));
+  const targets = links
+    .map((a) => document.getElementById(a.getAttribute("href").slice(1)))
+    .filter(Boolean);
+  const setActive = () => {
+    const y = window.scrollY + 120;
+    let current = null;
+    for (const el of targets) if (el.offsetTop <= y) current = el.id;
+    links.forEach((a) =>
+      a.classList.toggle("is-active", a.getAttribute("href") === "#" + current),
+    );
+  };
+  window.addEventListener("scroll", setActive, { passive: true });
+  setActive();
+
+  // --- Mermaid diagrams (loaded only when the page actually has any) ---
+  if (document.querySelector("pre.mermaid")) {
+    const { default: mermaid } = await import("mermaid");
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: "neutral",
+      securityLevel: "loose",
+      fontFamily: "ui-sans-serif, system-ui, sans-serif",
+    });
+    await mermaid.run({ querySelector: "pre.mermaid" });
+  }
+</script>
 </body>
 </html>

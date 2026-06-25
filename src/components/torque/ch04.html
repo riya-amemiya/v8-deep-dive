@@ -158,43 +158,43 @@ TaggedMember&lt;UnionOf&lt;Smi, MaybeWeak&lt;Map&gt;, TransitionArray, Prototype
 
 <p>V8 のヒープオブジェクトモデルの根は <code>Object = Smi|HeapObject</code> です。ヒープオブジェクト側のルートは <code>HeapObject</code> です。主要な階層は次のとおりです。</p>
 
-<pre><code class="language-text">Object (= Smi | HeapObject)
-├── Smi
-└── HeapObject
-    ├── Map
-    ├── PrimitiveHeapObject
-    │   ├── HeapNumber
-    │   ├── BigInt
-    │   ├── Oddball (Null/Undefined/Boolean/TheHole)
-    │   ├── Symbol
-    │   └── String
-    ├── FixedArrayBase
-    │   ├── FixedArray
-    │   ├── FixedDoubleArray
-    │   ├── HashTable (NameDictionary, NumberDictionary, ...)
-    │   └── ByteArray
-    ├── WeakFixedArray
-    ├── DescriptorArray
-    ├── TransitionArray
-    ├── JSReceiver
-    │   ├── JSProxy
-    │   └── JSObject
-    │       ├── JSArray (length: Number)
-    │       ├── JSFunction
-    │       ├── JSPromise
-    │       ├── JSArrayBuffer / JSTypedArray / JSDataView
-    │       ├── JSMap / JSSet / JSWeakMap / JSWeakSet
-    │       ├── JSRegExp
-    │       ├── JSDate
-    │       ├── JSGlobalProxy / JSGlobalObject
-    │       └── ...
-    ├── Context / NativeContext
-    ├── TrustedObject (sandbox 外)
-    │   ├── BytecodeArray
-    │   ├── Code
-    │   └── InstructionStream
-    └── ...
-</code></pre>
+<pre class="mermaid">
+flowchart TD
+  OBJ["Object（= Smi または HeapObject）"]
+  OBJ --> Smi
+  OBJ --> HO["HeapObject"]
+  HO --> Map
+  HO --> PHO["PrimitiveHeapObject"]
+  PHO --> HeapNumber
+  PHO --> BigInt
+  PHO --> Oddball["Oddball（Null/Undefined/Boolean/TheHole）"]
+  PHO --> Symbol
+  PHO --> Str["String"]
+  HO --> FAB["FixedArrayBase"]
+  FAB --> FixedArray
+  FAB --> FixedDoubleArray
+  FAB --> HashTable["HashTable（NameDictionary, NumberDictionary）"]
+  FAB --> ByteArray
+  HO --> WeakFixedArray
+  HO --> DescriptorArray
+  HO --> TransitionArray
+  HO --> JSR["JSReceiver"]
+  JSR --> JSProxy
+  JSR --> JSObject
+  JSObject --> JSArray["JSArray（length: Number）"]
+  JSObject --> JSFunction
+  JSObject --> JSPromise
+  JSObject --> JSAB["JSArrayBuffer / JSTypedArray / JSDataView"]
+  JSObject --> JSColl["JSMap / JSSet / JSWeakMap / JSWeakSet"]
+  JSObject --> JSRegExp
+  JSObject --> JSDate
+  JSObject --> JSGlobal["JSGlobalProxy / JSGlobalObject"]
+  HO --> Ctx["Context / NativeContext"]
+  HO --> TO["TrustedObject（sandbox 外）"]
+  TO --> BytecodeArray
+  TO --> Code
+  TO --> InstructionStream
+</pre>
 
 <p><code>JSReceiver</code> から下が「JavaScript で <code>Object</code> に分類される」ものです (<code class="file-ref">src/objects/js-objects.tq:5-11</code>)。</p>
 

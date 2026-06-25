@@ -4,18 +4,18 @@
 
 <p>V8 における JavaScript オブジェクトは、HeapObject を根とする多段継承で構成されています。</p>
 
-<pre><code class="language-text">HeapObject
-   └── JSReceiver        (properties_or_hash_ を持つ)
-          └── JSObject   (elements_ を持つ)
-                 ├── JSObjectWithEmbedderSlots
-                 ├── JSAPIObjectWithEmbedderSlots      (cpp_heap_wrappable_)
-                 ├── JSCustomElementsObject
-                 │      └── JSSpecialObject            (cpp_heap_wrappable_)
-                 ├── JSExternalObject                  (value_)
-                 ├── JSArray
-                 ├── JSArrayBuffer / JSArrayBufferView / JSTypedArray
-                 └── ...
-</code></pre>
+<pre class="mermaid">
+flowchart TD
+  HO["HeapObject"] --> JSR["JSReceiver（properties_or_hash_ を持つ）"]
+  JSR --> JSO["JSObject（elements_ を持つ）"]
+  JSO --> A["JSObjectWithEmbedderSlots"]
+  JSO --> B["JSAPIObjectWithEmbedderSlots（cpp_heap_wrappable_）"]
+  JSO --> C["JSCustomElementsObject"]
+  C --> C2["JSSpecialObject（cpp_heap_wrappable_）"]
+  JSO --> D["JSExternalObject（value_）"]
+  JSO --> E["JSArray"]
+  JSO --> F["JSArrayBuffer / JSArrayBufferView / JSTypedArray"]
+</pre>
 
 <p><code>JSReceiver</code> は「プロパティを定義できるオブジェクト」を表す抽象基底で、<code>JSObject</code> と <code>JSProxy</code> の共通親です。<code>JSCustomElementsObject</code> は elements_ が empty_fixed_array であってもカスタム要素アクセスが可能であることを型システムに伝えるためのマーカクラスです。<code>JSSpecialObject</code> はさらに JSGlobalObject や JSGlobalProxy のような特殊オブジェクトに対する受け皿です。</p>
 

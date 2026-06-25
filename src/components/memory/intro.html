@@ -16,44 +16,32 @@
 
 <h2>全体俯瞰図</h2>
 
-<pre><code class="language-text">┌─────────────────────────────────────────────────────────────────┐
-│                         V8 Isolate                              │
-│                                                                 │
-│  ┌────────────────────────────┐  ┌───────────────────────────┐  │
-│  │           Heap             │  │     Read-only Heap        │  │
-│  │ ┌────────────────────────┐ │  │  (複数 Isolate で共有)    │  │
-│  │ │ NewSpace (Scavenger)   │ │  │  Map、定数、builtin Code  │  │
-│  │ │ OldSpace (Mark-Compact)│ │  └───────────────────────────┘  │
-│  │ │ CodeSpace (executable) │ │                                 │
-│  │ │ TrustedSpace (Sandbox 外)│                                 │
-│  │ │ LargeObjectSpace       │ │                                 │
-│  │ └────────────────────────┘ │                                 │
-│  └────────────────────────────┘                                 │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │              Sandbox (通常 1 TB の予約領域)              │    │
-│  │ ┌───────────┐ ┌─────────────────────────────────────┐   │    │
-│  │ │ Guard 32GB│ │ PtrCompr cage 4GB                   │   │    │
-│  │ │ (PROT_NONE)│ │  (NewSpace, OldSpace, CodeSpace,   │   │    │
-│  │ └───────────┘ │   RO 等が全部この中)                │   │    │
-│  │               │  ArrayBuffer の backing store       │   │    │
-│  │               └─────────────────────────────────────┘   │    │
-│  │ ┌───────────┐                                           │    │
-│  │ │ Guard 32GB│ Sandbox 末尾                              │    │
-│  │ └───────────┘                                           │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │           Sandbox の外側 (信頼できる領域)                │    │
-│  │  TrustedRange (Code, BytecodeArray, DeoptimizationData) │    │
-│  │  External Pointer Table (512MB)                         │    │
-│  │  Trusted Pointer Table  (64MB)                          │    │
-│  │  Code Pointer Table     (128MB、write-protected)        │    │
-│  │  JSDispatchTable        (leaptiering、write-protected)  │    │
-│  │  Embedded Builtins (ELF/PE の .text セクション)         │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
-</code></pre>
+<pre class="mermaid">
+flowchart TB
+  subgraph ISO["V8 Isolate"]
+    subgraph HEAP["Heap"]
+      NS["NewSpace（Scavenger）"]
+      OS["OldSpace（Mark-Compact）"]
+      CS["CodeSpace（executable）"]
+      TSS["TrustedSpace（Sandbox 外）"]
+      LO["LargeObjectSpace"]
+    end
+    ROH["Read-only Heap（複数 Isolate で共有 / Map・定数・builtin Code）"]
+    subgraph SB["Sandbox（通常 1 TB の予約領域）"]
+      G1["Guard 32GB（PROT_NONE）"]
+      CAGE["PtrCompr cage 4GB（NewSpace / OldSpace / CodeSpace / RO と ArrayBuffer backing store）"]
+      G2["Guard 32GB（末尾）"]
+    end
+    subgraph OUT["Sandbox の外側（信頼できる領域）"]
+      TR["TrustedRange（Code, BytecodeArray, DeoptimizationData）"]
+      EPT["External Pointer Table（512MB）"]
+      TPT["Trusted Pointer Table（64MB）"]
+      CPT["Code Pointer Table（128MB）"]
+      JDT["JSDispatchTable（leaptiering）"]
+      EB["Embedded Builtins（.text セクション）"]
+    end
+  end
+</pre>
 
 <h2>重要数値早見表</h2>
 
