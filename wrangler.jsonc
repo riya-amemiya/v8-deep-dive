@@ -9,7 +9,6 @@
     "mode": "smart"
   },
   "assets": {
-    // Astro builds the artifact into ./dist; serve that as Cloudflare static assets.
     "directory": "./dist"
   },
   "compatibility_flags": [
