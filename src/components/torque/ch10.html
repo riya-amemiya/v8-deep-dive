@@ -1,0 +1,28 @@
+<h2 id="chapter-10">第 10 章 デバッグツールと開発体験</h2>
+
+<h3 id="sec-10-1">10.1 format-torque.py</h3>
+
+<p><code>tools/torque/format-torque.py</code> は <code>.tq</code> のフォーマッタです。<code>-i &lt;filename&gt;</code> で in-place 整形します。</p>
+
+<h3 id="sec-10-2">10.2 VSCode 拡張</h3>
+
+<p><code>https://github.com/v8/vscode-torque</code> に Torque 専用の VSCode 拡張があり、Torque コンパイラの language server (<code>-language-server</code> モード) と連携して go-to-definition、completion、構文ハイライトを提供します。サーバ側の実装は <code>src/torque/ls/</code> 配下にあります。</p>
+
+<h3 id="sec-10-3">10.3 Kythe 連携</h3>
+
+<p><code>src/torque/kythe-data.cc/h</code> は Kythe (Google のソースインデックス) 用のシンボル情報出力です。<code>CompileTorqueForKythe</code> (<code class="file-ref">torque-compiler.cc:186-218</code>) 経由で呼ぶと、シンボル定義/参照グラフを Kythe フォーマットで吐き、コードナビゲーションシステムに登録できます。</p>
+
+<h3 id="sec-10-4">10.4 クラスデバッグリーダー</h3>
+
+<p><code>src/torque/class-debug-reader-generator.cc</code> は、ポストモーテム解析 (<code>gdb</code> でクラッシュダンプから heap を見る、Windows の <code>windbg</code> から V8 dump を読む) のための C++ ヘルパーを生成します。生成された <code>class-debug-readers.cc</code> には、各クラスのフィールドオフセットと型を runtime に持つコードが入り、live でないインスタンスでもオフセット計算でフィールドを取り出せます。</p>
+
+<h3 id="sec-10-5">10.5 Torque DWARF</h3>
+
+<p><code>-torque-dwarf</code> オプションを Torque コンパイラに渡すと、<code>.tq</code> のソース行情報が生成 C++ ファイルにマッピングされます。<code>v8_enable_torque_dwarf</code> (<code class="file-ref">BUILD.gn:65</code>) が is_debug &amp;&amp; is_linux で有効化され、<code>perf</code> などで Torque ソース行をプロファイル可能になります。</p>
+
+<h3 id="sec-10-6">10.6 ビルド検証フラグ</h3>
+
+<p><code>v8_verify_torque_generation_invariance</code> で 32bit / 64bit ビルドの生成差分を検証し、<code>v8_annotate_torque_ir</code> で IR コメントを生成出力に残します。後者は <code>--trace-turbo</code> で TurboFan の中間表現を見るときに、どの Torque 行から来た operation かを追跡できる重要なオプションです。</p>
+
+<hr>
+

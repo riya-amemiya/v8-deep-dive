@@ -1,0 +1,142 @@
+<section id="appendix">
+<h2>付録 — 全体の参照ファイル索引</h2>
+
+<p>本書で言及した V8 ソースの主要ファイル一覧 (絶対パス)。</p>
+
+<h3>オブジェクト表現関連</h3>
+
+<p><code class="file-ref">/home/user/v8/include/v8-internal.h</code> — kSmiTag, kHeapObjectTag, kPtrComprCage, kSandbox 等の主要定数</p>
+<p><code class="file-ref">/home/user/v8/include/v8-primitive.h</code> — String::kMaxLength</p>
+<p><code class="file-ref">/home/user/v8/include/v8-typed-array.h</code> — 各 TypedArray の kMaxLength</p>
+<p><code class="file-ref">/home/user/v8/include/v8-isolate.h</code> — Isolate::CreateParams</p>
+<p><code class="file-ref">/home/user/v8/src/common/globals.h</code> — kTaggedSize, AllocationSpace, kHoleNanInt64, GarbageCollectionReason</p>
+<p><code class="file-ref">/home/user/v8/src/objects/tagged.h</code>, <code class="file-ref">tagged-impl.h</code> — Tagged&lt;T&gt;, TaggedImpl, MakeWeak/MakeStrong</p>
+<p><code class="file-ref">/home/user/v8/src/objects/smi.h</code> — Smi クラス</p>
+<p><code class="file-ref">/home/user/v8/src/objects/heap-object.h</code> — HeapObject 基底クラス</p>
+<p><code class="file-ref">/home/user/v8/src/objects/map.h</code>, <code class="file-ref">map-inl.h</code>, <code class="file-ref">map.cc</code> — Map (Hidden Class)</p>
+<p><code class="file-ref">/home/user/v8/src/objects/map-word.h</code>, <code class="file-ref">map-word-inl.h</code> — Forwarding pointer</p>
+<p><code class="file-ref">/home/user/v8/src/objects/descriptor-array.h</code> — DescriptorArray</p>
+<p><code class="file-ref">/home/user/v8/src/objects/transitions.h</code>, <code class="file-ref">transitions.cc</code> — TransitionArray / TransitionsAccessor</p>
+<p><code class="file-ref">/home/user/v8/src/objects/property-array.h</code> — PropertyArray</p>
+<p><code class="file-ref">/home/user/v8/src/objects/property-details.h</code> — PropertyDetails、Representation</p>
+<p><code class="file-ref">/home/user/v8/src/objects/dictionary.h</code> — NameDictionary</p>
+<p><code class="file-ref">/home/user/v8/src/objects/swiss-name-dictionary.h</code> — SwissNameDictionary</p>
+<p><code class="file-ref">/home/user/v8/src/objects/heap-number.h</code> — HeapNumber</p>
+<p><code class="file-ref">/home/user/v8/src/objects/oddball.h</code> — Null/Undefined/Boolean</p>
+<p><code class="file-ref">/home/user/v8/src/objects/instance-type.h</code> — InstanceType 定義</p>
+<p><code class="file-ref">/home/user/v8/src/common/ptr-compr.h</code>, <code class="file-ref">ptr-compr-inl.h</code> — Pointer Compression</p>
+<p><code class="file-ref">/home/user/v8/src/objects/allocation-site.h</code> — AllocationSite/Boilerplate</p>
+
+<h3>Heap 関連</h3>
+
+<p><code class="file-ref">/home/user/v8/src/heap/heap.h</code>, <code class="file-ref">heap.cc</code> — Heap 全体</p>
+<p><code class="file-ref">/home/user/v8/src/heap/heap-layout.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/heap-allocator.h</code>, <code class="file-ref">heap-allocator-inl.h</code>, <code class="file-ref">heap-allocator.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/main-allocator.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/linear-allocation-area.h</code> — LAB</p>
+<p><code class="file-ref">/home/user/v8/src/heap/memory-allocator.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/memory-chunk.h</code>, <code class="file-ref">memory-chunk-layout.h</code>, <code class="file-ref">memory-chunk-constants.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/base-page.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/mutable-page.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/normal-page.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/large-page.h</code>, <code class="file-ref">large-spaces.h</code>, <code class="file-ref">large-spaces.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/new-spaces.h</code>, <code class="file-ref">new-spaces-inl.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/paged-spaces.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/read-only-spaces.h</code>, <code class="file-ref">read-only-heap.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/spaces.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/free-list.h</code>, <code class="file-ref">free-list.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/marking.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/slot-set.h</code>, <code class="file-ref">base/basic-slot-set.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/code-range.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/trusted-range.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/allocation-result.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/utils/allocation.h</code> — VirtualMemoryCage</p>
+<p><code class="file-ref">/home/user/v8/src/base/build_config.h</code> — kPageSizeBits</p>
+
+<h3>GC 関連</h3>
+
+<p><code class="file-ref">/home/user/v8/src/heap/scavenger.h</code>, <code class="file-ref">scavenger.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/mark-compact.h</code>, <code class="file-ref">mark-compact.cc</code>, <code class="file-ref">mark-compact-inl.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/minor-mark-sweep.h</code>, <code class="file-ref">minor-mark-sweep.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/marking-state.h</code>, <code class="file-ref">marking-state-inl.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/marking-inl.h</code>, <code class="file-ref">marking-visitor.h</code>, <code class="file-ref">marking-visitor-inl.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/marking-worklist.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/incremental-marking.h</code>, <code class="file-ref">incremental-marking.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/concurrent-marking.h</code>, <code class="file-ref">concurrent-marking.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/marking-barrier.h</code>, <code class="file-ref">marking-barrier-inl.h</code>, <code class="file-ref">marking-barrier.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/heap-write-barrier.h</code>, <code class="file-ref">heap-write-barrier-inl.h</code>, <code class="file-ref">heap-write-barrier.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/WRITE_BARRIER.md</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/remembered-set.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/sweeper.h</code>, <code class="file-ref">sweeper.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/evacuation-allocator.h</code>, <code class="file-ref">evacuation-verifier.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/conservative-stack-visitor.h</code>, <code class="file-ref">conservative-stack-visitor-inl.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/memory-reducer.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/heap-controller.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/cppgc-js/cpp-heap.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/cppgc-js/cross-heap-remembered-set.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/cppgc-js/unified-heap-marking-state.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/gc-tracer.h</code></p>
+
+<h3>IC / Compiler / Deoptimizer 関連</h3>
+
+<p><code class="file-ref">/home/user/v8/src/ic/ic.h</code>, <code class="file-ref">ic.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/ic/handler-configuration.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/ic/stub-cache.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/feedback-vector.h</code>, <code class="file-ref">feedback-vector.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/code.h</code>, <code class="file-ref">code-kind.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/bytecode-array.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/deoptimization-data.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/interpreter/interpreter.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/baseline/baseline-compiler.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/maglev/maglev-compiler.h</code>, <code class="file-ref">maglev-compilation-info.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/compiler/pipeline.cc</code> (TurboFan)</p>
+<p><code class="file-ref">/home/user/v8/src/deoptimizer/deoptimizer.h</code>, <code class="file-ref">translated-state.h</code>, <code class="file-ref">materialized-object-store.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/execution/tiering-manager.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/execution/isolate.h</code></p>
+
+<h3>Sandbox 関連</h3>
+
+<p><code class="file-ref">/home/user/v8/src/sandbox/sandbox.h</code>, <code class="file-ref">sandbox.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/external-pointer-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/external-entity-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/trusted-pointer-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/code-pointer-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/js-dispatch-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/indirect-pointer-tag.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/compactible-external-entity-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/sandboxed-pointer.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/README.md</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/trusted-pointer.h</code></p>
+
+<h3>Handle / Snapshot 関連</h3>
+
+<p><code class="file-ref">/home/user/v8/src/handles/handles.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/handles/global-handles.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/handles/local-handles.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/handles/persistent-handles.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/handles/traced-handles.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/snapshot/embedded/embedded-data.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/codegen/compiler.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/codegen/compilation-cache.h</code></p>
+
+<h3>String / Array 関連</h3>
+
+<p><code class="file-ref">/home/user/v8/src/objects/string.h</code>, <code class="file-ref">string-inl.h</code>, <code class="file-ref">string.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/name.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/strings/string-hasher.h</code>, <code class="file-ref">string-hasher-inl.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/fixed-array.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/elements-kind.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/elements.h</code>, <code class="file-ref">elements.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/js-array.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/js-objects.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/js-array-buffer.h</code>, <code class="file-ref">js-array-buffer-inl.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/backing-store.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/bigint.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/objects/js-function.h</code></p>
+
+<h3>Flags</h3>
+
+<p><code class="file-ref">/home/user/v8/src/flags/flag-definitions.h</code> — <code>--invocation-count-for-*</code>、<code>--max-valid-polymorphic-map-count</code> 等</p>
+
+</section>
+

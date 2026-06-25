@@ -1,0 +1,14 @@
+<h2 id="section-1">1. 全体像</h2>
+
+<p>V8 の <code>Array.prototype.flat</code> の実装本体は <code class="file-ref">src/builtins/array-flat.tq</code> 全 610 行に集約されています。エントリポイントは行 534 の <code>ArrayPrototypeFlat</code> JavaScript builtin で、内部は次の階層構造を取ります。</p>
+
+<p>最初に JS 側からの呼び出しは <code>ArrayPrototypeFlat</code> (行 534-577) に入り、<code>ToObject</code> と <code>GetLengthProperty</code> の正規化、<code>depth</code> 引数の整数化を済ませた後、行 565-567 で <code>TryFastFlat</code> (行 184-350) を試みます。<code>TryFastFlat</code> が失敗を意味する <code>SlowFastPath</code> ラベルに脱出した場合、行 569-573 の仕様忠実な経路、すなわち <code>ArraySpeciesCreate</code> で結果配列を確保したうえで <code>FlattenIntoArrayWithoutMapFn</code> (行 515-523) を呼ぶ経路に切り替わります。</p>
+
+<p><code>FlattenIntoArrayWithoutMapFn</code> は内部の dispatcher <code>FlattenIntoArray</code> (行 500-513) を経由し、まず <code>FlattenIntoArrayFast</code> (行 352-435) を試行、<code>Bailout(targetIndex, sourceIndex)</code> ラベルに到達した場合は残りの進捗を <code>FlattenIntoArraySlow</code> (行 438-498) に引き継ぐ 2 段構成になっています。slow path が入れ子配列を再帰下降する際にも、<code>FlattenIntoArrayWithoutMapFn</code> の builtin 呼び出しを介して 2 段構成が各層で再開されます。</p>
+
+<p><code>flatMap</code> は <code>ArrayPrototypeFlatMap</code> (行 580-609) として別エントリで定義され、<code>FlattenIntoArrayWithMapFn</code> (行 525-531) を経由しますが、内部の dispatcher は flat と同じ <code>FlattenIntoArray</code> を共有しており、コンパイル時の <code>hasMapper: constexpr bool</code> パラメータで mapper の有無を切り分けます。<code>flat</code> から呼ばれた経路では mapper 関連のコードがコンパイル時に削除されるため、機械語に mapper のオーバーヘッドは一切載りません。</p>
+
+<p>builtin の登録は <code class="file-ref">src/init/bootstrapper.cc</code> 行 2493-2496 で行われており、<code>SimpleInstallFunction(isolate_, proto, "flat", Builtin::kArrayPrototypeFlat, 0, kDontAdapt)</code> で <code>Array.prototype.flat</code> に length 0 として、続けて <code>flatMap</code> が length 1 として <code>Array.prototype</code> に置かれます。<code class="file-ref">src/debug/debug-evaluate.cc</code> 行 581-582 では <code>kArrayPrototypeFlat</code> と <code>kArrayPrototypeFlatMap</code> が副作用フリー builtin として登録されており、デバッガから副作用なしで呼び出せるよう許可されています。</p>
+
+<hr/>
+

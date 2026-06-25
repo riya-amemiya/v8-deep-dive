@@ -1,0 +1,57 @@
+<h2 id="section-8">8. FastJSArrayWitness と Cast 階層</h2>
+
+<h3 id="section-8-1">8.1 透過型階層</h3>
+
+<p><code class="file-ref">src/objects/js-array.tq</code> 行 116-138 で transient 型として宣言されています。</p>
+
+<pre><code class="language-torque">transient type FastJSArray extends JSArray;
+transient type FastJSArrayForRead extends JSArray;
+transient type FastJSArrayForCopy extends FastJSArray;
+transient type FastJSArrayForConcat extends FastJSArrayForCopy;
+</code></pre>
+
+<p>実際の判定ロジックは <code class="file-ref">src/builtins/cast.tq</code> 行 535-622 に集中しています。</p>
+
+<p><code>Cast&lt;FastJSArray&gt;</code> (cast.tq 行 556) は <code>IsForceSlowPath()</code> を確認した後、<code>Is&lt;JSArray&gt;(o)</code> であること、<code>IsFastElementsKind(elementsKind)</code> であること、prototype が initial array prototype であること、<code>IsNoElementsProtectorCellInvalid()</code> が偽であることを順に検証します。<code>IsForceSlowPath</code> は <code>--force-slow-path</code> フラグでデバッグ時に強制的にスローパスを取らせるためのバルブで、production では消えます。<code>IsFastElementsKind</code> は ElementsKind が <code>PACKED_SMI_ELEMENTS</code>、<code>HOLEY_SMI_ELEMENTS</code>、<code>PACKED_ELEMENTS</code>、<code>HOLEY_ELEMENTS</code>、<code>PACKED_DOUBLE_ELEMENTS</code>、<code>HOLEY_DOUBLE_ELEMENTS</code> のいずれかであることを意味します。prototype 検査は user-mutated された prototype だと getter が存在しうるので、initial prototype に限ることで proto chain の getter 不在を保証します。</p>
+
+<p><code>Cast&lt;FastJSArrayForRead&gt;</code> (cast.tq 行 583) は <code>IsForceSlowPath()</code> の検査がなく、elements kind は <code>LAST_ANY_NONEXTENSIBLE_ELEMENTS_KIND</code> までを許容します。これは frozen array や sealed array まで含むので、fast 読み込み可能だが書き込み禁止のケースまでカバーします。</p>
+
+<p><code>Cast&lt;FastJSArrayForCopy&gt;</code> (cast.tq 行 590) は、<code>IsArraySpeciesProtectorCellInvalid()</code> を加えた上で <code>Cast&lt;FastJSArray&gt;</code> を行います。ArraySpecies protector が無効化されているのは、誰かが <code>Array[Symbol.species]</code> を再定義したり、prototype の <code>constructor</code> をいじったケースです。これが intact のときは、<code>o</code> から新しい array を作る際に <code>o.constructor[@@species]</code> を見に行く必要がなく、デフォルトの <code>Array</code> を使えるという保証になります。</p>
+
+<p><code>FastJSArrayForConcat</code> (cast.tq 行 599) はさらに <code>IsConcatSpreadableProtector</code> も含めて守られています。flat はこの型は使わず、concat 専用です。これが flat と concat の根本的なアーキテクチャ差です。</p>
+
+<p>array-flat.tq の <code>TryFastFlat</code> 行 189 で <code>const fastO: FastJSArrayForCopy = Cast&lt;FastJSArrayForCopy&gt;(receiver) otherwise goto Bailout;</code> とレシーバだけを <code>FastJSArrayForCopy</code> にキャストし、再帰的に降りる子配列群は <code>Cast&lt;FastJSArrayForRead&gt;</code> (行 77 など) にしています。これはセマンティックの違いを正確に反映しています。レシーバについては、flat の戻り値が <code>Array</code> インスタンスであるという保証のために species protector が必要です。一方、子要素の配列群はフラット化された結果に値だけが取り出され、新しい array は作らないので、species は問題になりません。子配列は読むだけでよく、frozen な配列が来てもいいので、ForRead で十分です。</p>
+
+<h3 id="section-8-2">8.2 Witness パターン</h3>
+
+<p>Witness は transitioning な呼び出しを越えても fast path の前提条件を維持するための仕組みです。<code>FastJSArrayWitness</code> (<code class="file-ref">src/objects/js-array.tq</code> 行 230-345) と <code>FastJSArrayForReadWitness</code> (行 374-417) の二つがあります。</p>
+
+<p><code>FastJSArrayWitness</code> のフィールド構成は次の通りです。</p>
+
+<pre><code class="language-torque">const stable: JSArray;
+unstable: FastJSArray;
+const map: Map;
+const hasDoubles: bool;
+const hasSmis: bool;
+arrayIsPushable: bool;
+</code></pre>
+
+<p><code>stable</code> は非 transient な <code>JSArray</code> として保持される「いつでも読める」ハンドル、<code>unstable</code> は transient な <code>FastJSArray</code> 型で、transitioning な呼び出しの直後には型システムから消えます。transitioning な呼び出しの後に再び transient な前提を取り戻したいときは <code>Recheck()</code> (行 235-245) を呼びます。</p>
+
+<pre><code class="language-torque">macro Recheck(): void labels CastError {
+  if (this.stable.map != this.map) goto CastError;
+  if (IsNoElementsProtectorCellInvalid()) goto CastError;
+  this.unstable = %RawDownCast&lt;FastJSArray&gt;(this.stable);
+}
+</code></pre>
+
+<p>検証しているのは二つだけです。一つは map identity つまり最初に witness を作った時点の map と今の map が同じであること、もう一つは <code>NoElementsProtector</code> が依然として有効であることです。V8 の map モデルでは ElementsKind は map のフィールドに含まれており、elements pointer 自体は別フィールドですが、map が同じであれば「fast elements であり、initial array prototype を使い、hole の挙動も同一」という不変条件が引き継がれます。</p>
+
+<p>長さの直接チェックはここでは行わず、array-flat.tq の <code>if (index &gt;= fastOW.Get().length) goto Bailout;</code> のように呼び出し側で明示的に検査します。elements pointer は再取得されますが、map が同じである限り FixedArray か FixedDoubleArray かの選別は不変なので、<code>hasDoubles</code> を const として保持しても問題ありません。</p>
+
+<p><code>FastJSArrayForReadWitness</code> は書き込み能力のないバージョンで、<code>Push</code> や <code>ChangeLength</code> を持たず、<code>LoadElementNoHole</code> のみが提供されます。array-flat の hot loop で使われているのはほとんどこちらで、再帰的に subarray を読みに行くため複数の witness を併用する必要があり、frozen / sealed elements も含めて読めるだけで十分だからです。</p>
+
+<p>このパターンがなぜ副作用がある状況で安全かというと、mapper コールバックや getter は任意の JS を実行しうるため、map を変えたり、prototype に property を追加したり、length を切り詰めたりする可能性があります。witness の <code>Recheck()</code> は元の map と現在の map を一致させるだけで、もし JS が map を transition させていたら一致しなくなり <code>CastError</code> ラベルに飛び、呼び出し側はそこで bailout します。array-flat.tq の <code>FlattenIntoArrayFast</code> は行 372 で <code>fastOW.Recheck() otherwise goto Bailout(targetIndex, smiSourceIndex);</code> を Call の前に置き、その後行 375 で <code>if (smiSourceIndex &gt;= fastOW.Get().length) goto Bailout(...)</code> も別途確認しています。これは Recheck が length を再検証しないため別途必要な検査です。</p>
+
+<hr/>
+

@@ -1,0 +1,480 @@
+<h2 id="chapter-3">第 3 章 言語仕様 (構文要素の全網羅)</h2>
+
+<p>ここでは Torque の文法を、AST のノード分類 (<code class="file-ref">src/torque/ast.h:24-99</code> の <code>AST_*_NODE_KIND_LIST</code> マクロ) に沿って網羅します。</p>
+
+<h3 id="sec-3-1">3.1 ファイル構造と namespace</h3>
+
+<p><code>.tq</code> ファイルは declaration の連続です。<code class="file-ref">docs/torque/user-manual.md:100-131</code> のとおり、Torque は C++ に近い形で namespace をサポートし、ネスト可能で、同名 namespace は複数ファイルに分割しても reopen できます。</p>
+
+<pre><code class="language-torque">macro IsJSObject(o: Object): bool { … }  // default namespace
+
+namespace array {
+  macro IsJSArray(o: Object): bool { … }
+};
+
+namespace string {
+  macro TestVisibility() {
+    IsJsObject(o);          // OK
+    IsJSArray(o);           // ERROR: 名前空間が違う
+    array::IsJSArray(o);    // OK
+  }
+};
+
+namespace array {
+  macro EnsureWriteableFastElements(array: JSArray) { … }  // reopen
+};
+</code></pre>
+
+<p><code>#include 'src/builtins/...h'</code> のように C++ ヘッダを取り込む宣言は、Torque のシンボル解決ではなく「生成された C++ ファイルに <code>#include</code> 行を出す」だけの指示です。</p>
+
+<h3 id="sec-3-2">3.2 型システム全体像</h3>
+
+<p>Torque は強い型システムを持ち、AST 上では <code>AbstractTypeDeclaration</code>, <code>TypeAliasDeclaration</code>, <code>BitFieldStructDeclaration</code>, <code>ClassDeclaration</code>, <code>StructDeclaration</code> の 5 種類が型を導入します。実体の Type クラス階層は <code class="file-ref">src/torque/types.h:32-63</code> の <code>TypeBase::Kind</code> 列挙で <code>kTopType</code>、<code>kAbstractType</code>、<code>kBuiltinPointerType</code>、<code>kUnionType</code>、<code>kBitFieldStructType</code>、<code>kStructType</code>、<code>kClassType</code> の 7 種類に整理されます。</p>
+
+<h4 id="sec-3-2-1">3.2.1 Abstract 型</h4>
+
+<p>Abstract 型は C++ の <code>TNode&lt;T&gt;</code> および constexpr C++ 型 (<code>int32_t</code> など) と直接対応する型です。<code class="file-ref">src/builtins/base.tq:111-134</code> に基底型が並びます。</p>
+
+<pre><code class="language-torque">type int32 generates 'TNode&lt;Int32T&gt;' constexpr 'int32_t';
+type int31 extends int32 generates 'TNode&lt;Int32T&gt;' constexpr 'int31_t';
+type uint32 generates 'TNode&lt;Uint32T&gt;' constexpr 'uint32_t';
+type intptr generates 'TNode&lt;IntPtrT&gt;' constexpr 'intptr_t';
+type uintptr generates 'TNode&lt;UintPtrT&gt;' constexpr 'uintptr_t';
+type float32 generates 'TNode&lt;Float32T&gt;' constexpr 'float';
+type float64 generates 'TNode&lt;Float64T&gt;' constexpr 'double';
+type bool generates 'TNode&lt;BoolT&gt;' constexpr 'bool';
+type bint generates 'TNode&lt;BInt&gt;' constexpr 'BInt';
+</code></pre>
+
+<p><code>generates</code> は実行時 (CSA 側) で対応する <code>TNode&lt;...&gt;</code> テンプレート引数、<code>constexpr</code> はビルド時 (mksnapshot 実行時) に評価される対応する C++ 型を指定します。</p>
+
+<p>ベースとなる tagged 型ヒエラルキーは <code class="file-ref">src/builtins/base.tq:37-50</code> で次のように定義されています。</p>
+
+<pre><code class="language-torque">type Tagged generates 'TNode&lt;MaybeObject&gt;' constexpr 'MaybeObject';
+type StrongTagged extends Tagged generates 'TNode&lt;Object&gt;' constexpr 'Object';
+type Smi extends StrongTagged generates 'TNode&lt;Smi&gt;' constexpr 'Smi';
+type TaggedIndex extends StrongTagged generates 'TNode&lt;TaggedIndex&gt;' constexpr 'TaggedIndex';
+type WeakHeapObject extends Tagged generates 'TNode&lt;Weak&lt;HeapObject&gt;&gt;' constexpr 'Weak&lt;HeapObject&gt;';
+type Weak&lt;T : type extends HeapObject&gt; extends WeakHeapObject;
+
+type Object = Smi|HeapObject;
+type MaybeObject = Smi|HeapObject|WeakHeapObject;
+</code></pre>
+
+<p><code>PositiveSmi</code>、<code>Zero</code>、<code>TaggedZeroPattern</code> のようなさらに絞り込んだ型も <code class="file-ref">base.tq:53-58</code> に並びます。</p>
+
+<h4 id="sec-3-2-2">3.2.2 Union 型</h4>
+
+<p><code class="file-ref">src/builtins/base.tq:296-298</code> の <code>Number</code> などが典型例です。</p>
+
+<pre><code class="language-torque">type Number = Smi|HeapNumber;
+type Numeric = Number|BigInt;
+type JSPrimitive = Numeric|String|Symbol|Boolean|Null|Undefined;
+type JSAny = JSPrimitive|JSReceiver;
+</code></pre>
+
+<p>Union は tagged 型に限られます。理由は untagged の値はランタイムで弁別できないためで、tagged 値であれば Map ポインタや Smi ビットを参照することで実際の型を判別できるからです。Union は結合・可換則を満たし、<code>B</code> が <code>A</code> の subtype の場合 <code>A|B = A</code> に縮約されます。<code>TypeOracle</code> の <code>Deduplicator&lt;UnionType&gt;</code> で完全に一意化され、同じ要素集合からは常に同じインスタンスが返ります (<code class="file-ref">src/torque/type-oracle.h:145-158</code>)。</p>
+
+<h4 id="sec-3-2-3">3.2.3 Class 型</h4>
+
+<p>Class 型は GC heap 上のオブジェクトに対応します。<code class="file-ref">src/objects/js-array.tq:62-68</code> を引用します。</p>
+
+<pre><code class="language-torque">@cppObjectLayoutDefinition
+extern class JSArray extends JSObject {
+  macro IsEmpty(): bool {
+    return this.length == 0;
+  }
+  length: Number;
+}
+</code></pre>
+
+<p><code>extern class</code> は「C++ 側で <code>JSArray</code> クラスが手書きで定義されている」ことを意味し、Torque は同一レイアウトを認識した上で <code>kHeaderSize</code> や <code>kSize</code>、フィールドの accessor (<code>LoadJSArrayLength</code>、<code>StoreJSArrayLength</code>) を自動生成します。</p>
+
+<p><code>@cppObjectLayoutDefinition</code> は C++ 手書きクラスの定義と Torque 宣言が同一であることを <code>static_assert</code> で検証するアノテーションで、<code class="file-ref">docs/torque/user-manual.md:268-277</code> に生成される <code>TorqueGeneratedJSProxyAsserts</code> の例があります。</p>
+
+<pre><code class="language-cpp">class TorqueGeneratedJSProxyAsserts {
+  static constexpr int kTargetOffset = sizeof(JSReceiver);
+  static_assert(kTargetOffset == offsetof(JSProxy, target_));
+  static_assert(kSize == sizeof(JSProxy));
+};
+</code></pre>
+
+<p>実装は <code class="file-ref">src/torque/implementation-visitor.cc:4111-4167</code> の <code>CppClassGenerator::GenerateCppObjectLayoutDefinitionAsserts</code> にあります。各フィールドについて「Torque が計算した <code>kFooOffset</code> と、C++ 側の <code>offsetof(Foo, foo_)</code> が一致するか」を <code>static_assert</code> で突き合わせ、レイアウト不一致をビルド時に保証します。</p>
+
+<p>クラスフィールドの種別には次があります。</p>
+
+<p>通常フィールドは Map ヘッダ直後から並ぶ tagged または untagged の値。<code>const</code> を付けると Torque 上で書き込み禁止になり、たとえば配列の <code>length</code> のような「容易に書き換えると GC マーカーとレースする」値はこれで保護されます。<code>weak</code> を付けると <code>MaybeObject</code> 形式ではない「カスタム弱参照」フィールドとして扱われ、<code>kStartOfWeakFieldsOffset</code> などの定数が <code>BodyDescriptor</code> 生成に効きます。<code>Weak&lt;T&gt;</code> 型は <code>MaybeObject</code> 形式の弱参照を表します。</p>
+
+<p>indexed field (可変長配列) は <code>slots[slot_count]: CoverageInfoSlot;</code> のように <code>[length_field]</code> の形で指定し、その class のインスタンスはサイズ可変になります。Torque は indexed field の長さフィールドを必ず <code>const</code> であることを要求します (GC とのレース回避のため)。</p>
+
+<p><code>bitfield struct</code> フィールドは固定幅整数を内側で複数の意味あるビットへ分解した構造体で、<code class="file-ref">src/objects/map.tq:5-35</code> の <code>MapBitFields1</code> / <code>MapBitFields2</code> / <code>MapBitFields3</code> が典型例です。</p>
+
+<pre><code class="language-torque">bitfield struct MapBitFields2 extends uint8 {
+  new_target_is_base: bool: 1 bit;
+  is_immutable_prototype: bool: 1 bit;
+  elements_kind: ElementsKind: 6 bit;
+}
+</code></pre>
+
+<p><code>bit-fields.h</code> には対応する C++ Bit::kShift、Bit::kMask、Bit::kEncode マクロが生成されます。</p>
+
+<p>クラスアノテーション一覧は次のとおりです。</p>
+
+<p><code>@abstract</code> はインスタンス化されない基底クラスで、自身の Instance Type を持たず、サブクラスの Instance Type の範囲だけが意味を持ちます。</p>
+
+<p><code>@export</code> を付けると Torque-only クラスから C++ 用の具体クラスを生成します。<code>extern</code> と排他です。</p>
+
+<p><code>@hasSameInstanceTypeAsParent</code> は親と同じ Instance Type を共有するクラスで、フィールド名のリネームや Map の差し替えだけで親と区別したいときに使います。</p>
+
+<p><code>@highestInstanceTypeWithinParentClassRange</code> / <code>@lowestInstanceTypeWithinParentClassRange</code> / <code>@reserveBitsInInstanceType(N)</code> / <code>@apiExposedInstanceTypeValue(N)</code> は Instance Type の自動割当に対する制約を与えます。<code class="file-ref">src/objects/js-objects.tq:15</code> の <code>JSObject</code> は <code>0x421</code> を <code>@apiExposedInstanceTypeValue</code> で固定値として持ちます。</p>
+
+<p><code>@cppObjectLayoutDefinition</code> は C++ 側でレイアウトが書かれていることを示します。</p>
+
+<p><code>@doNotGenerateCppClass</code> は C++ クラスを生成しません (<code>HeapObject</code> のような特殊な基底クラスで使用)。</p>
+
+<p><code>@doNotGenerateCast</code> は <code>Cast&lt;T&gt;</code> の自動生成を抑止します。</p>
+
+<p><code>@generateBodyDescriptor</code> は GC 用の <code>BodyDescriptor</code> を Torque 側で生成します。</p>
+
+<p><code>@generateUniqueMap</code> / <code>@generateFactoryFunction</code> は Map と factory 関数を自動生成します。</p>
+
+<p><code>@cppAcquireLoad</code> / <code>@cppReleaseStore</code> はフィールド単位でメモリ順序を指定します。Torque 上では <code>FieldSynchronization</code> enum として <code>instructions.h</code> の <code>LoadReferenceInstruction</code> / <code>StoreReferenceInstruction</code> に伝搬し、CSA レイヤでは <code>LoadObjectField&lt;T&gt;(obj, offset, kSeqCstAccess)</code> のような形に落ちます。</p>
+
+<p><code>@cppRelaxedLoad</code> / <code>@cppRelaxedStore</code> は relaxed メモリ順序のアクセッサを生成します。Weak 参照や <code>MaybeObject</code> フィールドでよく使われます。</p>
+
+<p><code>@if(BuildFlag)</code> / <code>@ifnot(BuildFlag)</code> はビルド構成で条件分岐します。<code>V8_ENABLE_WEBASSEMBLY</code>、<code>V8_ENABLE_UNDEFINED_DOUBLE</code>、<code>TAGGED_SIZE_8_BYTES</code>、<code>V8_INTL_SUPPORT</code>、<code>V8_ENABLE_SANDBOX</code>、<code>DEBUG</code> などのフラグが使えます (<code class="file-ref">src/torque/torque-parser.cc:42-93</code> の <code>BuildFlags</code> クラスが正解)。</p>
+
+<p><code>@incrementUseCounter('v8::Isolate::kXxx')</code> は、ビルトインの先頭で <code>IncrementUseCounter</code> を自動的に呼び出すコードを生成します。<code class="file-ref">src/builtins/array-findlast.tq:77</code> の <code>@incrementUseCounter('v8::Isolate::kArrayFindLast')</code> のように、新機能の利用率測定に使われます。</p>
+
+<p><code>@useParentTypeChecker</code> は親型の type checker を流用します。<code class="file-ref">src/builtins/base.tq:170</code> の <code>@useParentTypeChecker type SmiTagged&lt;T&gt; extends Smi;</code> がその例です。</p>
+
+<h4 id="sec-3-2-4">3.2.4 Struct と Shape</h4>
+
+<p><code>struct</code> (大文字の <code>Struct</code> クラスとは別) は値型で、いくつかの値をまとめて引き回すための構造体です。</p>
+
+<pre><code class="language-torque">@export
+struct PromiseResolvingFunctions {
+  resolve: JSFunction;
+  reject: JSFunction;
+}
+</code></pre>
+
+<p><code>@export</code> を付けると <code>gen/torque-generated/csa-types.h</code> に <code>TorqueStructPromiseResolvingFunctions</code> という名前で公開されます。</p>
+
+<p>struct は class とは違い、generics 可能で、メソッドも持てます。<code class="file-ref">src/builtins/iterator.tq:8-16</code> の <code>IteratorRecord</code> は ECMA-262 仕様の Iterator Record をそのまま表現する典型例です。</p>
+
+<pre><code class="language-torque">@export
+struct IteratorRecord {
+  object: JSReceiver;  // [[Iterator]]
+  next: JSAny;         // [[NextMethod]]
+}
+</code></pre>
+
+<p><code>shape</code> は <code>JSObject</code> のサブタイプで、ある時点でのオブジェクトの in-object property レイアウトを表します。ただし shape は instance type を持たず、dictionary mode に遷移した瞬間に失効するため、寿命の短い型分析にしか使えません。</p>
+
+<h4 id="sec-3-2-5">3.2.5 Reference と Slice</h4>
+
+<p><code class="file-ref">src/builtins/torque-internal.tq:62-72</code> で次のように定義されています。</p>
+
+<pre><code class="language-torque">struct Reference&lt;T: type&gt; {
+  macro GCUnsafeRawPtr(): RawPtr&lt;T&gt; {
+    return %RawDownCast&lt;RawPtr&lt;T&gt;&gt;(
+        unsafe::GCUnsafeReferenceToRawPtr(this.object, this.offset));
+  }
+  const object: HeapObject|TaggedZeroPattern;
+  const offset: intptr;
+  unsafeMarker: Unsafe;
+}
+type ConstReference&lt;T: type&gt; extends Reference&lt;T&gt;;
+type MutableReference&lt;T: type&gt; extends ConstReference&lt;T&gt;;
+</code></pre>
+
+<p><code>&amp;T</code> と <code>const &amp;T</code> は <code>MutableReference&lt;T&gt;</code> / <code>ConstReference&lt;T&gt;</code> の型エイリアスです。Reference は heap 上の特定オフセットへの間接ポインタで、<code>*r</code> (dereference)、<code>r-&gt;field</code> (FieldAccess) で値の読み書きができます。</p>
+
+<p>Slice は同じ object/offset に加えて長さを持つもので、<code>MutableSlice&lt;T&gt;</code> と <code>ConstSlice&lt;T&gt;</code> があります。<code>&amp;o.x</code> と書くと、<code>x</code> が単フィールドなら Reference を、indexed field なら Slice を返すという便利な構文糖が用意されています。</p>
+
+<p><code>unsafeMarker: Unsafe</code> という構築不能なフィールドを持つことで、ユーザーコードからの直接構築を防いでいます。</p>
+
+<h4 id="sec-3-2-6">3.2.6 Bitfield struct</h4>
+
+<pre><code class="language-torque">bitfield struct DebuggerHints extends uint31 {
+  side_effect_state: int32: 2 bit;
+  debug_is_blackboxed: bool: 1 bit;
+  computed_debug_is_blackboxed: bool: 1 bit;
+  debugging_id: int32: 20 bit;
+}
+</code></pre>
+
+<p>Smi の中に bitfield を埋め込みたい場合は <code>SmiTagged&lt;T&gt;</code> という generic abstract type が使われます。Torque は読み書きを <code>LoadBitFieldInstruction</code> / <code>StoreBitFieldInstruction</code> に展開し、CSA レイヤでは <code>DecodeWord32&lt;BitFieldName&gt;</code> 相当に落ちます。</p>
+
+<h4 id="sec-3-2-7">3.2.7 Function pointer 型</h4>
+
+<pre><code class="language-torque">type CompareBuiltinFn = builtin(implicit context: Context)(Object, Object, Object) =&gt; Number;
+</code></pre>
+
+<p>Torque ビルトインへの関数ポインタは ABI が決まっているため安全に扱えます。匿名のまま使うこともでき、<code>type</code> 宣言で名前付けできます。</p>
+
+<h4 id="sec-3-2-8">3.2.8 特別な型</h4>
+
+<p><code>void</code> は値を返さない呼び出し用、<code>never</code> は到達不能 (例外でしか戻らない) な呼び出し用の戻り型です。<code>never</code> を戻る関数は呼び出し元の制御フローを到達不能扱いにします。</p>
+
+<h4 id="sec-3-2-9">3.2.9 Transient 型</h4>
+
+<p>V8 のヒープオブジェクトはランタイムでレイアウトが変わります。Torque はこの「ある条件下でのみ有効な型」を <code>transient type</code> として表現します (<code class="file-ref">src/objects/js-array.tq:118-138</code>)。</p>
+
+<pre><code class="language-torque">transient type FastJSArray extends JSArray;
+transient type FastJSArrayForRead extends JSArray;
+transient type FastJSArrayForCopy extends FastJSArray;
+transient type FastJSArrayForConcat extends FastJSArrayForCopy;
+transient type FastJSArrayWithNoCustomIteration extends FastJSArray;
+</code></pre>
+
+<p>これらの transient 型を引き回している最中に「prototype を変える可能性のある」操作 (JS への callback 呼び出し、<code>Call(...)</code> など) を行うと、その時点で transient 値は無効化されます。型システム上はこれを <code>transitioning</code> キーワードで表現します。</p>
+
+<pre><code class="language-torque">extern transitioning macro Call(implicit context: Context)(Callable, Object): Object;
+
+const fastArray: FastJSArray = Cast&lt;FastJSArray&gt;(array) otherwise Bailout;
+Call(f, Undefined);
+return fastArray;   // 型エラー: fastArray は Call 越しに無効化された
+</code></pre>
+
+<h4 id="sec-3-2-10">3.2.10 Enum</h4>
+
+<pre><code class="language-torque">extern enum LanguageMode extends Smi {
+  kStrict,
+  kSloppy
+}
+
+extern enum ElementsKind extends int32 {
+  NO_ELEMENTS,
+  PACKED_SMI_ELEMENTS,
+  HOLEY_SMI_ELEMENTS,
+  PACKED_ELEMENTS,
+  HOLEY_ELEMENTS,
+  PACKED_DOUBLE_ELEMENTS,
+  HOLEY_DOUBLE_ELEMENTS,
+  ...
+}
+</code></pre>
+
+<p><code>typeswitch</code> と相性が良く、各エントリは distinct な型を持つため、</p>
+
+<pre><code class="language-torque">typeswitch (language_mode) {
+  case (LanguageMode::kStrict): { … }
+  case (LanguageMode::kSloppy): { … }
+}
+</code></pre>
+
+<p>のように網羅性チェックも効きます。C++ 側で定義された enum に Torque 側でアクセスする場合は <code>extern enum ... { kFoo, ... }</code> の最後に <code>...</code> を付けて「open enum」として扱います。</p>
+
+<h3 id="sec-3-3">3.3 宣言可能な呼び出し (Callable)</h3>
+
+<p>Torque の呼び出し可能宣言は 4 種類あります。</p>
+
+<h4 id="sec-3-3-1">3.3.1 macro</h4>
+
+<p><code>macro</code> は呼び出しサイトでインライン展開される CSA コード片です。Torque で本体を書くか、<code>extern macro</code> で C++ 側 (<code>CodeStubAssembler</code> 派生クラスのメンバ) に実体を委ねるかを選べます。</p>
+
+<pre><code class="language-torque">extern macro BranchIfFastJSArrayForCopy(Object, Context): never
+    labels Taken, NotTaken;
+
+macro BranchIfNotFastJSArrayForCopy(implicit context: Context)(o: Object): never
+    labels Taken, NotTaken {
+  BranchIfFastJSArrayForCopy(o, context) otherwise NotTaken, Taken;
+}
+</code></pre>
+
+<p><code>labels</code> 付きの macro は通常 return に加えて「失敗パス」をラベルで返せます。</p>
+
+<h4 id="sec-3-3-2">3.3.2 builtin</h4>
+
+<p><code>builtin</code> は CSA レベルでも単一の関数として残り、呼び出しは call 命令経由になります。インライン展開されない代わり、コードサイズが減ります。<code>javascript builtin</code> または <code>transitioning javascript builtin</code> を付けると JavaScript からも呼べる ABI を持つ V8 builtin として登録されます。</p>
+
+<pre><code class="language-torque">transitioning javascript builtin ArrayPrototypeShift(
+    js-implicit context: NativeContext, receiver: JSAny)(...arguments): JSAny {
+  // ...
+}
+</code></pre>
+
+<p><code>tail</code> 修飾を付けると tail call 最適化が要求されます (<code>return tail Foo(...)</code>)。<code>builtin</code> はラベルを持てません (本体が独立した関数として生成され、ラベルに対応するジャンプを別関数間で渡せないため)。</p>
+
+<h4 id="sec-3-3-3">3.3.3 runtime</h4>
+
+<p><code>extern transitioning runtime Foo(Context, JSAny): JSAny;</code> のように宣言され、V8 の runtime function (<code>Runtime::kFoo</code>) を Torque から呼べるようにします。実装は必ず C++ 側です。慣習的に <code>namespace runtime { ... }</code> でくくられます。</p>
+
+<h4 id="sec-3-3-4">3.3.4 intrinsic</h4>
+
+<p><code>intrinsic</code> は Torque コンパイラ自身がコード生成を行う、ユーザー定義不可能な特殊呼び出しです。</p>
+
+<pre><code class="language-torque">// %RawObjectCast: Object のサブタイプへの無検査ダウンキャスト
+intrinsic %RawObjectCast&lt;A: type&gt;(o: Object): A;
+// %RawPointerCast: RawPtr のサブタイプへの無検査ダウンキャスト
+intrinsic %RawPointerCast&lt;A: type&gt;(p: RawPtr): A;
+// %RawConstexprCast: constexpr 値同士の static_cast 相当
+intrinsic %RawConstexprCast&lt;To: type, From: type&gt;(f: From): To;
+// %FromConstexpr: constexpr 値を非 constexpr 値に変換
+intrinsic %FromConstexpr&lt;To: type, From: type&gt;(b: From): To;
+// %Allocate: 未初期化オブジェクトの確保
+intrinsic %Allocate&lt;Class: type&gt;(size: intptr): Class;
+// %RawDownCast: 任意のダウンキャスト (危険)
+intrinsic %RawDownCast&lt;To: type, From: type&gt;(x: From): To;
+// メモリサイズ取得 (constexpr int31)
+intrinsic %SizeOf&lt;T: type&gt;(): constexpr int31;
+// 範囲内の最小/最大 InstanceType
+intrinsic %MinInstanceType&lt;T: type&gt;(): constexpr InstanceType;
+intrinsic %MaxInstanceType&lt;T: type&gt;(): constexpr InstanceType;
+// クラスに固有の Map 定数があるか確認、取得
+intrinsic %ClassHasMapConstant&lt;T: type&gt;(): constexpr bool;
+intrinsic %GetClassMapConstant&lt;T: type&gt;(): Map;
+// インデックス付きフィールドの長さ取得
+intrinsic %IndexedFieldLength&lt;T: type&gt;(o: T, f: constexpr string): intptr;
+// フィールドへの Slice 取得 (optional field 対応)
+intrinsic %FieldSlice&lt;T: type, TSlice: type&gt;(o: T, f: constexpr string): TSlice;
+// 遅延評価ハンドル生成
+intrinsic %MakeLazy&lt;T: type&gt;(getter: constexpr string): Lazy&lt;T&gt;;
+intrinsic %MakeLazy&lt;T: type, A1: type&gt;(getter: constexpr string, arg1: A1): Lazy&lt;T&gt;;
+</code></pre>
+
+<p>これらは Torque プログラマが日常的に直接書くことは少なく、<code>Cast&lt;T&gt;</code> などのユーザー向けマクロが内部で呼ぶ形になっています。</p>
+
+<h3 id="sec-3-4">3.4 制御フローとラベル</h3>
+
+<p>Torque の制御フロー文は <code class="file-ref">ast.h:53-67</code> の <code>AST_STATEMENT_NODE_KIND_LIST</code> で列挙されています。<code>BlockStatement</code>, <code>ExpressionStatement</code>, <code>IfStatement</code>, <code>WhileStatement</code>, <code>TypeswitchStatement</code>, <code>ForLoopStatement</code>, <code>BreakStatement</code>, <code>ContinueStatement</code>, <code>ReturnStatement</code>, <code>DebugStatement</code>, <code>AssertStatement</code>, <code>TailCallStatement</code>, <code>VarDeclarationStatement</code>, <code>GotoStatement</code> です。</p>
+
+<h4 id="sec-3-4-1">3.4.1 if / while / for</h4>
+
+<p>C-like な構文で書けます。<code>for</code> は <code>for (let i: Smi = 0; i &lt; len; i++) {...}</code> のように初期化・継続・更新を分けて書きます。</p>
+
+<p><code>if constexpr</code> は constexpr 評価専用の分岐構文で、<code>if constexpr (kind == ElementsKind::UINT8_ELEMENTS)</code> のように generic 関数や macro の中で型パラメータに基づく特殊化を実現するために使います。条件が constexpr であるため、生成コードに分岐が残らず一方の枝のみが残ります。</p>
+
+<h4 id="sec-3-4-2">3.4.2 typeswitch</h4>
+
+<p>union 型の値を case ごとに具体化する構造化された判定です。</p>
+
+<pre><code class="language-torque">typeswitch (o) {
+  case (s: Smi): { return s; }
+  case (n: HeapNumber): { return n; }
+  case (Object): { goto CastError; }
+}
+</code></pre>
+
+<p><code class="file-ref">src/builtins/cast.tq:185-198</code> の <code>Cast&lt;Number&gt;</code> がこの形です。コンパイラは各 case を <code>BranchIfSmi</code> / <code>IsHeapNumber</code> 等の判定に展開します。型システムは網羅性をチェックします。</p>
+
+<h4 id="sec-3-4-3">3.4.3 ラベルと try-label</h4>
+
+<p>Torque の例外的退出はラベルです。<code>macro Foo(): X labels Bailout, NoMore { ... goto Bailout; }</code> のように宣言し、呼び出し側では <code>try { ... } label Bailout { ... } label NoMore { ... }</code> で受け止めます。ラベル付き macro 呼び出しでは <code>Foo() otherwise Bailout, NoMore;</code> の構文でラベルを連携します。</p>
+
+<p><code class="file-ref">src/builtins/math.tq:7-9</code> の <code>ReduceToSmiOrFloat64</code> がきれいな例です。</p>
+
+<pre><code class="language-torque">transitioning macro ReduceToSmiOrFloat64(implicit context: Context)(x: JSAny): never
+    labels SmiResult(Smi), Float64Result(float64) {
+</code></pre>
+
+<p>戻り値型が <code>never</code> で、必ずいずれかのラベルへ抜けます。</p>
+
+<p>呼び出し側は</p>
+
+<pre><code class="language-torque">try {
+  ReduceToSmiOrFloat64(x) otherwise SmiResult, Float64Result;
+} label SmiResult(s: Smi) { ... }
+  label Float64Result(f: float64) { return Convert&lt;Number&gt;(Float64Abs(f)); }
+</code></pre>
+
+<p>代表例として、<code class="file-ref">src/builtins/array-foreach.tq:68-88</code> の <code>FastArrayForEach</code> は <code>Bailout(Smi)</code> ラベルを返し、呼び出し側は</p>
+
+<pre><code class="language-torque">try {
+  return FastArrayForEach(o, len, callbackfn, thisArg) otherwise Bailout;
+} label Bailout(kValue: Smi) deferred {
+  k = kValue;
+}
+</code></pre>
+
+<p>のように deferred ラベルで受け止めます。<code>deferred</code> は「コードキャッシュ的に寒い経路」というヒントで、生成 CSA で <code>CodeAssemblerLabel::kDeferred</code> フラグが付き、ターボファン側で実コードが関数末尾に配置されます。CSAGenerator では <code>(block-&gt;IsDeferred() ? "kDeferred" : "kNonDeferred")</code> で直接 CSA に伝わります (<code class="file-ref">csa-generator.cc:38-39</code>)。</p>
+
+<p><code>try/catch (e, message) { ... }</code> 構文 (例外オブジェクトと pending message を捕捉) もサポートされており、内部では <code>GetAndResetPendingMessage</code> と組み合わさって V8 の <code>PendingMessageObject</code> を吸い上げます。</p>
+
+<pre><code class="language-torque">try {
+  mappedValue = Call(context, mapfn, thisArg, nextValue, k);
+} catch (e, message) {
+  iterator::IteratorCloseOnException(iteratorRecord.object);
+  ReThrowWithMessage(context, e, message);
+}
+</code></pre>
+
+<h4 id="sec-3-4-4">3.4.4 unreachable と goto</h4>
+
+<p><code>unreachable</code> キーワードは到達不能を表明し、CSA 側で <code>Unreachable()</code> を呼びます (<code class="file-ref">csa-generator.cc:874-879</code>)。<code>goto Label[(args...)]</code> で任意のラベルへジャンプでき、ラベルパラメータの受け渡しもできます。</p>
+
+<h4 id="sec-3-4-5">3.4.5 assertion 系</h4>
+
+<p>Torque は <code>dcheck</code>、<code>check</code>、<code>sbxcheck</code>、<code>static_assert</code> の 4 種類の assertion を持ちます。<code>AssertStatement</code> の <code>AssertKind</code> enum (<code class="file-ref">ast.h:759</code>) で区別され、それぞれ DEBUG_BOOL 時のみ評価、常時評価、sandbox 用、コンパイル時 assertion の意味を持ちます。</p>
+
+<h3 id="sec-3-5">3.5 演算子オーバーロード</h3>
+
+<p><code>operator '&lt;演算子記号&gt;' macro Foo(...)</code> 構文で演算子を定義できます (<code class="file-ref">src/builtins/base.tq:977-1108</code> に大量の宣言があります)。</p>
+
+<pre><code class="language-torque">extern operator '==' macro WordEqual(RawPtr, RawPtr): bool;
+extern operator '+' macro RawPtrAdd(RawPtr, intptr): RawPtr;
+extern operator '&lt;' macro Int32LessThan(int32, int32): bool;
+extern operator '+' macro SmiAdd(Smi, Smi): Smi;
+extern operator '&lt;&lt;' macro WordShl(intptr, intptr): intptr;
+</code></pre>
+
+<p>C++ 演算子のように見える <code>==</code>, <code>!=</code>, <code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>&amp;</code>, <code>|</code>, <code>^</code>, <code>&lt;&lt;</code>, <code>&gt;&gt;</code> のほか、<code>'.field'</code>、<code>'[]'</code>、<code>'[]='</code> のような疑似演算子もオーバーロード可能です (<code class="file-ref">src/builtins/frames.tq:53-103</code>、<code class="file-ref">src/builtins/ic.tq:56-67</code>)。たとえば</p>
+
+<pre><code class="language-torque">operator '.function' macro LoadFunctionFromFrame(f: Frame): JSFunction { ... }
+operator '[]' macro LoadFeedbackVectorSlot(FeedbackVector, intptr): ...
+operator '.objects[]' macro LoadFixedArrayElement(FixedArray, intptr): Object;
+operator '.objects[]=' macro StoreFixedArrayElement(FixedArray, intptr, Smi): void;
+</code></pre>
+
+<p>のように、<code>frame.function</code> や <code>vec[index]</code>、<code>fixedArr.objects[i] = v</code> のようなアクセス記法を自由に提供できます。<code>'.foo'</code> 形式は「<code>x.foo</code>」というフィールドアクセスにマップされ、<code>'.foo[]'</code> は「<code>x.foo[i]</code>」というインデクス付きアクセスにマップされます。代入版は <code>.foo[]=</code> のように <code>=</code> を末尾に付けます。</p>
+
+<h3 id="sec-3-6">3.6 ジェネリクス</h3>
+
+<p><code>generic</code> 型パラメータは <code>&lt;T: type, U: type extends HeapObject&gt;</code> のように宣言できます。<code class="file-ref">src/objects/js-array.tq:152-185</code> の <code>LoadElementNoHole&lt;T&gt;</code> のように、型パラメータごとに別実装をオーバーロード可能です。</p>
+
+<pre><code class="language-torque">macro LoadElementNoHole&lt;T : type extends FixedArrayBase&gt;(
+    a: JSArray, index: Smi): JSAny labels IfHole;
+
+LoadElementNoHole&lt;FixedArray&gt;(implicit context: Context)(...)
+    labels IfHole { ... }
+
+LoadElementNoHole&lt;FixedDoubleArray&gt;(implicit context: Context)(...)
+    labels IfHole { ... }
+</code></pre>
+
+<p>これは「特殊化」と呼ばれ、Torque は型パラメータに応じて適切な実装を呼び出します。</p>
+
+<p>generic struct の例として <code class="file-ref">src/builtins/torque-internal.tq:99-173</code> の <code>Slice&lt;T: type, Reference: type&gt;</code> があります。これは二つのジェネリックパラメータを持ち、データ型と参照型を同時にパラメタライズすることで <code>MutableSlice&lt;T&gt;</code> (<code>Slice&lt;T, &amp;T&gt;</code>) と <code>ConstSlice&lt;T&gt;</code> (<code>Slice&lt;T, const &amp;T&gt;</code>) の両方を一つの struct で表現できます。</p>
+
+<h3 id="sec-3-7">3.7 implicit パラメータと js-implicit</h3>
+
+<p><code>(implicit context: Context)(explicit_arg: A): R</code> のように、明示的な引数の前に implicit パラメータを書けます。Scala の implicit に近い意味論で、呼び出し側は値を渡さずに呼べ、呼び出し元のスコープに同名の implicit 束縛があれば自動的にバインドされます。Torque はこの bind を完全な name 一致でしか許さないので、Scala より厳しい意味論です。</p>
+
+<p><code>javascript</code> linkage の builtin (JS から呼ばれる) では <code>js-implicit</code> を使い、JS 呼び出し規約の 4 引数 (context、receiver、target、newTarget) に対応する一部を選んで宣言できます。</p>
+
+<pre><code class="language-torque">transitioning javascript builtin ArrayPrototypeShift(
+    js-implicit context: NativeContext, receiver: JSAny)(...arguments): JSAny { ... }
+</code></pre>
+
+<p>ここで context が <code>NativeContext</code> 型であることに注意してください。これは builtin が常に native context を closures に埋め込んでいるためで、<code>LoadNativeContext</code> を別途呼ぶ必要がない最適化になります。</p>
+
+<h3 id="sec-3-8">3.8 constexpr</h3>
+
+<p>Torque の <code>constexpr</code> は C++ の <code>constexpr</code> と似て見えますが、評価のタイミングが違います (<code class="file-ref">docs/torque/user-manual.md:86-96</code>)。Torque の <code>constexpr</code> は「mksnapshot 実行時に評価される C++ 値」で、Torque コンパイラ自身が完全に計算するわけではなく、C++ コードとして書き出されたものを mksnapshot が走らせる時点で確定します。</p>
+
+<p><code>const</code> は「実行時定数 (再代入不可)」を意味し、<code>constexpr</code> は「コンパイル時定数 (mksnapshot 時定数)」を意味します。両者は別物です。</p>
+
+<pre><code class="language-torque">// const (実行時定数)
+const len: Smi = Convert&lt;Smi&gt;(arguments.length);
+
+// constexpr (mksnapshot 時定数)
+const kTaggedSize: constexpr int31 generates 'kTaggedSize';
+const kEnableUndefinedDouble: constexpr bool generates 'V8_UNDEFINED_DOUBLE_BOOL';
+</code></pre>
+
+<p>これにより <code>if constexpr (...) { ... } else { ... }</code> や <code>const x: constexpr int31 = ...;</code> で「ビルトインの一族」を自動生成できます。<code>if constexpr</code> は branch を生成せずコンパイル時に枝刈りされるため、特殊化された TypedArray ビルトインを多数生成する局面で威力を発揮します。</p>
+
+<hr>
+

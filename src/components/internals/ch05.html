@@ -1,0 +1,281 @@
+<h2 id="ch5">第5章 ElementsKind 完全列挙と遷移</h2>
+
+<h3 id="ch5-1">5.1 elements_ フィールドの意味</h3>
+
+<p>JSObject::elements_ は単純な <code>Tagged&lt;FixedArrayBase&gt;</code> です。しかしこの 1 フィールドの裏側に、すさまじく多くの実体型があります。<code>elements_</code> が指すものは Map の <code>elements_kind</code> フィールドに従って解釈されます。</p>
+
+<ul>
+<li>PACKED_SMI_ELEMENTS, HOLEY_SMI_ELEMENTS, PACKED_ELEMENTS, HOLEY_ELEMENTS のときは FixedArray を指す</li>
+<li>PACKED_DOUBLE_ELEMENTS, HOLEY_DOUBLE_ELEMENTS のときは FixedDoubleArray を指す</li>
+<li>DICTIONARY_ELEMENTS のときは NumberDictionary を指す</li>
+<li>FAST_SLOPPY_ARGUMENTS_ELEMENTS / SLOW_SLOPPY_ARGUMENTS_ELEMENTS のときは SloppyArgumentsElements を指す</li>
+<li>各 TypedArray の Elements のときは backing store の参照を表す ByteArray などを指す</li>
+</ul>
+
+<p>「elements_ をどう解釈するか」は完全に Map に書かれた elements_kind に依存します。</p>
+
+<h3 id="ch5-2">5.2 配列リテラル <code>[1, 2, 3]</code> の挙動</h3>
+
+<p>新しく <code>[1, 2, 3]</code> を作ると、ElementsKind は最も狭い <code>PACKED_SMI_ELEMENTS</code> から始まります。</p>
+
+<pre><code class="language-cpp">// src/objects/elements-kind.h:274
+inline ElementsKind GetInitialFastElementsKind() { return PACKED_SMI_ELEMENTS; }
+</code></pre>
+
+<p>backing store は 3 要素の FixedArray が確保され、各スロットには Smi で 1, 2, 3 が入ります。空配列でも 4 要素分の領域を先取りします。</p>
+
+<pre><code class="language-cpp">// src/objects/js-array.h:128-129
+// Number of element slots to pre-allocate for an empty array.
+static const int kPreallocatedArrayElements = 4;
+</code></pre>
+
+<p>これにより <code>push</code> を 4 回までは追加アロケーションなしで実行できます。</p>
+
+<h3 id="ch5-3">5.3 全 ElementsKind の正確な列挙</h3>
+
+<pre><code class="language-cpp">// src/objects/elements-kind.h:105-183 抜粋
+enum ElementsKind : uint8_t {
+  PACKED_SMI_ELEMENTS,      // 0
+  HOLEY_SMI_ELEMENTS,       // 1
+  PACKED_ELEMENTS,          // 2
+  HOLEY_ELEMENTS,           // 3
+  PACKED_DOUBLE_ELEMENTS,   // 4
+  HOLEY_DOUBLE_ELEMENTS,    // 5
+  PACKED_NONEXTENSIBLE_ELEMENTS,
+  HOLEY_NONEXTENSIBLE_ELEMENTS,
+  PACKED_SEALED_ELEMENTS,
+  HOLEY_SEALED_ELEMENTS,
+  PACKED_FROZEN_ELEMENTS,
+  HOLEY_FROZEN_ELEMENTS,
+  SHARED_ARRAY_ELEMENTS,
+  DICTIONARY_ELEMENTS,
+  FAST_SLOPPY_ARGUMENTS_ELEMENTS,
+  SLOW_SLOPPY_ARGUMENTS_ELEMENTS,
+  FAST_STRING_WRAPPER_ELEMENTS,
+  SLOW_STRING_WRAPPER_ELEMENTS,
+  // Fixed typed arrays
+  UINT8_ELEMENTS, INT8_ELEMENTS, UINT16_ELEMENTS, INT16_ELEMENTS,
+  UINT32_ELEMENTS, INT32_ELEMENTS, BIGUINT64_ELEMENTS, BIGINT64_ELEMENTS,
+  UINT8_CLAMPED_ELEMENTS, FLOAT32_ELEMENTS, FLOAT64_ELEMENTS, FLOAT16_ELEMENTS,
+  // RAB/GSAB typed arrays
+  RAB_GSAB_UINT8_ELEMENTS, ...,
+  WASM_ARRAY_ELEMENTS,
+  NO_ELEMENTS,
+};
+</code></pre>
+
+<p><code>kElementsKindBits = 6</code> なので、Map のビットフィールドに 6 ビットで詰め込めます。</p>
+
+<pre><code class="language-cpp">// src/objects/elements-kind.h:193-195
+constexpr int kElementsKindBits = 6;
+static_assert((1 &lt;&lt; kElementsKindBits) &gt; LAST_ELEMENTS_KIND);
+static_assert((1 &lt;&lt; (kElementsKindBits - 1)) &lt;= LAST_ELEMENTS_KIND);
+</code></pre>
+
+<p>PACKED と HOLEY の対が連番で配置されていることに注目してください。<code>HOLEY_SMI_ELEMENTS - PACKED_SMI_ELEMENTS = 1</code> であり、これが <code>kFastElementsKindPackedToHoley</code> として定義されています。</p>
+
+<pre><code class="language-cpp">// src/objects/elements-kind.h:189-191
+constexpr int kFastElementsKindPackedToHoley =
+    HOLEY_SMI_ELEMENTS - PACKED_SMI_ELEMENTS;
+</code></pre>
+
+<p>この設計のおかげで <code>IsHoleyElementsKind</code> は単純な bit 検査になります。</p>
+
+<pre><code class="language-cpp">// src/objects/elements-kind.h:435-437
+constexpr bool IsHoleyElementsKind(ElementsKind kind) {
+  return kind % 2 == 1 &amp;&amp; kind &lt;= HOLEY_DOUBLE_ELEMENTS;
+}
+</code></pre>
+
+<p>最下位ビットが 1 かを見るだけで packed か holey か判定できます。生成コードでは <code>test al, 1</code> の 1 命令です。</p>
+
+<h3 id="ch5-4">5.4 遷移の単方向性</h3>
+
+<p>ElementsKind 遷移は不可逆 (単方向) です。一度 PACKED_ELEMENTS まで広がったら、二度と PACKED_SMI_ELEMENTS には戻れません。</p>
+
+<pre><code class="language-cpp">// src/objects/elements-kind.cc:184-207
+bool IsMoreGeneralElementsKindTransition(ElementsKind from_kind,
+                                         ElementsKind to_kind) {
+  if (!IsFastElementsKind(from_kind)) return false;
+  if (!IsFastTransitionTarget(to_kind)) return false;
+  switch (from_kind) {
+    case PACKED_SMI_ELEMENTS:
+      return to_kind != PACKED_SMI_ELEMENTS;
+    case HOLEY_SMI_ELEMENTS:
+      return to_kind != PACKED_SMI_ELEMENTS &amp;&amp; to_kind != HOLEY_SMI_ELEMENTS;
+    case PACKED_DOUBLE_ELEMENTS:
+      return to_kind != PACKED_SMI_ELEMENTS &amp;&amp; to_kind != HOLEY_SMI_ELEMENTS &amp;&amp;
+             to_kind != PACKED_DOUBLE_ELEMENTS;
+    case HOLEY_DOUBLE_ELEMENTS:
+      return to_kind == PACKED_ELEMENTS || to_kind == HOLEY_ELEMENTS;
+    case PACKED_ELEMENTS:
+      return to_kind == HOLEY_ELEMENTS;
+    case HOLEY_ELEMENTS:
+      return false;
+    default:
+      return false;
+  }
+}
+</code></pre>
+
+<p>これを図示すると以下のようになります。</p>
+
+<pre><code class="language-text">                      ElementsKind 遷移グラフ (Fast Elements)
+
+         PACKED_SMI ───────► HOLEY_SMI
+              │                  │
+              │                  │
+              ▼                  ▼
+       PACKED_DOUBLE ──────► HOLEY_DOUBLE
+              │                  │
+              │                  │
+              ▼                  ▼
+         PACKED ──────────────► HOLEY ────────► DICTIONARY
+                                                (terminal)
+</code></pre>
+
+<p>矢印はすべて一方向です。HOLEY からは PACKED に戻れず、DOUBLE からは SMI に戻れず、終端は HOLEY_ELEMENTS または DICTIONARY_ELEMENTS のみです。</p>
+
+<p>シーケンス順序は <code>kFastElementsKindSequence</code> 配列で定義されています。</p>
+
+<pre><code class="language-cpp">// src/objects/elements-kind.cc:143-158
+const ElementsKind kFastElementsKindSequence[kFastElementsKindCount] = {
+    PACKED_SMI_ELEMENTS,     // 0
+    HOLEY_SMI_ELEMENTS,      // 1
+    PACKED_DOUBLE_ELEMENTS,  // 2
+    HOLEY_DOUBLE_ELEMENTS,   // 3
+    PACKED_ELEMENTS,         // 4
+    HOLEY_ELEMENTS           // 5
+};
+</code></pre>
+
+<h3 id="ch5-5">5.5 holey 化のトリガと the_hole_value</h3>
+
+<p>PACKED から HOLEY に遷移するのは、配列中に穴が生まれる可能性のある操作が行われた場合です。<code>arr[100] = x</code> のように length を超えるインデックスへの書き込み、<code>delete arr[5]</code>、<code>arr.length = 100</code> での length 拡大、setter (getter/setter プロパティ) の定義などです。</p>
+
+<p>穴は具体的に <code>the_hole_value</code> という特殊な HeapObject で表されます (FixedArray の場合)、または <code>kHoleNanInt64</code> という特殊な signaling NaN のビットパターン (FixedDoubleArray の場合) で表されます。</p>
+
+<pre><code class="language-cpp">// src/objects/js-objects-inl.h:180-186
+Tagged&lt;Object&gt; the_hole = GetReadOnlyRoots().the_hole_value();
+TSlot end = elements + count;
+for (; elements &lt; end; ++elements) {
+  Tagged&lt;Object&gt; current = *elements;
+  if (current == the_hole) {
+    is_holey = true;
+    target_kind = GetHoleyElementsKind(target_kind);
+</code></pre>
+
+<p>穴の判定が大事なのは、HOLEY_ELEMENTS の load はプロトタイプチェーンへのフォールスルーが必要になるからです。例えば <code>arr[3]</code> が穴なら、JavaScript の意味論では <code>Array.prototype[3]</code> を見に行く必要があるためです。これが速度のロスをもたらすため、TurboFan は配列が PACKED であることを保証できれば穴チェックを省略します。</p>
+
+<h3 id="ch5-6">5.6 TypedArray の Elements Kinds</h3>
+
+<p>TypedArray の Elements は基本的に「backing store の view」です。</p>
+
+<pre><code class="language-cpp">// src/objects/elements-kind.h:213-247 抜粋
+case UINT8_ELEMENTS:
+case INT8_ELEMENTS:
+case UINT8_CLAMPED_ELEMENTS:
+  return 0;  // 1 byte
+case UINT16_ELEMENTS:
+case INT16_ELEMENTS:
+case FLOAT16_ELEMENTS:
+  return 1;  // 2 bytes
+case UINT32_ELEMENTS:
+case INT32_ELEMENTS:
+case FLOAT32_ELEMENTS:
+  return 2;  // 4 bytes
+case PACKED_DOUBLE_ELEMENTS:
+case HOLEY_DOUBLE_ELEMENTS:
+case FLOAT64_ELEMENTS:
+case BIGINT64_ELEMENTS:
+case BIGUINT64_ELEMENTS:
+  return 3;  // 8 bytes
+</code></pre>
+
+<p>各 ElementsKind は要素のバイトサイズを返す shift 値を持ちます。<code>obj[i]</code> を計算するときは <code>base + (i &lt;&lt; shift)</code> で行えるため、極めて高速です。</p>
+
+<p>RAB/GSAB バリアントは ResizableArrayBuffer (RAB) / GrowableSharedArrayBuffer (GSAB) を裏付けとする TypedArray の Elements です。普通の TypedArray と異なり、長さが変動するため境界チェックが追加で必要です。それを ElementsKind の段階で区別しています。</p>
+
+<h3 id="ch5-7">5.7 FixedArrayBase の共通ヘッダ</h3>
+
+<pre><code class="language-cpp">// src/objects/fixed-array.h:445-475
+class FixedArrayBase : public HeapObject {
+ public:
+  static constexpr int kLengthOffset = sizeof(HeapObject);
+#if TAGGED_SIZE_8_BYTES
+  static constexpr uint32_t kPaddingOffset = kLengthOffset + kUInt32Size;
+  static constexpr uint32_t kHeaderSize = kPaddingOffset + kUInt32Size;
+#else
+  static constexpr uint32_t kHeaderSize = kLengthOffset + kUInt32Size;
+#endif
+  static constexpr uint32_t kMaxLength = FixedArray::kMaxCapacity;
+  ...
+ public:
+  uint32_t length_;
+#if TAGGED_SIZE_8_BYTES
+  uint32_t optional_padding_;
+#endif
+} V8_OBJECT_END;
+</code></pre>
+
+<p>注目点は length が <code>uint32_t</code> であり、Smi ではないことです。これは FixedArray の length が GC ではトラバースされない、純粋なメタデータだからです。ポインタ圧縮を使わない 64 ビットビルドでは、length 後にパディング 4 バイトが入って 8 バイト境界に揃えられます。</p>
+
+<pre><code class="language-text">                FixedArray layout (圧縮ポインタ 64bit)
+                ┌──────────────────────────────────┐
+   offset 0     │ map_ (Tagged&lt;Map&gt;)        (4B)   │
+                ├──────────────────────────────────┤
+   offset 4     │ length_ (uint32_t)        (4B)   │
+                ├──────────────────────────────────┤
+   offset 8     │ objects[0] (Tagged)       (4B)   │
+                ├──────────────────────────────────┤
+   offset 12    │ objects[1]                (4B)   │
+                ├──────────────────────────────────┤
+                │ ...                              │
+                └──────────────────────────────────┘
+</code></pre>
+
+<h3 id="ch5-8">5.8 FixedDoubleArray の構造</h3>
+
+<pre><code class="language-cpp">// src/objects/fixed-array.h:577-630 抜粋
+V8_OBJECT class FixedDoubleArray
+    : public PrimitiveArrayBase&lt;FixedDoubleArray, double&gt; {
+  using Super = PrimitiveArrayBase&lt;FixedDoubleArray, double&gt;;
+ public:
+  static constexpr RootIndex kMapRootIndex = RootIndex::kFixedDoubleArrayMap;
+  using ElementMemberT = UnalignedDoubleMember;
+ public:
+  uint32_t length_;
+#if TAGGED_SIZE_8_BYTES
+  uint32_t optional_padding_;
+#endif
+  FLEXIBLE_ARRAY_MEMBER(ElementMemberT, values);
+} V8_OBJECT_END;
+</code></pre>
+
+<p>FixedDoubleArray の Element は <code>UnalignedDoubleMember</code>、つまりアラインメントが保証されない 8 バイト double です。ポインタ圧縮環境では Tagged は 4 バイトですから、ヘッダが 4 + 4 = 8 バイトでも、Object pointer をフィールドの間に挟むと double が 4 バイト境界に来てしまうことがあります。x86-64 系では unaligned double load が許可されているので、こうしたレイアウトでも問題ありません。</p>
+
+<h3 id="ch5-9">5.9 PropertyAccess の実装 - LookupIterator</h3>
+
+<p>State 機械としての LookupIterator の状態は以下のとおりです。</p>
+
+<pre><code class="language-cpp">// src/objects/lookup.h:70-118
+enum State {
+  NOT_FOUND,
+  STRING_LOOKUP_START_OBJECT,
+  TYPED_ARRAY_INDEX_NOT_FOUND,
+  ACCESS_CHECK,
+  INTERCEPTOR,
+  JSPROXY,
+  ACCESSOR,
+  DATA,
+  WASM_OBJECT,
+  MODULE_NAMESPACE,
+  TRANSITION,
+  BEFORE_PROPERTY = INTERCEPTOR
+};
+</code></pre>
+
+<p>LookupIterator は、与えられた receiver と name に対し、プロトタイプチェーンを 1 段ずつ降りながら state を更新していくステートマシンです。NOT_FOUND からスタートし、INTERCEPTOR (API interceptor が刺さっているか)、ACCESS_CHECK (アクセス権検査)、JSPROXY (Proxy オブジェクト)、ACCESSOR (getter/setter)、DATA (普通のデータプロパティ) などの状態を経て、最終的に見つけたか見つからなかったかに落ち着きます。</p>
+
+<p>DATA は通常のデータプロパティで、値は in-object slot、PropertyArray slot、Dictionary entry、Elements のいずれかに存在します。<code>TYPED_ARRAY_INDEX_NOT_FOUND</code> は TypedArray に整数インデックスでアクセスして範囲外だった場合、prototype chain を辿らずに即座に undefined を返すという特殊な動作 (ES2015 仕様) を表します。</p>
+

@@ -1,0 +1,10 @@
+<h2 id="section-12">12. flat と concat の意味論的差異</h2>
+
+<p>flat / flatMap が <code>@@isConcatSpreadable</code> を使わず <code>IsArray</code> で配列性を判定する点は重要です。これに対し <code>Array.prototype.concat</code> は仕様で <code>IsConcatSpreadable(E)</code> を呼び、<code>@@isConcatSpreadable</code> が true / undefined (デフォルトで IsArray が true) のとき配列扱いします。さらに flat は「配列要素のみフラット化、それ以外は単独要素として書く」のに対し、concat は配列引数を unpacking し非配列引数は単独要素として連結します。穴の扱いも対照的で、flat と flatMap は穴をスキップして compact しますが、concat は spread される配列内の穴を保持します (HasProperty を経由しないため)。</p>
+
+<p>具体例で示します。<code>[1, , 3].flat()</code> は <code>[1, 3]</code> を返し穴が消えます。一方 <code>[].concat([1, , 3])</code> は <code>[1, undefined, 3]</code> ではなく <code>[1, empty, 3]</code> (穴を保持した配列) を返し、<code>HasProperty</code> 経由でない素のスロットコピーが行われます。Array-like の扱いも違い、flat は <code>IsArray</code> で false を返した array-like (例 <code>{length: 2, 0: 'a', 1: 'b'}</code>) は要素として書きますが、concat は <code>@@isConcatSpreadable: true</code> を付ければ array-like も unpacking する自由を与えます。</p>
+
+<p>V8 の Fast パス実装側でも、flat の <code>FastJSArrayForCopy</code> (<code class="file-ref">src/objects/js-array.tq</code> 行 126) は <code>ArraySpeciesProtector</code> のみで守られていますが、concat の <code>FastJSArrayForConcat</code> (行 130) は加えて <code>IsConcatSpreadableProtector</code> まで含めて守られ、より厳しい型で要素アクセスを最適化します。<code class="file-ref">src/builtins/array-concat.tq</code> 行 16、行 27-28 がその使用例です。これが両者のアーキテクチャ差の根本です。</p>
+
+<hr/>
+

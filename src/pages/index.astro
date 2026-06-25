@@ -1,0 +1,39 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import Sidebar from "../components/matter/Sidebar.astro";
+import Hero from "../components/matter/Hero.astro";
+import Prologue from "../components/matter/Prologue.astro";
+import Epilogue from "../components/matter/Epilogue.astro";
+import Footer from "../components/matter/Footer.astro";
+import Internals from "../components/internals/Internals.astro";
+import Memory from "../components/memory/Memory.astro";
+import Torque from "../components/torque/Torque.astro";
+import Arrays from "../components/arrays/Arrays.astro";
+import Flat from "../components/flat/Flat.astro";
+import bridge1 from "../components/bridges/bridge1.html?raw";
+import bridge2 from "../components/bridges/bridge2.html?raw";
+import bridge3 from "../components/bridges/bridge3.html?raw";
+import bridge4 from "../components/bridges/bridge4.html?raw";
+import bridge5 from "../components/bridges/bridge5.html?raw";
+---
+<BaseLayout>
+<div class="layout">
+<Sidebar />
+<main class="main" id="top">
+<Hero />
+<Prologue />
+<Fragment set:html={bridge1} />
+<Internals />
+<Fragment set:html={bridge2} />
+<Memory />
+<Fragment set:html={bridge3} />
+<Torque />
+<Fragment set:html={bridge4} />
+<Arrays />
+<Fragment set:html={bridge5} />
+<Flat />
+<Epilogue />
+<Footer />
+</main>
+</div>
+</BaseLayout>

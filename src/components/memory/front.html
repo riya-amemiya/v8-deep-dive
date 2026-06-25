@@ -1,0 +1,88 @@
+<h1>V8 メモリ管理 完全解説書</h1>
+
+<nav class="toc">
+<h2>目次</h2>
+<ol>
+<li><a href="#intro">序論と全体俯瞰</a></li>
+<li><a href="#part1">第 I 部 オブジェクト表現とタグ付きポインタ</a>
+  <ol>
+    <li><a href="#p1-1">Tagged Pointer の完全な解剖</a></li>
+    <li><a href="#p1-2">SMI エンコーディング - 3 パターン詳説</a></li>
+    <li><a href="#p1-3">HeapObject レイアウト</a></li>
+    <li><a href="#p1-4">Pointer Compression 詳細</a></li>
+    <li><a href="#p1-5">Map (Hidden Class / Shape) の構造</a></li>
+    <li><a href="#p1-6">プロパティストレージのメモリレイアウト</a></li>
+    <li><a href="#p1-7">その他の重要なオブジェクト</a></li>
+    <li><a href="#p1-8">まとめ: V8 オブジェクト表現の設計原則</a></li>
+  </ol>
+</li>
+<li><a href="#part2">第 II 部 ヒープ構造とメモリ空間 (Space)</a>
+  <ol>
+    <li><a href="#p2-1">Heap 全体構造</a></li>
+    <li><a href="#p2-2">Page / MemoryChunk</a></li>
+    <li><a href="#p2-3">Young Generation (NewSpace)</a></li>
+    <li><a href="#p2-4">Old Generation</a></li>
+    <li><a href="#p2-5">Read-Only Space</a></li>
+    <li><a href="#p2-6">Large Object Space</a></li>
+    <li><a href="#p2-7">Allocation メカニズム</a></li>
+    <li><a href="#p2-8">Code Range / VirtualMemory Cage</a></li>
+    <li><a href="#p2-9">Sandbox (V8 Sandbox)</a></li>
+    <li><a href="#p2-10">補足 主要な数値のまとめ</a></li>
+    <li><a href="#p2-11">主要参照ファイル一覧</a></li>
+    <li><a href="#p2-12">まとめと観察</a></li>
+  </ol>
+</li>
+<li><a href="#part3">第 III 部 ガベージコレクション</a>
+  <ol>
+    <li><a href="#p3-1">アーキテクチャ全景</a></li>
+    <li><a href="#p3-2">Scavenger (Minor GC, Cheney 流コピー収集)</a></li>
+    <li><a href="#p3-3">Major GC (Mark-Compact)</a></li>
+    <li><a href="#p3-4">Minor Mark-Sweep / Sticky Mark Bits</a></li>
+    <li><a href="#p3-5">Write Barrier</a></li>
+    <li><a href="#p3-6">Remembered Set / Slot Set のデータ構造</a></li>
+    <li><a href="#p3-7">スタックスキャン (Conservative vs Precise)</a></li>
+    <li><a href="#p3-8">GC Pause: Atomic / Idle / Concurrent / Parallel</a></li>
+    <li><a href="#p3-9">CppGC との統合 (Unified Heap)</a></li>
+    <li><a href="#p3-10">ヒューリスティクス / トリガー / コントローラ</a></li>
+    <li><a href="#p3-11">すべてをつなぐ: 一回の Major GC の擬似コード</a></li>
+    <li><a href="#p3-12">重要ファイルの一覧</a></li>
+    <li><a href="#p3-13">補足: MarkingVisitorBase と各オブジェクト型の特別扱い</a></li>
+    <li><a href="#p3-14">補足: Object Promotion と Page Promotion</a></li>
+    <li><a href="#p3-15">補足: 保守的と精密の選び方</a></li>
+    <li><a href="#p3-16">まとめ</a></li>
+  </ol>
+</li>
+<li><a href="#part4">第 IV 部 最適化機構 (IC, JIT, Sandbox)</a>
+  <ol>
+    <li><a href="#p4-1">Inline Cache (IC)</a></li>
+    <li><a href="#p4-2">Hidden Class (Map) と Transition</a></li>
+    <li><a href="#p4-3">コンパイラ階層とコードメモリ</a></li>
+    <li><a href="#p4-4">Deoptimization</a></li>
+    <li><a href="#p4-5">V8 Sandbox</a></li>
+    <li><a href="#p4-6">Embedded Builtins / Snapshot</a></li>
+    <li><a href="#p4-7">Code Caching / Off-thread Compile</a></li>
+    <li><a href="#p4-8">Embedder API のメモリ管理</a></li>
+    <li><a href="#p4-9">Persistent / Global Handle</a></li>
+    <li><a href="#p4-10">補足: Heap Spaces 概観</a></li>
+    <li><a href="#p4-11">参照ファイル一覧</a></li>
+  </ol>
+</li>
+<li><a href="#part5">第 V 部 オブジェクトのメモリ表現 (String, Array, TypedArray, HeapNumber, BigInt)</a>
+  <ol>
+    <li><a href="#p5-0">全 HeapObject 共通の前提 - Tagged Pointer と Map</a></li>
+    <li><a href="#p5-1">String の完全な分類</a></li>
+    <li><a href="#p5-2">Array の内部構造</a></li>
+    <li><a href="#p5-3">JSObject Layout</a></li>
+    <li><a href="#p5-4">ArrayBuffer / TypedArray</a></li>
+    <li><a href="#p5-5">HeapNumber と Mutable Double Field</a></li>
+    <li><a href="#p5-6">BigInt</a></li>
+    <li><a href="#p5-7">JSReceiver, JSObject, JSFunction</a></li>
+    <li><a href="#p5-8">Hash の格納</a></li>
+    <li><a href="#p5-9">まとめ - 状態遷移と最適化の俯瞰</a></li>
+  </ol>
+</li>
+<li><a href="#appendix">付録 - 全体の参照ファイル索引</a></li>
+<li><a href="#conclusion">結語</a></li>
+</ol>
+</nav>
+

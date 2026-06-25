@@ -1,0 +1,1050 @@
+<section id="part2">
+<h2>第 II 部 ヒープ構造とメモリ空間 (Space)</h2>
+
+<h3>V8 ヒープ構造とメモリ空間 (Space) ── 超詳細技術解説</h3>
+
+<p>本稿は <code>/home/user/v8</code> を実地に読み解いて得た、V8 の Heap 設計に関する濃密な技術レポートです。
+本稿の主たる目的は「登壇資料」の参考文献となることを念頭に置き、可能な限り具体的なファイル参照
+(<code>src/...:行番号</code>) と定数値、ビットレイアウト、コード抜粋を残すことです。</p>
+
+<p>なお全体としては 14 年以上 (Heap class は 2012 年に著作権ヘッダが入っている。<code class="file-ref">src/heap/heap.h:1</code>)
+にわたり積み重ねられた実装で、近年は Sandbox/PtrComprCage 導入、SemiSpace から PagedNewSpace への
+移行、Sticky Mark-Bits の導入などにより、ファイル構成が大きく変化していることを最初に断っておきます。
+たとえば旧来あった <code>Page</code>/<code>PageMetadata</code>/<code>MemoryChunkMetadata</code> といったクラスは整理され、
+現在は <code>MemoryChunk</code> (= ヘッダ部分) と <code>BasePage</code> / <code>MutablePage</code> / <code>NormalPage</code> / <code>LargePage</code> /
+<code>ReadOnlyPage</code> (= メタデータ) という二層構造になっています (<code class="file-ref">src/heap/memory-chunk.h</code>,
+<code class="file-ref">src/heap/base-page.h</code>, <code class="file-ref">src/heap/mutable-page.h</code>, <code class="file-ref">src/heap/normal-page.h</code>, <code class="file-ref">src/heap/large-page.h</code>,
+<code class="file-ref">src/heap/read-only-spaces.h</code>)。</p>
+
+<h3 id="p2-1">1. Heap 全体構造</h3>
+
+<h4>1.1 Isolate と Heap の関係</h4>
+
+<p><code>Heap</code> は <code>Isolate</code> の所有物 (composition) で、ポインタや <code>unique_ptr</code> ではなく <strong>値メンバー</strong>として
+直接 <code>Isolate</code> に埋め込まれています。<code class="file-ref">src/execution/isolate.h:2611</code> を見ると <code>Heap heap_;</code> という宣言が
+あり、<code>heap()</code> getter は <code class="file-ref">src/execution/isolate.h:1199</code> で <code>return &amp;heap_;</code> と単純にアドレスを返すだけ
+です。つまり 1 Isolate につきちょうど 1 つの <code>Heap</code> が存在し、Isolate と Heap のライフタイムは
+完全に一致します。<code>Heap::Heap()</code> (<code class="file-ref">src/heap/heap.cc:283</code>) のコンストラクタも <code>isolate_(isolate())</code> で
+所有 Isolate を覚えるだけで、空間の確保はしません。空間の確保は <code>Heap::SetUpSpaces()</code>
+(<code class="file-ref">src/heap/heap.cc:5997</code>) と <code>Heap::ConfigureHeap()</code> (<code class="file-ref">src/heap/heap.cc:4869</code>) に分かれます。</p>
+
+<h4>1.2 AllocationSpace 列挙体</h4>
+
+<p>すべての空間種は <code>enum AllocationSpace</code> (<code class="file-ref">src/common/globals.h:1441</code> ~ 1467) に集約されています。
+これは V8 の世界観の中核です。実値は宣言順に 0 から 12 までで、<code>FIRST_SPACE == 0</code>
+(<code class="file-ref">src/common/globals.h:1469</code> で <code>static_assert</code>) です。</p>
+
+<pre><code class="language-cpp">enum AllocationSpace {
+  RO_SPACE,                  // 0  Immortal/Immovable/Immutable オブジェクト
+  NEW_SPACE,                 // 1  若い世代 (Scavenger/MinorMS)
+  OLD_SPACE,                 // 2  古い世代 通常オブジェクト
+  CODE_SPACE,                // 3  古い世代 コードオブジェクト (executable)
+  SHARED_SPACE,              // 4  Isolate 間共有 (optional)
+  TRUSTED_SPACE,             // 5  Sandbox 有効時は sandbox の外側に置かれる
+  SHARED_TRUSTED_SPACE,      // 6
+  NEW_LO_SPACE,              // 7  若い世代の大オブジェクト
+  LO_SPACE,                  // 8  古い世代の大オブジェクト
+  CODE_LO_SPACE,             // 9  古い世代の大コードオブジェクト
+  SHARED_LO_SPACE,           // 10
+  SHARED_TRUSTED_LO_SPACE,   // 11
+  TRUSTED_LO_SPACE,          // 12
+
+  FIRST_SPACE = RO_SPACE,
+  LAST_SPACE = TRUSTED_LO_SPACE,
+  ...
+};
+constexpr int kSpaceTagSize = 4;  // 4 bits で表現可能
+</code></pre>
+
+<p>そして <code>Heap</code> 内部では、これら 13 種の Space を <code>std::unique_ptr&lt;Space&gt; space_[LAST_SPACE + 1];</code>
+という配列で持ちます (<code class="file-ref">src/heap/heap.h:2172</code>)。各 Space に対する型付きポインタも別途キャッシュされ、
+たとえば <code>new_space_</code>, <code>old_space_</code>, <code>code_space_</code>, <code>lo_space_</code>, <code>code_lo_space_</code>,
+<code>new_lo_space_</code>, <code>read_only_space_</code>, <code>trusted_space_</code>, <code>trusted_lo_space_</code> などが
+<code class="file-ref">src/heap/heap.h:2150-2162</code> に並びます。</p>
+
+<h4>1.3 Heap のサイズ定数</h4>
+
+<p><code class="file-ref">src/heap/heap.h:310-318</code> に重要な配置パラメータが集まっています。</p>
+
+<pre><code class="language-cpp">static constexpr size_t kPhysicalMemoryToOldGenerationRatio = 4;
+static constexpr size_t kNewLargeObjectSpaceToSemiSpaceRatio = 1;
+static constexpr size_t kDefaultMinHeapSize = 256u * MB;
+#ifdef V8_HOST_ARCH_64_BIT
+static constexpr size_t kDefaultMaxHeapSize = static_cast&lt;uint64_t&gt;(4u) * GB;
+#else
+static constexpr size_t kDefaultMaxHeapSize = static_cast&lt;uint64_t&gt;(1u) * GB;
+#endif
+</code></pre>
+
+<p>つまり「物理メモリの 1/4 を Old 世代に割り当てる」「Heap 規模は 64bit で最大 4 GB」が初期方針です。
+さらに PtrCompr 有効時には Heap 全体が PtrCompr cage (4 GB) に収まる必要があり、
+<code>Heap::kAllocatorLimitOnMaxOldGenerationSize</code>
+(<code class="file-ref">src/heap/heap.h:322-323</code>) は <code>kPtrComprCageReservationSize</code> (4 GB)
+となります。</p>
+
+<h4>1.4 SetUpSpaces()</h4>
+
+<p><code>Heap::SetUpSpaces()</code> (<code class="file-ref">src/heap/heap.cc:5997</code>) が実際に各 Space を <code>make_unique</code> する場所です。
+重要な分岐を以下に抜粋しておきます。</p>
+
+<pre><code class="language-cpp">if (v8_flags.sticky_mark_bits) {
+  space_[OLD_SPACE] = std::make_unique&lt;StickySpace&gt;(this);
+} else {
+  space_[OLD_SPACE] = std::make_unique&lt;OldSpace&gt;(this);
+}
+if (!v8_flags.single_generation) {
+  if (!v8_flags.sticky_mark_bits) {
+    if (v8_flags.minor_ms) {
+      space_[NEW_SPACE] = std::make_unique&lt;PagedNewSpace&gt;(this,
+          initial_semispace_size_, min_semi_space_size_, max_semi_space_size_);
+    } else {
+      space_[NEW_SPACE] = std::make_unique&lt;SemiSpaceNewSpace&gt;(this, ...);
+    }
+  }
+  space_[NEW_LO_SPACE] = std::make_unique&lt;NewLargeObjectSpace&gt;(this, NewSpaceCapacity());
+}
+space_[CODE_SPACE]    = std::make_unique&lt;CodeSpace&gt;(this);
+space_[LO_SPACE]      = std::make_unique&lt;OldLargeObjectSpace&gt;(this);
+space_[CODE_LO_SPACE] = std::make_unique&lt;CodeLargeObjectSpace&gt;(this);
+space_[TRUSTED_SPACE] = std::make_unique&lt;TrustedSpace&gt;(this);
+space_[TRUSTED_LO_SPACE] = std::make_unique&lt;TrustedLargeObjectSpace&gt;(this);
+if (isolate()-&gt;is_shared_space_isolate()) {
+  space_[SHARED_SPACE]            = std::make_unique&lt;SharedSpace&gt;(this);
+  space_[SHARED_LO_SPACE]         = std::make_unique&lt;SharedLargeObjectSpace&gt;(this);
+  space_[SHARED_TRUSTED_SPACE]    = std::make_unique&lt;SharedTrustedSpace&gt;(this);
+  space_[SHARED_TRUSTED_LO_SPACE] = std::make_unique&lt;SharedTrustedLargeObjectSpace&gt;(this);
+}
+</code></pre>
+
+<p>注意点として <code>RO_SPACE</code> だけはここで生成しません。<code>ReadOnlySpace</code> は <code>Heap</code> の所有物ですが、
+<code>Heap::SetUpFromReadOnlySpace</code> (DCHECK が <code class="file-ref">src/heap/heap.cc:5999</code> にあります) 経由で
+別途渡されます。これは複数 Isolate 間で <code>ReadOnlyHeap</code> を共有するためです。</p>
+
+<h4>1.5 MemoryAllocator</h4>
+
+<p>各 Space は物理メモリの確保や解放を直接 OS に依頼しません。代わりに <code>Isolate::heap()-&gt;memory_allocator()</code>
+が窓口になります (<code class="file-ref">src/heap/memory-allocator.h:41</code> に <code>class MemoryAllocator final</code>)。</p>
+
+<p><code>MemoryAllocator</code> は Isolate-local な存在で、ヘッダーには
+「pages never get reused across Isolates」(<code class="file-ref">src/heap/memory-allocator.h:39-40</code>) と明記されています。
+コンストラクタ (<code class="file-ref">src/heap/memory-allocator.h:83</code>) は 3 種類の <code>v8::PageAllocator</code> を受け取り、
+<code>page_allocator(AllocationSpace)</code> (<code class="file-ref">src/heap/memory-allocator.h:184-205</code>) で空間ごとに使い分けます。</p>
+
+<p><code>RO_SPACE</code> → <code>read_only_page_allocator_</code></p>
+<p><code>CODE_SPACE</code>, <code>CODE_LO_SPACE</code> → <code>code_page_allocator_</code> (実体は通常 <code>CodeRange</code> の <code>BoundedPageAllocator</code>)</p>
+<p><code>TRUSTED_SPACE</code>, <code>SHARED_TRUSTED_SPACE</code>, <code>TRUSTED_LO_SPACE</code>, <code>SHARED_TRUSTED_LO_SPACE</code>
+  → <code>trusted_page_allocator_</code> (Sandbox 有効時は <code>TrustedRange</code> 経由で sandbox の外)</p>
+<p>それ以外 (<code>NEW_SPACE</code>, <code>NEW_LO_SPACE</code>, <code>OLD_SPACE</code>, <code>LO_SPACE</code>, <code>SHARED_SPACE</code>, <code>SHARED_LO_SPACE</code>)
+  → <code>data_page_allocator_</code></p>
+
+<p>ページの確保は <code>AllocatePage(AllocationMode, Space*, Executability)</code>
+(<code class="file-ref">src/heap/memory-allocator.h:96</code>) 経由。大ページは <code>AllocateLargePage(...)</code> (<code>:100</code>)。
+内部の汎用関数は <code>AllocateUninitializedChunk[At]()</code> (<code>:259-270</code>) で、ここで <code>VirtualMemory</code>
+と <code>ComputeChunkSize</code> を組み合わせます。プーリングのモードは <code>AllocationMode::kRegular</code> /
+<code>kTryDelayedAndPooled</code> の 2 値で、ページ解放のモードは <code>FreeMode::kImmediately</code> / <code>kPool</code> /
+<code>kDelayThenRelease</code> / <code>kDelayThenPool</code> の 4 値 (<code>:43-66</code>)。</p>
+
+<h3 id="p2-2">2. Page / MemoryChunk</h3>
+
+<h4>2.1 ページサイズ定数</h4>
+
+<p>最重要定数 <code>kPageSizeBits</code> の値は <code class="file-ref">src/base/build_config.h:68-83</code> で決定されます。</p>
+
+<pre><code class="language-cpp">#if defined(V8_HOST_ARCH_PPC64) &amp;&amp; !defined(V8_OS_AIX)
+constexpr int kPageSizeBits = 19;   // PPC は huge page
+#elif defined(ENABLE_HUGEPAGE)
+constexpr int kHugePageBits = 21;
+constexpr int kPageSizeBits = kHugePageBits;
+#else
+constexpr int kPageSizeBits = 18;   // 通常 (x64/arm64 含む)
+#endif
+constexpr int kRegularPageSize = 1 &lt;&lt; kPageSizeBits;
+</code></pre>
+
+<p>つまり通常の構成では <strong>1 ページ = 2^18 = 262144 バイト = 256 KB</strong> です。PPC は 512 KB、
+hugepage 有効時は 2 MB になります。<code>NormalPage::kPageSize</code>
+(<code class="file-ref">src/heap/normal-page.h:22</code>) はこれをそのまま <code>kRegularPageSize</code> にリネームしたものです。</p>
+
+<p>そして「regular とみなされる最大 HeapObject サイズ」は <code>kMaxRegularHeapObjectSize</code>
+(<code class="file-ref">src/common/globals.h:720</code>) で</p>
+
+<pre><code class="language-cpp">constexpr int kMaxRegularHeapObjectSize = (1 &lt;&lt; (kPageSizeBits - 1));
+</code></pre>
+
+<p>すなわちページサイズの<strong>ちょうど半分</strong> = 128 KB (通常) です。これを超えると Large Object Space へ
+配置されます。</p>
+
+<h4>2.2 MemoryChunk のレイアウト</h4>
+
+<p><code>MemoryChunk</code> は「Sandbox から見える、ページの先頭に置かれる小さなヘッダ」です。
+<code class="file-ref">src/heap/memory-chunk.h:47</code> の <code>class V8_EXPORT_PRIVATE MemoryChunk final</code> を読むと
+わかる通り、Sandbox 有効時にはこの構造体は「壊れているかもしれない」前提で扱われ、
+信頼できる情報は対応する <code>BasePage</code> (=「メタデータ」) 側に置きます (コメント <code>:43-46</code>)。</p>
+
+<p>ヘッダの中身は実質 2 ワードだけ:</p>
+
+<pre><code class="language-cpp">MainThreadFlags untrusted_main_thread_flags_;   // uintptr_t
+#ifdef V8_ENABLE_SANDBOX
+  uint32_t metadata_index_;       // MetadataPointerTable へのインデックス
+#else
+  BasePage* metadata_;            // 直接ポインタ
+#endif
+</code></pre>
+
+<p><code>MemoryChunk::BaseAddress(addr)</code> (<code class="file-ref">src/heap/memory-chunk.h:145-155</code>) はアドレスを
+<code>~kAlignmentMask</code> でマスクしてチャンクの先頭を取り出す古典的な手口です。
+<code>kAlignment = 1 &lt;&lt; kPageSizeBits</code> (<code>:305-307</code>) なので 256 KB アラインを使い、
+任意のオブジェクト内ポインタから所属チャンクを定数時間で求められます。
+<code>MemoryChunk::FromHeapObject(o)</code> (<code>:178-181</code>) はこの仕組みの利用例で、
+write barrier やマーキングの hot path で重要です。</p>
+
+<h4>2.3 MemoryChunk のフラグ</h4>
+
+<p><code>enum Flag : uintptr_t</code> (<code class="file-ref">src/heap/memory-chunk.h:56-109</code>) には次のビットが定義されています。</p>
+
+<table>
+<thead><tr><th>値</th><th>名前</th><th>意味</th></tr></thead>
+<tbody>
+<tr><td><code>1u &lt;&lt; 0</code></td><td><code>IN_WRITABLE_SHARED_SPACE</code></td><td>書き込み可能な共有空間に属する</td></tr>
+<tr><td><code>1u &lt;&lt; 1</code></td><td><code>POINTERS_TO_HERE_ARE_INTERESTING</code></td><td>ここへ向くポインタを記録する必要</td></tr>
+<tr><td><code>1u &lt;&lt; 2</code></td><td><code>POINTERS_FROM_HERE_ARE_INTERESTING</code></td><td>ここからのポインタを記録する必要</td></tr>
+<tr><td><code>1u &lt;&lt; 3</code></td><td><code>FROM_PAGE</code></td><td>from-space / scavenge 未処理の young large</td></tr>
+<tr><td><code>1u &lt;&lt; 4</code></td><td><code>TO_PAGE</code></td><td>to-space / scavenge 済 young large</td></tr>
+<tr><td><code>1u &lt;&lt; 5</code></td><td><code>INCREMENTAL_MARKING</code></td><td>インクリメンタルマーキング中</td></tr>
+<tr><td><code>1u &lt;&lt; 6</code></td><td><code>BLACK_ALLOCATED</code></td><td>major incremental marking 中に確保されたページ (老人のみ)</td></tr>
+<tr><td><code>1u &lt;&lt; 7</code></td><td><code>LARGE_PAGE</code></td><td>大ページ</td></tr>
+<tr><td><code>1u &lt;&lt; 8</code></td><td><code>EVACUATION_CANDIDATE</code></td><td>退避候補</td></tr>
+<tr><td><code>1u &lt;&lt; 9</code></td><td><code>NEW_SPACE_BELOW_AGE_MARK</code></td><td>NEW_SPACE 内かつ age_mark より下 = 一度生き延びた</td></tr>
+<tr><td><code>1u &lt;&lt; 10</code></td><td><code>READ_ONLY_HEAP</code></td><td>RO_HEAP に属する (CONTIGUOUS_COMPRESSED_RO_SPACE_BOOL 未定義時のみ)</td></tr>
+<tr><td><code>1u &lt;&lt; 11</code></td><td><code>STICKY_MARK_BIT_CONTAINS_ONLY_OLD</code></td><td>sticky markbits: 老人だけのページ</td></tr>
+<tr><td><code>1u &lt;&lt; 12</code></td><td><code>STICKY_MARK_BIT_IS_MAJOR_GC_IN_PROGRESS</code></td><td>sticky markbits: major GC 進行中扱い</td></tr>
+</tbody>
+</table>
+
+<p>複合マスクが直後に並びます。</p>
+
+<pre><code class="language-cpp">static constexpr MainThreadFlags kIsInYoungGenerationMask =
+    MainThreadFlags(FROM_PAGE) | MainThreadFlags(TO_PAGE);
+static constexpr MainThreadFlags kSkipEvacuationSlotsRecordingMask =
+    MainThreadFlags(kEvacuationCandidateMask) |
+    MainThreadFlags(kIsInYoungGenerationMask);
+</code></pre>
+
+<p>write barrier ではこれらのマスクを 1 命令で AND し、関心のあるページかを高速判定します。</p>
+
+<h4>2.4 BasePage と派生クラス</h4>
+
+<p>「信頼できるメタデータ」を持つのが <code>BasePage</code> 系で、ヘッダは <code class="file-ref">src/heap/base-page.h:29-373</code>。
+クラス階層は次の通り。</p>
+
+<p><code>BasePage</code>
+  <code>MutablePage</code>
+    <code>NormalPage</code> (<code>kPageSize = kRegularPageSize</code>、<code class="file-ref">src/heap/normal-page.h:19-122</code>)
+    <code>LargePage</code> (<code>kMaxCodePageSize = 512 * MB</code>、<code class="file-ref">src/heap/large-page.h:13-40</code>)
+  <code>ReadOnlyPage</code> (<code class="file-ref">src/heap/read-only-spaces.h:33-70</code>)</p>
+
+<p><code>BasePage</code> の主要フィールド (<code class="file-ref">base-page.h:275-307</code>):</p>
+
+<pre><code class="language-cpp">VirtualMemory reservation_;            // 自前の予約があれば
+size_t allocated_bytes_;
+size_t wasted_memory_ = 0;
+std::atomic&lt;intptr_t&gt; high_water_mark_;
+size_t size_;                          // ヘッダ＋ガード込みのチャンク全体サイズ
+Address area_end_;
+Heap* heap_;                           // RO chunk なら nullptr
+Address area_start_;
+std::atomic&lt;BaseSpace*&gt; owner_;
+using FlagsT = uint32_t;
+FlagsT flags_ = 0;
+</code></pre>
+
+<p><code>flags_</code> は <code>BitField</code> で 13 のブール状態を 32bit に詰めます (<code>:311-358</code>):
+<code>IsPinnedForTesting</code>, <code>IsUnregistered</code>, <code>IsPreeFreed</code>, <code>IsLargePage</code>, <code>IsExecutable</code>,
+<code>WillBePromoted</code>, <code>IsQuarantined</code>, <code>IsEvacuationCandidate</code>, <code>EvacuationWasAborted</code>,
+<code>NeverEvacuate</code>, <code>NeverAllocateOnChunk</code>, <code>ForceEvacuationCandidateForTesting</code>,
+<code>IsTrustedField</code>, <code>IsWritableSharedSpaceField</code>, <code>IsSealedReadOnlySpaceField</code>,
+<code>IsReadOnlyPageField</code>, <code>IsBlackAllocated</code>。</p>
+
+<p><code>MutablePage</code> (<code class="file-ref">src/heap/mutable-page.h:45</code>) になると更に多くの状態がぶら下がります。とくに</p>
+
+<pre><code class="language-cpp">SlotSet* slot_set_[NUMBER_OF_REMEMBERED_SET_TYPES] = {nullptr};
+TypedSlotSet* typed_slot_set_[NUMBER_OF_REMEMBERED_SET_TYPES] = {nullptr};
+MarkingProgressTracker marking_progress_tracker_;
+std::atomic&lt;intptr_t&gt; live_byte_count_{0};
+std::atomic&lt;ConcurrentSweepingState&gt; concurrent_sweeping_{...kDone};
+heap::ListNode&lt;MutablePage&gt; list_node_;
+FreeListCategory** categories_ = nullptr;
+PossiblyEmptyBuckets possibly_empty_buckets_;
+std::unique_ptr&lt;ActiveSystemPages&gt; active_system_pages_;
+size_t allocated_lab_size_ = 0;
+size_t age_in_new_space_ = 0;
+MemoryChunk::MainThreadFlags trusted_main_thread_flags_;
+MarkingBitmap marking_bitmap_;
+base::Mutex mutex_;
+base::Mutex object_mutex_;
+</code></pre>
+
+<p>このうち <code>marking_bitmap_</code> (<code class="file-ref">mutable-page.h:332</code>) は <strong>ページ内マーキングビット</strong> の本体です。
+レイアウト上「prefer-platform-independent」を理由に最後に置かれています (<code>:334-340</code>)。
+コード生成側ではオフセット <code>MutablePage::MarkingBitmapOffset()</code> を assembler 経由で使うため、
+位置を 64bit プラットフォームで安定にする必要があります。</p>
+
+<h4>2.5 RememberedSet と SlotSet</h4>
+
+<p>スロットセットは「old → new」「old → old」「trusted → code」など 8 種類の方向性を区別します
+(<code class="file-ref">src/heap/mutable-page.h:32-42</code>):</p>
+
+<pre><code class="language-cpp">enum RememberedSetType {
+  OLD_TO_NEW,
+  OLD_TO_NEW_BACKGROUND,
+  OLD_TO_OLD,
+  OLD_TO_SHARED,
+  TRUSTED_TO_CODE,
+  TRUSTED_TO_TRUSTED,
+  TRUSTED_TO_SHARED_TRUSTED,
+  SURVIVOR_TO_EXTERNAL_POINTER,
+  NUMBER_OF_REMEMBERED_SET_TYPES
+};
+</code></pre>
+
+<p>具体的なビットマップは <code>SlotSet</code> (<code class="file-ref">src/heap/slot-set.h:127</code>) で、basis は
+<code>BasicSlotSet&lt;kTaggedSize&gt;</code> (<code class="file-ref">src/heap/base/basic-slot-set.h</code>)。レイアウトの定数値は
+<code class="file-ref">basic-slot-set.h:277-285</code>:</p>
+
+<pre><code class="language-cpp">static constexpr int kCellsPerBucket = 32;       // バケツ内の cell 数
+static constexpr int kBitsPerCell = 32;          // cell あたり 32bit
+static constexpr int kBitsPerBucket =
+    kCellsPerBucket * kBitsPerCell;              // = 1024 bit / バケツ
+</code></pre>
+
+<p>つまり 1 バケツが 1024 スロットを扱い、それが pageSize / (kTaggedSize * kBitsPerBucket)
+本だけ並びます。<code>SlotSet::kBucketsRegularPage</code> の値は
+<code class="file-ref">slot-set.h:131-132</code> に直接書かれています:</p>
+
+<pre><code class="language-cpp">static const int kBucketsRegularPage =
+    (1 &lt;&lt; kPageSizeBits) / kTaggedSize / kCellsPerBucket / kBitsPerCell;
+</code></pre>
+
+<p><code>kPageSizeBits=18</code>, <code>kTaggedSize=4</code> (ptr-compr 有効時), <code>kCellsPerBucket=32</code>, <code>kBitsPerCell=32</code> で
+<code>262144 / 4 / 32 / 32 = 64</code> バケツになります。</p>
+
+<h4>2.6 MarkingBitmap</h4>
+
+<p>マーキングビットマップ自体の構造は <code class="file-ref">src/heap/marking.h:93-238</code>。重要なのは</p>
+
+<pre><code class="language-cpp">using CellType = uintptr_t;   // 64bit プラットフォームでは 64bit cell
+static constexpr uint32_t kBitsPerCell = sizeof(CellType) * kBitsPerByte; // = 64
+static constexpr size_t kLength = ((1 &lt;&lt; kPageSizeBits) &gt;&gt; kTaggedSizeLog2);
+static constexpr size_t kCellsCount = (kLength + kBitsPerCell - 1) &gt;&gt; kBitsPerCellLog2;
+static constexpr size_t kSize = kCellsCount * kBytesPerCell;
+</code></pre>
+
+<p><code>kPageSizeBits=18</code>, <code>kTaggedSizeLog2=2</code> で <strong>1 ページあたり 65536 bit</strong> がマークビット。
+それを 64bit cell に詰めて 1024 cells = <strong>8 KB</strong> がマーキングビットマップとして
+<code>MutablePage::marking_bitmap_</code> 領域を消費します (ページサイズの約 3%)。</p>
+
+<h4>2.7 MemoryChunkLayout (Sandbox 有効時の特殊配置)</h4>
+
+<p><code class="file-ref">src/heap/memory-chunk-constants.h:15-37</code> には Sandbox 有効時のメタデータポインタテーブル
+レイアウトが定義されています。</p>
+
+<pre><code class="language-cpp">#ifdef V8_ENABLE_SANDBOX
+static constexpr size_t kPagesInMainCage =
+    kPtrComprCageReservationSize / kRegularPageSize;       // 4GB/256KB = 16384
+static constexpr size_t kPagesInCodeCage =
+    kMaximalCodeRangeSize / kRegularPageSize;
+static constexpr size_t kPagesInTrustedCage =
+    kMaximalTrustedRangeSize / kRegularPageSize;
+static constexpr size_t kMainCageMetadataOffset = 0;
+static constexpr size_t kTrustedSpaceMetadataOffset =
+    kMainCageMetadataOffset + kPagesInMainCage;
+static constexpr size_t kCodeRangeMetadataOffset =
+    kTrustedSpaceMetadataOffset + kPagesInTrustedCage;
+static constexpr size_t kMetadataPointerTableSizeLog2 = base::bits::BitWidth(...)
+static constexpr size_t kMetadataPointerTableSize = 1 &lt;&lt; kMetadataPointerTableSizeLog2;
+static constexpr size_t kMetadataPointerTableSizeMask = kMetadataPointerTableSize - 1;
+#endif
+</code></pre>
+
+<p><code>MemoryChunk</code> から <code>BasePage*</code> を得るときは Sandbox 内ではこの "Metadata Pointer Table" を引きます
+(<code class="file-ref">src/heap/memory-chunk.h:318-322</code>)。Sandbox 外オブジェクト (=信頼できる) を取得するのに
+Sandbox 内のフラグを介さない、というセキュリティモデルです。</p>
+
+<p><code>MemoryChunkLayout::ObjectStartOffsetInCodePage()</code> (<code class="file-ref">memory-chunk-layout.h:18-24</code>) は
+コードページの場合、<code>InstructionStream::kHeaderSize</code> を引いた特殊な配置を行います:</p>
+
+<pre><code class="language-cpp">static constexpr intptr_t ObjectStartOffsetInCodePage() {
+  return RoundUp(sizeof(MemoryChunk) + InstructionStream::kHeaderSize,
+                 kCodeAlignment) - InstructionStream::kHeaderSize;
+}
+</code></pre>
+
+<p>データページの方は <code>ObjectStartOffsetInDataPage()</code> (<code>:30-33</code>) で <code>sizeof(MemoryChunk)</code> を
+<code>kDoubleSize</code> にラウンドアップするだけです。</p>
+
+<h3 id="p2-3">3. Young Generation (NewSpace)</h3>
+
+<p>V8 の若い世代は歴史的に「2 つのセミスペース (from-space / to-space) を flip する」古典的な
+Cheney アルゴリズム実装で、これを <code>SemiSpaceNewSpace</code> (<code class="file-ref">src/heap/new-spaces.h:244</code>) が担います。
+最近は MinorMS (Minor Mark Sweep) という別のコレクタ用に <strong>PagedNewSpace</strong> が導入され、
+<code>v8_flags.minor_ms</code> で切り替えられます (実装は <code class="file-ref">src/heap/new-spaces.h:481-563, 567-697</code>)。</p>
+
+<h4>3.1 既定容量</h4>
+
+<p>容量の既定値は <code>Heap::DefaultMinSemiSpaceSize()</code> (<code class="file-ref">src/heap/heap.cc:4828-4830</code>) と
+<code>Heap::DefaultMaxSemiSpaceSize(physical_memory)</code> (<code>:4833-4851</code>):</p>
+
+<pre><code class="language-cpp">size_t Heap::DefaultMinSemiSpaceSize() {
+  return RoundUp(512 * KB, NormalPage::kPageSize);   // 通常は 512KB→256KB ラウンドで 512KB
+}
+size_t Heap::DefaultMaxSemiSpaceSize(uint64_t physical_memory) {
+  if (v8_flags.minor_ms) {
+    static constexpr size_t kMinorMsMaxCapacity = 72 * MB;
+    return RoundUp(kMinorMsMaxCapacity, NormalPage::kPageSize);
+  }
+  static constexpr size_t kScavengerDefaultMaxCapacity = 32 * MB;
+  size_t max_semi_space_size = kScavengerDefaultMaxCapacity;
+#if defined(ANDROID)
+  if (!IsHighEndAndroid(physical_memory)) {
+    static constexpr size_t kAndroidNonHighEndMaxCapacity = 8 * MB;
+    max_semi_space_size = kAndroidNonHighEndMaxCapacity;
+  }
+#endif
+  return RoundUp(max_semi_space_size, NormalPage::kPageSize);
+}
+</code></pre>
+
+<p>Scavenger 構成: 1 半空間あたり最大 32 MB、Android 非ハイエンドは 8 MB。</p>
+<p>MinorMS 構成: 1 半空間あたり最大 72 MB。</p>
+<p>最小値はいずれも 512 KB (NormalPage::kPageSize にラウンド)。</p>
+
+<p>実コードでの設定経路は <code>Heap::ConfigureHeap()</code> (<code class="file-ref">src/heap/heap.cc:4869</code>) で、<code>v8_flags.max_semi_space_size</code>
+や <code>v8_flags.max_heap_size</code> の指定を優先します。フラグ自体は
+<code class="file-ref">src/flags/flag-definitions.h:2453-2459</code> で定義:</p>
+
+<pre><code class="language-cpp">DEFINE_SIZE_T(min_semi_space_size, 0, ...);
+DEFINE_SIZE_T(max_semi_space_size, 0, ...);
+DEFINE_INT(semi_space_growth_factor, 2, "factor by which to grow the new space")
+</code></pre>
+
+<h4>3.2 SemiSpace と SemiSpaceNewSpace</h4>
+
+<p><code>SemiSpace</code> (<code class="file-ref">src/heap/new-spaces.h:43</code>) は実体上「ページのリスト」で、<code>SemiSpaceId</code>
+(<code>from=0</code>, <code>to=1</code>) で 2 個ペアを <code>SemiSpaceNewSpace</code> が抱えます (<code class="file-ref">new-spaces.h:446-447</code>):</p>
+
+<pre><code class="language-cpp">SemiSpace to_space_;
+SemiSpace from_space_;
+Address allocation_top_ = kNullAddress;
+ParkedAllocationBuffersVector parked_allocation_buffers_;
+size_t quarantined_size_ = 0;
+size_t size_after_last_gc_ = 0;
+const size_t minimum_capacity_ = 0;
+const size_t maximum_capacity_ = 0;
+Address age_mark_ = kNullAddress;
+size_t target_capacity_ = 0;
+</code></pre>
+
+<p>確保は単純な bump-pointer です。<code>SemiSpaceNewSpace::Allocate(...)</code> (<code class="file-ref">new-spaces.h:418-419</code>,
+実装は <code>new-spaces.cc</code>) は <code>to_space_.page_high()</code> を限界として <code>allocation_top_</code> を進めます。
+SemiSpace の swap は <code>SemiSpace::Swap(from, to)</code> (<code class="file-ref">new-spaces.h:48</code>) で <code>std::swap</code> 風に行い、
+<code>SwapSemiSpaces()</code> (<code class="file-ref">new-spaces.h:388</code>) が GC 直前に呼ばれます。</p>
+
+<p><code>age_mark_</code> は「現在の to-space で、前回 GC 終了時点までに到達していた top」を覚えており、
+GC 中に live と判定された場合に「年寄りページ」を ageMark より下に置くことで、
+SemiSpace 内の中で世代を区別します。これが <code>NEW_SPACE_BELOW_AGE_MARK</code> フラグ
+(<code class="file-ref">memory-chunk.h:89</code>) に直結します。</p>
+
+<h4>3.3 PagedNewSpace (MinorMS)</h4>
+
+<p>MinorMS フラグ有効時には NEW_SPACE は SemiSpace ではなく、固定的に配置された通常ページ
+(=<code>PagedSpaceForNewSpace</code>) に変わります (<code class="file-ref">new-spaces.h:481-562</code>)。PagedSpace と同じ free list
+が使え、from/to の概念がなくなる代わりに mark-sweep で生存判定をします。クラス階層は</p>
+
+<pre><code class="language-text">NewSpace
+ └─ PagedNewSpace (forwarding shim)
+     └─ PagedSpaceForNewSpace (実体, PagedSpaceBase 派生)
+</code></pre>
+
+<p>の 3 段になっており (<code class="file-ref">new-spaces.h:481-562, 567-697</code>)、コメントに <code>TODO(v8:12612)</code>
+として「いつかこの 3 つを 1 つに統合する」と書かれています。</p>
+
+<h4>3.4 LAB と最終ページ</h4>
+
+<p>NewSpace の bump 確保の生コアは <code>Address allocation_top_</code>、limit が <code>to_space_.page_high()</code>
+というだけのものです。とはいえ実際の確保パスは <code>MainAllocator</code> 経由で
+<code>LinearAllocationArea</code> に投影され、<code>top()</code> / <code>limit()</code> 経由で扱われます (後述)。</p>
+
+<h3 id="p2-4">4. Old Generation</h3>
+
+<h4>4.1 クラス階層と FreeList の生成</h4>
+
+<p><code>PagedSpaceBase</code> (<code class="file-ref">src/heap/paged-spaces.h:111</code>) → <code>PagedSpace</code> (<code>:361</code>) → 各具体 Space:
+<code>OldSpace</code> (<code>:444</code>)、<code>StickySpace</code> (<code>:462</code>)、<code>CodeSpace</code> (<code>:505</code>)、<code>SharedSpace</code> (<code>:517</code>)、
+<code>TrustedSpace</code> (<code>:532</code>)、<code>SharedTrustedSpace</code> (<code>:541</code>) と <code>CompactionSpace</code> (<code>:375</code>)。</p>
+
+<p>すべて生成時に <code>FreeList::CreateFreeList()</code> を呼びます。実装は <code class="file-ref">src/heap/free-list.cc:138-143</code>:</p>
+
+<pre><code class="language-cpp">std::unique_ptr&lt;FreeList&gt; FreeList::CreateFreeList() {
+  return std::make_unique&lt;FreeListManyCachedOrigin&gt;();
+}
+std::unique_ptr&lt;FreeList&gt; FreeList::CreateFreeListForNewSpace() {
+  return std::make_unique&lt;FreeListManyCachedFastPathForNewSpace&gt;();
+}
+</code></pre>
+
+<p>すなわち old generation のすべての PagedSpace は <code>FreeListManyCachedOrigin</code> を使い、
+PagedNewSpace は <code>FreeListManyCachedFastPathForNewSpace</code> を使います。</p>
+
+<h4>4.2 FreeList のカテゴリ</h4>
+
+<p><code>FreeListMany</code> (<code class="file-ref">src/heap/free-list.h:298-350</code>) には <strong>24 個のカテゴリ</strong>があります。
+具体的な境界値は <code>categories_min[24]</code> (<code class="file-ref">free-list.h:328-330</code>):</p>
+
+<pre><code class="language-cpp">static constexpr unsigned int categories_min[kNumberOfCategories] = {
+    24,  32,  48,  64,  80,  96,   112,  128,  144,  160,   176,   192,
+    208, 224, 240, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
+</code></pre>
+
+<p>オブジェクトサイズが <code>categories_min[i] &lt;= size &lt; categories_min[i+1]</code> なら i 番目のカテゴリへ。
+最小ブロックサイズは <code>kMinBlockSize = 3 * kTaggedSize</code> (<code class="file-ref">free-list.h:310</code>)、最大は
+<code>kMaxBlockSize = kRegularPageSize</code> (<code>:314</code>)。256 まで 16B 刻みで「精密」、それ以降は倍々で
+「粗い」分類です。</p>
+
+<p>カテゴリ選択ロジック (<code class="file-ref">free-list.h:333-346</code>) は次の通り:</p>
+
+<pre><code class="language-cpp">FreeListCategoryType SelectFreeListCategoryType(size_t size_in_bytes) override {
+  if (size_in_bytes &lt;= kPreciseCategoryMaxSize) {  // 256
+    if (size_in_bytes &lt; categories_min[1]) return 0;
+    return static_cast&lt;FreeListCategoryType&gt;(size_in_bytes &gt;&gt; 4) - 1;
+  }
+  for (int cat = (kPreciseCategoryMaxSize &gt;&gt; 4) - 1; cat &lt; last_category_; cat++) {
+    if (size_in_bytes &lt; categories_min[cat + 1]) {
+      return cat;
+    }
+  }
+  return last_category_;
+}
+</code></pre>
+
+<p>すなわち size &lt;= 256B なら <code>(size &gt;&gt; 4) - 1</code> で定数時間。それ以上は線形走査。</p>
+
+<h4>4.3 FreeListManyCached/CachedFastPath</h4>
+
+<p><code>FreeListManyCached</code> (<code class="file-ref">free-list.h:357-417</code>) は「各カテゴリ c について、c 以上で非空な最小カテゴリ」を
+<code>next_nonempty_category[c]</code> に持つキャッシュを追加し、空カテゴリのスキャンを O(1) にします。</p>
+
+<p><code>FreeListManyCachedFastPath</code> (<code class="file-ref">free-list.h:438-491</code>) は更に最初に試すカテゴリを「ターゲットサイズ +
+1.85k」相当のカテゴリへずらし、過剰割当てによる高速確保パスを設けます。具体的には</p>
+
+<pre><code class="language-cpp">static const FreeListCategoryType kFastPathFirstCategory = 18;   // 2k 〜
+static const size_t kFastPathStart = 2048;
+static const size_t kTinyObjectMaxSize = 128;
+static const size_t kFastPathOffset = kFastPathStart - kTinyObjectMaxSize; // 1920
+static const FreeListCategoryType kFastPathFallBackTiny = 15;    // 256 〜
+</code></pre>
+
+<p>128 バイト以下の極小オブジェクト用には secondary fast path として <code>kFastPathFallBackTiny</code>
+カテゴリから検索します。</p>
+
+<p><code>FreeListManyCachedOrigin</code> (<code class="file-ref">free-list.h:514-520</code>) は呼び出し元が GC か Runtime かで戦略を変えます。
+GC 中 (<code>AllocationOrigin::kGC</code>) は <code>FreeListManyCached</code>、それ以外は <code>FreeListManyCachedFastPath</code>。
+GC の並行/平行コンテキストでは「断片化を減らす」、Runtime の hot path では「速く取りたい」、
+というトレードオフです。</p>
+
+<h4>4.4 PagedSpace の主要 API</h4>
+
+<p><code>PagedSpaceBase</code> の主要操作は <code>Free(start, size)</code> / <code>Allocate*</code> / <code>RefillFreeList</code> / <code>AddPage</code> /
+<code>RemovePage</code> / <code>RawAllocateBackground</code> (<code class="file-ref">paged-spaces.h:151-291</code>)。背景スレッドからの確保は
+<code>RawAllocateBackground</code> (<code>:178-180</code>) のみで、<code>local_heap</code>, <code>min_size_in_bytes</code>, <code>max_size_in_bytes</code>,
+<code>AllocationOrigin</code> を取り、CAS 風に確保します。</p>
+
+<p><code>OldSpace::AddPromotedPage</code> (<code class="file-ref">paged-spaces.h:452</code>) は young → old の物理ページ移動 (page-promote)
+で使われます。<code>StickySpace</code> (<code>:462-500</code>) は sticky-markbits 構成専用の OldSpace 派生で、
+「ページ内に若いオブジェクトと老人オブジェクトを混在させる」という特異な仕組みを持ち、
+<code>allocated_old_size_</code> を別管理します。</p>
+
+<h3 id="p2-5">5. Read-Only Space</h3>
+
+<h4>5.1 設計目的</h4>
+
+<p><code class="file-ref">src/heap/read-only-spaces.h:159-261</code> の <code>ReadOnlySpace</code>。「Immortal Immovable Immutable」、
+すなわち<strong>起動後に書き換えられない</strong>オブジェクト用空間です。代表的な居住者は内蔵ビルトイン (Code)、
+シングルトンの roots (<code>undefined_value</code>, <code>null_value</code>, <code>the_hole_value</code> 等)、定数 Map など。</p>
+
+<p>主な利点は 2 点:</p>
+<p>1. <strong>複数 Isolate 間で共有可能</strong>になり、メモリ使用量が劇的に下がる。
+   <code>SharedReadOnlySpace</code> (<code class="file-ref">read-only-spaces.h:263-275</code>) は <code>is_marked_read_only_ = true</code> で
+   <code>ReadOnlySpace</code> を継承し、<code>ReadOnlyArtifacts::ReinstallReadOnlySpace</code>
+   (<code class="file-ref">read-only-spaces.h:96</code>, <code>read-only-heap.cc</code>) で先頭 Isolate の RO 空間を他 Isolate に注入。</p>
+<p>2. ページに <code>MakeHeaderRelocatableAndMarkAsSealed()</code> (<code class="file-ref">read-only-spaces.h:41</code>) を適用して
+   PROT_READ にできる。GC ですらここを触らないため、メモリ保護違反で書き込み攻撃を検出できる。</p>
+
+<h4>5.2 ReadOnlyPage</h4>
+
+<p><code>ReadOnlyPage</code> (<code class="file-ref">read-only-spaces.h:33-70</code>) は <code>BasePage</code> 派生で、<code>MutablePage</code> の slot set や
+marking bitmap を持たず、<code>AllocationStats</code> のみ。<code>ShrinkToHighWaterMark()</code> (<code>:43</code>) で
+未使用領域を切り詰めて OS にも返却します。<code>OffsetToAddress(offset)</code> (<code>:46-59</code>) は
+PtrCompr の "multiple cages" 環境ではページが複数の場所にマッピングされうるため <code>area_start()</code>
+ベースのアサーションを切り、<code>ChunkAddress() + offset</code> 直接計算に倒します。</p>
+
+<h4>5.3 Seal の手順</h4>
+
+<p><code>ReadOnlySpace::Seal(SealMode)</code> (<code class="file-ref">read-only-spaces.h:191-193</code>) は 3 つのモードを取ります:</p>
+
+<p><code>kDetachFromHeap</code>           : ヘッドから切り離す</p>
+<p><code>kDetachFromHeapAndUnregisterMemory</code>: さらに <code>MemoryAllocator</code> の bookkeeping から外す
+  (メモリリーク検出器対策)</p>
+<p><code>kDoNotDetachFromHeap</code>      : そのまま</p>
+
+<p>書き込み権限の制御は <code>SetPermissionsForPages(allocator, access)</code> (<code>:226-227</code>)。
+通常は <code>kReadOnly</code> を渡して PROT_READ にします。</p>
+
+<h3 id="p2-6">6. Large Object Space</h3>
+
+<h4>6.1 概要</h4>
+
+<p><code>kMaxRegularHeapObjectSize</code> (= 128KB 通常) を超えるオブジェクトは、Large Object Space に
+<strong>1 オブジェクト = 1 ページ</strong>として配置されます。ページ自体のサイズは <code>kRegularPageSize</code> の倍数で、
+オブジェクトサイズ + ヘッダ + 必要な OS ページアラインで切り上げます。</p>
+
+<p>クラス階層 (<code class="file-ref">src/heap/large-spaces.h</code>):</p>
+
+<pre><code class="language-text">LargeObjectSpace
+ ├─ OldLargeObjectSpace
+ │   ├─ SharedLargeObjectSpace
+ │   ├─ TrustedLargeObjectSpace
+ │   ├─ SharedTrustedLargeObjectSpace
+ │   └─ CodeLargeObjectSpace
+ └─ NewLargeObjectSpace
+</code></pre>
+
+<p>それぞれに対応する <code>AllocationSpace</code>:</p>
+<p><code>LO_SPACE</code> (<code>OldLargeObjectSpace</code>)</p>
+<p><code>CODE_LO_SPACE</code> (<code>CodeLargeObjectSpace</code>)</p>
+<p><code>SHARED_LO_SPACE</code> (<code>SharedLargeObjectSpace</code>)</p>
+<p><code>SHARED_TRUSTED_LO_SPACE</code> (<code>SharedTrustedLargeObjectSpace</code>)</p>
+<p><code>TRUSTED_LO_SPACE</code> (<code>TrustedLargeObjectSpace</code>)</p>
+<p><code>NEW_LO_SPACE</code> (<code>NewLargeObjectSpace</code>)</p>
+
+<h4>6.2 確保ロジック</h4>
+
+<p><code>OldLargeObjectSpace::AllocateRaw</code> (<code class="file-ref">src/heap/large-spaces.cc:108-150</code>) を見ると、</p>
+
+<pre><code class="language-cpp">if (!heap()-&gt;ShouldExpandOldGenerationOnSlowAllocation(local_heap, AllocationOrigin::kRuntime) ||
+    !heap()-&gt;CanExpandOldGeneration(object_size)) {
+  return AllocationResult::Failure();
+}
+heap()-&gt;StartIncrementalMarkingIfAllocationLimitIsReached(...);
+LargePage* page = AllocateLargePage(object_size, executable, hint);
+if (page == nullptr) return AllocationResult::Failure();
+Tagged&lt;HeapObject&gt; object = page-&gt;GetObject();
+if (local_heap-&gt;is_main_thread() &amp;&amp; identity() != SHARED_LO_SPACE) {
+  UpdatePendingObject(object);
+}
+if (v8_flags.sticky_mark_bits || heap()-&gt;incremental_marking()-&gt;black_allocation()) {
+  heap()-&gt;marking_state()-&gt;TryMarkAndAccountLiveBytes(object, object_size);
+}
+page-&gt;Chunk()-&gt;InitializationMemoryFence();
+heap()-&gt;NotifyOldGenerationExpansion(local_heap, identity(), page);
+</code></pre>
+
+<p>ポイント:</p>
+<p>大オブジェクトは <strong>インクリメンタルマーキング進行中は黒で確保</strong> (<code>TryMarkAndAccountLiveBytes</code>)。</p>
+<p><code>InitializationMemoryFence()</code> (<code class="file-ref">memory-chunk.h:232</code>) で並行マーカーに対する初期化完了を保証。</p>
+<p><code>UpdatePendingObject(object)</code> で「まだ初期化中の <code>pending_object_</code>」を <code>MutablePage</code> に記録し、
+  並行マーカーが半分初期化状態を読まないようにする。<code>pending_object_</code> は std::atomic&lt;Address&gt;
+  (<code class="file-ref">large-spaces.h:131-132</code>) で acquire/release で同期。</p>
+
+<h4>6.3 LargePage の上限</h4>
+
+<p><code>LargePage::kMaxCodePageSize = 512 * MB</code> (<code class="file-ref">large-page.h:18</code>) があり、
+old-to-old typed slot のオフセットが overflow しない範囲に抑えるためです。
+コード以外の LargePage に明確な上限は無いですが、Heap 全体の上限により実質的に制限されます。</p>
+
+<h4>6.4 NewLargeObjectSpace</h4>
+
+<p><code>NewLargeObjectSpace::AllocateRaw</code> (<code class="file-ref">large-spaces.cc:346</code>) は GC 後に <code>Flip()</code>、
+<code>OldLargeObjectSpace::PromoteNewLargeObject(page)</code> (<code class="file-ref">large-spaces.cc:182-195</code>) で生き残った
+LargePage を物理的にコピーせず <code>RemovePage</code> + <code>AddPage</code> の所有権変更だけで old に促進します。
+このため LargeObject は scavenger でもコピーされません。</p>
+
+<h3 id="p2-7">7. Allocation メカニズム</h3>
+
+<h4>7.1 AllocationType / AllocationOrigin / AllocationAlignment</h4>
+
+<p><code>enum class AllocationType</code> (<code class="file-ref">src/common/globals.h:1526-1536</code>) は 9 値:
+<code>kYoung</code>, <code>kOld</code>, <code>kCode</code>, <code>kMap</code>, <code>kReadOnly</code>, <code>kSharedOld</code>, <code>kSharedMap</code>,
+<code>kSharedTrusted</code>, <code>kTrusted</code>。</p>
+
+<p><code>enum class AllocationOrigin</code> (<code class="file-ref">src/heap/allocation-result.h:15-22</code>):</p>
+<pre><code class="language-cpp">kGeneratedCode = 0,
+kRuntime       = 1,
+kGC            = 2,
+</code></pre>
+
+<p><code>enum AllocationAlignment</code> (<code class="file-ref">globals.h:1724-1732</code>):</p>
+<pre><code class="language-cpp">kTaggedAligned,    // タグサイズ境界 (既定)
+kDoubleAligned,    // double サイズ境界
+kDoubleUnaligned,  // (addr + kTaggedSize) が double サイズ境界
+</code></pre>
+
+<p><code>AllocationResult</code> (<code class="file-ref">allocation-result.h:26-71</code>) は 1 ワードだけのオブジェクトで、
+<code>Tagged&lt;HeapObject&gt;</code> のスマートラッパ。<code>is_null()</code> で失敗扱い。<code>sizeof(AllocationResult)==kSystemPointerSize</code>
+が <code>static_assert</code> されています。</p>
+
+<h4>7.2 HeapAllocator (LocalHeap ごとの allocator)</h4>
+
+<p><code>HeapAllocator</code> (<code class="file-ref">src/heap/heap-allocator.h:36</code>) はメインスレッド / 各バックグラウンドスレッドに
+1 つずつ存在し、<code>MainAllocator</code> を 5 種類 (new, old, trusted, code, shared, shared_trusted) を
+<code>std::optional</code> で抱えます (<code class="file-ref">heap-allocator.h:210-220</code>):</p>
+
+<pre><code class="language-cpp">std::optional&lt;MainAllocator&gt; new_space_allocator_;
+std::optional&lt;MainAllocator&gt; old_space_allocator_;
+std::optional&lt;MainAllocator&gt; trusted_space_allocator_;
+std::optional&lt;MainAllocator&gt; code_space_allocator_;
+std::optional&lt;MainAllocator&gt; shared_space_allocator_;
+std::optional&lt;MainAllocator&gt; shared_trusted_space_allocator_;
+</code></pre>
+
+<p>ホットパスは <code>AllocateRaw&lt;AllocationType&gt;(...)</code> (<code class="file-ref">src/heap/heap-allocator-inl.h:74-190</code>)。
+ここで大切な分岐:</p>
+
+<pre><code class="language-cpp">const size_t large_object_threshold = heap_-&gt;MaxRegularHeapObjectSize(type);
+const bool large_object = static_cast&lt;size_t&gt;(size_in_bytes) &gt; large_object_threshold;
+if (V8_UNLIKELY(large_object)) {
+  allocation = AllocateRawLargeInternal(size_in_bytes, type, origin, alignment, hint);
+} else {
+  // 8 種の AllocationType 別に各 *_space_allocator_-&gt;AllocateRaw(...) へ
+}
+</code></pre>
+
+<p>つまり「size が large_object_threshold を超えた瞬間に LO_SPACE 系へ自動でルーティング」されます。
+<code>MaxRegularHeapObjectSize(type)</code> (<code class="file-ref">src/heap/heap.h:1484</code>) はコード用には OS ページサイズ依存があるため
+動的、それ以外には実質 <code>kMaxRegularHeapObjectSize</code> 相当となります。</p>
+
+<p>失敗 (<code>AllocationResult::IsFailure()</code>) の場合は、呼び出し側が <code>AllocateRawWith&lt;kLightRetry|kRetryOrFail&gt;</code>
+で再試行します (<code class="file-ref">heap-allocator-inl.h:229-256</code>)。<code>kRetryOrFail</code> を選ぶと最終的に GC をかけて
+<code>AllocateRawSlowPath</code> (<code class="file-ref">heap-allocator.cc:199</code>) → <code>CollectGarbage</code> → 再試行のループに入ります。
+リカバリ不能なら <code>CollectAllAvailableGarbage</code> (<code class="file-ref">heap-allocator.cc:178-197</code>)、最終的に OOM。</p>
+
+<h4>7.3 LAB (LinearAllocationArea) と MainAllocator</h4>
+
+<p>LAB の構造はシンプルで <code>start &lt;= top &lt;= limit</code> の 3 ワードです (<code class="file-ref">src/heap/linear-allocation-area.h:19-124</code>):</p>
+
+<pre><code class="language-cpp">Address start_ = kNullAddress;
+Address top_   = kNullAddress;
+Address limit_ = kNullAddress;
+</code></pre>
+
+<p><code>MainAllocator</code> (<code class="file-ref">src/heap/main-allocator.h:153</code>) はこれをラップし、
+allocator policy (<code>AllocatorPolicy</code> 派生: <code>SemiSpaceNewSpaceAllocatorPolicy</code>,
+<code>PagedSpaceAllocatorPolicy</code>, <code>PagedNewSpaceAllocatorPolicy</code>) を切り替えて使います。</p>
+
+<p>確保 fast path は <code>AllocateFastUnaligned</code> / <code>AllocateFastAligned</code> (<code class="file-ref">main-allocator.h:276-286</code>) で
+<strong>インライン</strong> (<code>V8_INLINE</code>)。コードはおおよそ次のような形:</p>
+
+<pre><code class="language-cpp">if (V8_LIKELY(allocation_info_-&gt;CanIncrementTop(size_in_bytes))) {
+  Address top = allocation_info_-&gt;IncrementTop(size_in_bytes);
+  return AllocationResult::FromObject(HeapObject::FromAddress(top));
+}
+return AllocateRawSlow(size_in_bytes, alignment, origin);
+</code></pre>
+
+<p>ポイントは、<code>allocation_info_</code> の top と limit がインラインで参照できるよう、これらが Isolate の
+<code>IsolateData::new_allocation_info()</code> / <code>old_allocation_info()</code> という固定スロットに置かれ
+(<code class="file-ref">heap-allocator.cc:37-58</code>)、コード生成 (TurboFan / Maglev) からも <code>[isolate_data + offset]</code> で
+最短アクセスできることです。</p>
+
+<p>LAB 拡張 (<code>ExtendLAB</code>, <code class="file-ref">main-allocator.h:259</code>) は PagedNewSpace で使われ、断片化を抑える
+重要な高速化です。</p>
+
+<h4>7.4 GC トリガロジック</h4>
+
+<p>GC を呼ぶのは <code>HeapAllocator::CollectGarbage(allocation, perform_heap_limit_check, gc_reason)</code>
+(<code class="file-ref">heap-allocator.cc:150-176</code>)。トリガ理由は <code>enum class GarbageCollectionReason</code>
+(<code class="file-ref">src/common/globals.h:1594-1627</code>) の 30 値で、たとえば <code>kAllocationFailure = 1</code>、
+<code>kAllocationLimit = 2</code>、<code>kBackgroundAllocationFailure = 25</code>、<code>kLastResort = 13</code> などがあります。</p>
+
+<p>allocation type ごとにどの space で GC するかは <code>AllocationTypeToGCSpace</code> (<code class="file-ref">heap-allocator.cc:129-146</code>):</p>
+
+<pre><code class="language-cpp">constexpr AllocationSpace AllocationTypeToGCSpace(AllocationType type) {
+  switch (type) {
+    case AllocationType::kYoung: return NEW_SPACE;
+    case AllocationType::kOld:
+    case AllocationType::kCode:
+    case AllocationType::kMap:
+    case AllocationType::kTrusted:
+    case AllocationType::kSharedMap:
+    case AllocationType::kSharedOld:
+      return OLD_SPACE;   // 実は OLD_SPACE は "full GC" の意味
+    ...
+  }
+}
+</code></pre>
+
+<p>つまり Young 確保失敗 → Scavenger or MinorMS、Old 系の確保失敗 → Mark-Compact。</p>
+
+<h3 id="p2-8">8. Code Range / VirtualMemory Cage</h3>
+
+<h4>8.1 サイズ定数</h4>
+
+<p><code>kMaximalCodeRangeSize</code> (<code class="file-ref">src/common/globals.h:507-522</code>) はターゲットアーキとビルドオプションに依存:</p>
+
+<table>
+<thead><tr><th>アーキ + 設定</th><th>kMaximalCodeRangeSize</th></tr></thead>
+<tbody>
+<tr><td>PPC64 Linux</td><td>512 MB</td></tr>
+<tr><td>ARM64/LOONG64/RISCV64 + ptr-compr (内部 code)</td><td>128 MB</td></tr>
+<tr><td>ARM64/LOONG64/RISCV64 + 外部 code</td><td>256 MB</td></tr>
+<tr><td>x64 + ptr-compr (内部 code)</td><td>128 MB</td></tr>
+<tr><td>x64 + 外部 code</td><td>512 MB</td></tr>
+<tr><td>他 64bit</td><td>128 MB</td></tr>
+<tr><td>32bit / RISCV32</td><td>0 〜 256 MB</td></tr>
+</tbody>
+</table>
+
+<p><code>kMinimumCodeRangeSize = 64 * MB</code> (<code>:523</code>)。<code>kReservedCodeRangePages</code> (<code>:524-528</code>) は Windows で 1、
+それ以外で 0 — Win64 では unwind 情報用に最初の OS ページを RW で予約するためです。</p>
+
+<h4>8.2 CodeRange クラス</h4>
+
+<p><code>class CodeRange final : public VirtualMemoryCage</code> (<code class="file-ref">src/heap/code-range.h:112-183</code>)。
+インライン ASCII 図がそのまま重要なドキュメントです (<code class="file-ref">code-range.h:82-104</code>)。</p>
+
+<pre><code class="language-text">+---------+---------+-----------------  ~~~  -+
+|   RW    |   ...   |     ...                 |
++---------+---------+------------------ ~~~  -+
+^                   ^
+base                allocatable base
+&lt;------------------&gt;&lt;-------------------------&gt;
+   non-allocatable     allocatable region
+</code></pre>
+
+<p><code>InitReservation(page_allocator, requested, immutable)</code> (<code>:146</code>) でアドレス空間を予約し、
+<code>GetWritableReservedAreaSize()</code> (<code>:118</code>) で先頭の RW 領域サイズを返します (= kReservedCodeRangePages
+分)。<code>RemapEmbeddedBuiltins(isolate, embedded_blob_code, ...)</code> (<code>:161</code>) で組み込みビルトインを
+この CodeRange の中にもう一度マップし、短い相対呼び出しを可能にします (これが <code>short builtin calls</code>
+最適化)。</p>
+
+<h4>8.3 VirtualMemoryCage</h4>
+
+<p><code class="file-ref">src/utils/allocation.h:356-419</code> の <code>class VirtualMemoryCage</code> は CodeRange と TrustedRange の共通基底:</p>
+
+<pre><code class="language-cpp">Address base_ = kNullAddress;
+size_t size_ = 0;
+std::unique_ptr&lt;base::BoundedPageAllocator&gt; page_allocator_;
+VirtualMemory reservation_;
+</code></pre>
+
+<p><code>ReservationParams</code> には <code>reservation_size</code>, <code>base_alignment</code>, <code>page_size</code>,
+<code>requested_start_hint</code>, <code>permissions</code>, <code>page_initialization_mode</code>, <code>page_freeing_mode</code>
+を取り、<code>InitReservation</code> (<code>:408</code>) で <code>BoundedPageAllocator</code> を生成します。</p>
+
+<h4>8.4 PtrComprCage</h4>
+
+<p><code>#ifdef V8_COMPRESS_POINTERS</code> の下で</p>
+<pre><code class="language-cpp">constexpr size_t kPtrComprCageReservationSize = size_t{1} &lt;&lt; 32;  // = 4 GB
+constexpr size_t kPtrComprCageBaseAlignment   = size_t{1} &lt;&lt; 32;  // = 4 GB
+</code></pre>
+<p>(<code class="file-ref">include/v8-internal.h:166-168</code>)。すなわち PtrCompr 有効時、V8 は <strong>4 GB アラインで 4 GB 連続</strong>の
+仮想アドレス空間を予約し、その先頭 32bit をオフセットとして「圧縮ポインタ」を表現します。
+このため Heap 全体 (RO_SPACE 含む) はこの 4 GB cage に収まらなければならず、
+<code>max_old_generation_size</code> の上限が <code>kAllocatorLimitOnMaxOldGenerationSize = kPtrComprCageReservationSize</code>
+(<code class="file-ref">src/heap/heap.h:322-323</code>) に設定されています。</p>
+
+<h3 id="p2-9">9. Sandbox (V8 Sandbox)</h3>
+
+<h4>9.1 構造</h4>
+
+<p><code>class Sandbox</code> (<code class="file-ref">src/sandbox/sandbox.h:48-347</code>) のヘッダコメントが概念図を持っています
+(<code class="file-ref">sandbox.h:50-60</code>):</p>
+
+<pre><code class="language-text">+-  ~~~  -+----------------------------------------  ~~~  -+-  ~~~  -+
+|  32 GB  |                 (Ideally) 1 TB                 |  32 GB  |
+|         |                                                |         |
+| Guard   |      4 GB      :  ArrayBuffer backing stores,  | Guard   |
+| Region  |    V8 Heap     :  WASM memory buffers, and     | Region  |
+| (front) |     Region     :  any other sandboxed objects. | (back)  |
++-  ~~~  -+----------------+-----------------------  ~~~  -+-  ~~~  -+
+</code></pre>
+
+<p>サイズ定数 (<code class="file-ref">include/v8-internal.h:220-302</code>):</p>
+
+<pre><code class="language-cpp">#if defined(V8_TARGET_OS_ANDROID)
+  constexpr size_t kSandboxSizeLog2 = 37;  // 128 GB
+#elif defined(V8_TARGET_OS_IOS)
+  constexpr size_t kSandboxSizeLog2 = 34;  // 16 GB
+#elif defined(V8_HOST_ARCH_RISCV64) || defined(V8_TARGET_ARCH_LOONG64)
+  constexpr size_t kSandboxSizeLog2 = 37;  // 128 GB
+#else
+  constexpr size_t kSandboxSizeLog2 = 40;  // 1 TB
+#endif
+constexpr size_t kSandboxSize = 1ULL &lt;&lt; kSandboxSizeLog2;
+constexpr size_t kSandboxAlignment = kPtrComprCageBaseAlignment;  // 4 GB
+constexpr uint64_t kSandboxedPointerShift = 64 - kSandboxSizeLog2;
+constexpr size_t kSandboxMinimumReservationSize = 8ULL * GB;
+constexpr size_t kMaxSafeBufferSizeForSandbox = 32ULL * GB - 1;
+constexpr size_t kBoundedSizeShift = 29;
+constexpr size_t kSandboxGuardRegionSize =
+    32ULL * GB + (kMaxSafeBufferSizeForSandbox + 1);
+</code></pre>
+
+<p>Sandbox サイズは通常 1 TB、前後に 32 GB の guard region (PROT_NONE) を置き、
+その間に PtrCompr cage (4GB) が冒頭に座り、残り (約 1 TB) は ArrayBuffer や WebAssembly memory に
+使えるという設計です。さらに <code>kSmiAddressRange = 4 * GB</code> (<code class="file-ref">sandbox.h:77</code>) を先頭に予約 (<code>PROT_NONE</code>)
+することで Smi(値)と HeapObject(ポインタ) の取り違えバグを mitigate します。</p>
+
+<h4>9.2 サンドボックスのポリシー</h4>
+
+<p><code>bool Contains(Address addr)</code> (<code class="file-ref">sandbox.h:191-194</code>) は単純な範囲チェック:</p>
+<pre><code class="language-cpp">bool Contains(Address addr) const {
+  return base::IsInHalfOpenRange(addr, base_, base_ + size_);
+}
+</code></pre>
+<p><code>OutsideSandbox(addr)</code> (<code class="file-ref">sandbox.h:355-364</code>) は trusted オブジェクトのアサーションに使います。</p>
+
+<h4>9.3 Sandboxed Pointer / External Pointer Table / Trusted Pointer Table</h4>
+
+<p>オフセット型のサンドボックスポインタは <code>SandboxedPointer_t = Address</code> (<code class="file-ref">v8-internal.h:216</code>)。
+インデックス型の外部ポインタは <code>ExternalPointerTable</code> (<code class="file-ref">src/sandbox/external-pointer-table.h:39-</code>)
+が管理する <code>ExternalPointerTableEntry</code> を介します。エントリは 1 ワードに「外部ポインタ実値 +
+type tag + marking bit」を埋め込み、フリーリストエントリ・避難エントリも同じ 1 ワードに
+別エンコーディングで共存します。</p>
+
+<p>ExternalEntityTable (<code class="file-ref">src/sandbox/external-entity-table.h:53-</code>) は <code>SegmentedTable&lt;Entry, size&gt;</code> を
+基底にしたページング型データ構造で、<code>kSegmentSize</code>, <code>kEntriesPerSegment</code>, <code>kEntrySize</code>
+(<code>:61-63</code>) という定数を持ちます。Space (<code>:80-</code>) は同じ freelist を共有するセグメントの集合で、
+young/old 分離や複数 Isolate での独立 GC など、Heap の二次元的な構造をテーブル側にも持ち込んだ形です。</p>
+
+<p><code>Heap</code> 側からはこれらのテーブルへ「自分の Space」を介してアクセスします
+(<code class="file-ref">src/heap/heap.h:2177-2197</code>):</p>
+
+<pre><code class="language-cpp">#ifdef V8_COMPRESS_POINTERS
+ExternalPointerTable::Space young_external_pointer_space_;
+ExternalPointerTable::Space old_external_pointer_space_;
+ExternalPointerTable::Space read_only_external_pointer_space_;
+CppHeapPointerTable::Space cpp_heap_pointer_space_;
+#endif
+#ifdef V8_ENABLE_SANDBOX
+TrustedPointerTable::Space trusted_pointer_space_;
+CodePointerTable::Space code_pointer_space_;
+#endif
+JSDispatchTable::Space js_dispatch_table_space_;
+JSDispatchTable::Space read_only_js_dispatch_table_space_;
+</code></pre>
+
+<h4>9.4 TrustedSpace / TrustedRange</h4>
+
+<p><code>TrustedRange</code> (<code class="file-ref">src/heap/trusted-range.h:22-26</code>) は VirtualMemoryCage 派生で、
+Sandbox 有効時に「sandbox の外側」へ独立に予約される 512 MB 〜 1 GB の cage です。
+ここに <code>TRUSTED_SPACE</code> / <code>TRUSTED_LO_SPACE</code> / <code>SHARED_TRUSTED_*</code> のページが置かれ、
+攻撃者が sandbox 内のメモリ corruption で書き換えられない領域となります。
+これにより、JIT コードのエントリポイントやインタプリタのバイトコード配列など
+「破壊されると即任意コード実行に直結する」データを安全に保ちます。</p>
+
+<p>メタデータポインタテーブル <code>MemoryChunkConstants::kMetadataPointerTableSize</code>
+(<code class="file-ref">memory-chunk-constants.h:33-36</code>) は <strong>main cage + trusted cage + code cage</strong> 内のページ数の合計を
+覆うサイズに切り上げられます。Sandbox 内の <code>MemoryChunk</code> ヘッダから信頼できる <code>BasePage</code> を取得する
+唯一のルートになります。</p>
+
+<h3 id="p2-10">10. 補足 — 主要な数値のまとめ</h3>
+
+<table>
+<thead><tr><th>項目</th><th>値 / 計算式</th><th>ファイル / 行</th></tr></thead>
+<tbody>
+<tr><td><code>kPageSizeBits</code> (x64/arm64)</td><td>18</td><td><code class="file-ref">src/base/build_config.h:80</code></td></tr>
+<tr><td><code>kRegularPageSize</code></td><td><code>1 &lt;&lt; kPageSizeBits</code> = <strong>256 KB</strong></td><td><code class="file-ref">src/base/build_config.h:83</code></td></tr>
+<tr><td><code>kMaxRegularHeapObjectSize</code></td><td><code>1 &lt;&lt; (kPageSizeBits - 1)</code> = <strong>128 KB</strong></td><td><code class="file-ref">src/common/globals.h:720</code></td></tr>
+<tr><td><code>kMinimumOSPageSize</code></td><td>4 KB / 16 KB / 64 KB (環境依存)</td><td><code class="file-ref">src/base/build_config.h:88-105</code></td></tr>
+<tr><td><code>kSpaceTagSize</code></td><td>4 bits</td><td><code class="file-ref">src/common/globals.h:1468</code></td></tr>
+<tr><td><code>kDefaultMinHeapSize</code></td><td>256 MB</td><td><code class="file-ref">src/heap/heap.h:313</code></td></tr>
+<tr><td><code>kDefaultMaxHeapSize</code></td><td>4 GB (64bit) / 1 GB (32bit)</td><td><code class="file-ref">src/heap/heap.h:315-317</code></td></tr>
+<tr><td>Scavenger 既定 max semi-space</td><td>32 MB</td><td><code class="file-ref">src/heap/heap.cc:4840</code></td></tr>
+<tr><td>MinorMS 既定 max semi-space</td><td>72 MB</td><td><code class="file-ref">src/heap/heap.cc:4835</code></td></tr>
+<tr><td><code>DefaultMinSemiSpaceSize</code></td><td>512 KB</td><td><code class="file-ref">src/heap/heap.cc:4828-4830</code></td></tr>
+<tr><td>FreeList カテゴリ数</td><td>24</td><td><code class="file-ref">src/heap/free-list.h:327</code></td></tr>
+<tr><td>FreeList 最小ブロック</td><td><code>3 * kTaggedSize</code> (= 12B ptr-compr / 24B no-compr)</td><td><code class="file-ref">src/heap/free-list.h:310</code></td></tr>
+<tr><td><code>kBitsPerBucket</code> (SlotSet)</td><td>1024</td><td><code class="file-ref">src/heap/base/basic-slot-set.h:283</code></td></tr>
+<tr><td>MarkingBitmap セル / ページ</td><td>1024 cells (8 KB)</td><td><code class="file-ref">src/heap/marking.h:108-114</code></td></tr>
+<tr><td><code>kPtrComprCageReservationSize</code></td><td>4 GB</td><td><code class="file-ref">include/v8-internal.h:167</code></td></tr>
+<tr><td><code>kSandboxSize</code></td><td>16 GB / 128 GB / 1 TB</td><td><code class="file-ref">include/v8-internal.h:225-246</code></td></tr>
+<tr><td><code>kMaximalCodeRangeSize</code> (x64 内部 code)</td><td>128 MB</td><td><code class="file-ref">src/common/globals.h:515-517</code></td></tr>
+<tr><td><code>kMaximalCodeRangeSize</code> (x64 外部 code)</td><td>512 MB</td><td><code class="file-ref">src/common/globals.h:515-517</code></td></tr>
+<tr><td><code>kMaximalTrustedRangeSize</code></td><td>1 GB</td><td><code class="file-ref">src/common/globals.h:531</code></td></tr>
+<tr><td><code>LargePage::kMaxCodePageSize</code></td><td>512 MB</td><td><code class="file-ref">src/heap/large-page.h:18</code></td></tr>
+</tbody>
+</table>
+
+<h3 id="p2-11">11. 主要参照ファイル一覧 (絶対パス)</h3>
+
+<p>レポートで言及した主なファイル群:</p>
+
+<p><code class="file-ref">/home/user/v8/src/heap/heap.h</code>, <code class="file-ref">/home/user/v8/src/heap/heap.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/heap-layout.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/heap-allocator.h</code>, <code class="file-ref">/home/user/v8/src/heap/heap-allocator-inl.h</code>, <code class="file-ref">/home/user/v8/src/heap/heap-allocator.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/main-allocator.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/linear-allocation-area.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/memory-allocator.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/memory-chunk.h</code>, <code class="file-ref">/home/user/v8/src/heap/memory-chunk-layout.h</code>, <code class="file-ref">/home/user/v8/src/heap/memory-chunk-constants.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/base-page.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/mutable-page.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/normal-page.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/large-page.h</code>, <code class="file-ref">/home/user/v8/src/heap/large-spaces.h</code>, <code class="file-ref">/home/user/v8/src/heap/large-spaces.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/new-spaces.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/paged-spaces.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/read-only-spaces.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/spaces.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/free-list.h</code>, <code class="file-ref">/home/user/v8/src/heap/free-list.cc</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/marking.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/slot-set.h</code>, <code class="file-ref">/home/user/v8/src/heap/base/basic-slot-set.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/code-range.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/trusted-range.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/heap/allocation-result.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/execution/isolate.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/common/globals.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/base/build_config.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/utils/allocation.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/sandbox.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/sandbox/external-entity-table.h</code>, <code class="file-ref">/home/user/v8/src/sandbox/external-pointer-table.h</code></p>
+<p><code class="file-ref">/home/user/v8/include/v8-internal.h</code></p>
+<p><code class="file-ref">/home/user/v8/src/flags/flag-definitions.h</code></p>
+
+<h3 id="p2-12">12. まとめと観察</h3>
+
+<p>V8 の Heap 設計は、長年にわたって <strong>「セキュリティ強化」</strong> と <strong>「マルチ Isolate 対応」</strong>
+の 2 軸で大きな変革を経ています。本稿でなぞった概念的ハイライトを最後にまとめます。</p>
+
+<p>第一に、Heap は <code>enum AllocationSpace</code> で表される 13 種の Space を <code>std::unique_ptr&lt;Space&gt;</code> の配列で
+持ち、各 Space は MemoryAllocator が用意したページから物を切り出します。NEW_SPACE は伝統的な
+semi-space 構成と新しい PagedNewSpace の 2 流派が共存し、<code>v8_flags.minor_ms</code> で切り替え可能です。</p>
+
+<p>第二に、各 Space で確保されるオブジェクトは <code>kMaxRegularHeapObjectSize</code>
+(= ページサイズの半分 = 通常 128KB) を境に「通常ページ」と「LargeObject ページ」に振り分けられます。
+ページサイズ自体は <code>kRegularPageSize = 1 &lt;&lt; kPageSizeBits</code> で、通常は 256 KB ですが PPC や hugepage
+構成では別の値です。<code>MemoryChunk</code> のアドレスはこの大きさにアラインされ、<code>addr &amp; ~kAlignmentMask</code>
+だけでチャンクを定数時間で求められます。</p>
+
+<p>第三に、確保のフロントエンドは <code>HeapAllocator</code> (LocalHeap ごと) で、ホットパスは <code>MainAllocator</code>
+の <code>LinearAllocationArea</code> (top/limit/start の 3 ワード) を進めるだけです。
+LAB が枯渇したときに各 <code>AllocatorPolicy</code> が free-list refill か新ページ確保かを判断し、
+失敗すれば GC 呼び出し → 再試行 → 最終的に OOM、という階段を降ります。</p>
+
+<p>第四に、FreeList は 24 のサイズカテゴリを持ち、<code>FreeListManyCachedOrigin</code> が GC か Runtime かで
+戦略 (best-fit vs first-fit-with-overallocation) を切り替えます。これがオブジェクトサイズ毎の
+<strong>自動的なヒューリスティック</strong>として効きます。</p>
+
+<p>第五に、Sandbox 構成 (<code>V8_ENABLE_SANDBOX</code>) ではアドレス空間全体が
+「<strong>1 TB の Sandbox + 前後 32 GB の guard + 4 GB の PtrCompr cage + 外側の TrustedRange/CodeRange</strong>」
+という多層構造になります。<code>MemoryChunk</code> から信頼できる <code>BasePage</code> を得るには
+<strong>MetadataPointerTable</strong> という別テーブル経由のインダイレクションが入り、Sandbox 内のフラグ corruption
+を許容する設計です。External pointers / Trusted pointers / Code pointers といった「sandbox 外の世界」
+への参照は、Isolate ごとのテーブル経由でインデックス化され、攻撃者が偽のポインタ値を構築するのを
+防ぎます。</p>
+
+<p>結果として、現代の V8 ヒープは <strong>「アドレス空間そのものを信頼境界として使う」</strong>
+モダンな memory safety 強化の典型例となっており、本稿で触れた <code>MemoryChunk</code> のフラグやレイアウト、
+<code>AllocationSpace</code> の細分化、SlotSet/MarkingBitmap の置き場所などのすべてが、その総合的な戦略の
+パーツとして配置されています。</p>
+
+</section>
+

@@ -1,0 +1,34 @@
+<h2 id="section-7">7. TryFastFlat 第二パス</h2>
+
+<p>行 184 から始まる <code>TryFastFlat</code> の本体は、第一パスで取得した <code>FlattenedLengthResult</code> (length と targetKind) を元にバッキングストアを 1 回だけ確保し、再走査して値を流し込みます。</p>
+
+<h3 id="section-7-1">7.1 PACKED_DOUBLE 専用経路</h3>
+
+<p>行 200-276 が <code>info.targetKind == ElementsKind::PACKED_DOUBLE_ELEMENTS</code> 専用の分岐です。最初に <code>AllocateFixedDoubleArrayWithHoles(SmiUntag(flattenedLength))</code> (行 203-204) で <code>FixedDoubleArray</code> を確保します。</p>
+
+<p><code>AllocateFixedDoubleArrayWithHoles</code> の動作 (<code class="file-ref">src/codegen/code-stub-assembler.h</code> 行 2304) は、<code>AllocateFixedArray(PACKED_DOUBLE_ELEMENTS, capacity, flags)</code> を呼んだ後 <code>FillFixedArrayWithValue(PACKED_DOUBLE_ELEMENTS, ..., RootIndex::kTheHoleValue)</code> を呼ぶ二段階で、<code>StoreDoubleHole</code> (CSA cc 行 6078) によって <code>kHoleNanInt64</code> ビットパターン (<code>0xFFF7FFFF_FFF7FFFF</code>) を 64 ビットストアで書きます。</p>
+
+<p>値を格納する行 251-252 では</p>
+
+<pre><code class="language-torque">doubleElements.values[targetIndex] =
+    Convert&lt;float64_or_undefined_or_hole&gt;(UnsafeCast&lt;Number&gt;(element));
+</code></pre>
+
+<p><code>element</code> (tagged Number) を <code>Convert&lt;float64_or_undefined_or_hole&gt;</code> で float64 へ変換し、<code>FixedDoubleArray::values[]=</code> operator で生 float64 を書き込みます。</p>
+
+<p>これが tagged 経路より速い理由は複数あります。第一に <code>FixedArray&lt;Object&gt;</code> 経由なら tagged Number (Smi または HeapNumber ポインタ) をそのまま <code>objects</code> セルに書き込み、結果を <code>PACKED_DOUBLE_ELEMENTS</code> JSArray にしたければ後段で全要素を unbox する追加パスが必要です。第二に各 HeapNumber は 16 バイトの独立ヒープオブジェクトで、leaf に float64 値が n 個あれば最悪 16n バイトの HeapNumber 群と 8n バイトの tagged ポインタ配列、合計 24n バイトとプロモーション用 write barrier を支払うことになります。<code>FixedDoubleArray</code> 直接書き込みなら 8n バイトのみで、HeapNumber アロケーションは 0 になり write barrier も不要 (double セルは GC ルートとして辿られない) です。第三に SIMD / ストアバッファ的観点でも、連続 8 バイト書き込みのほうがハードウェア的に効率が良いという点があります。</p>
+
+<h3 id="section-7-2">7.2 PACKED_ELEMENTS / PACKED_SMI_ELEMENTS 経路</h3>
+
+<p>行 278-349 が一般経路です。<code>NewFlatVector(flattenedLength)</code> (行 278、行 37-42 のマクロ) で <code>length &gt; 0 ? AllocateFixedArrayWithHoles(SmiUntag(length)) : kEmptyFixedArray</code> の三項演算で FixedArray を確保し、<code>FlatVector</code> struct でラップします。</p>
+
+<p><code>AllocateFixedArrayWithHoles</code> の動作 (<code class="file-ref">src/codegen/code-stub-assembler.h</code> 行 2295) は、<code>AllocateFixedArray(PACKED_ELEMENTS, capacity, flags)</code> を呼んだ後 <code>FillFixedArrayWithValue(PACKED_ELEMENTS, ..., RootIndex::kTheHoleValue)</code> で全スロットを <code>the_hole_value</code> ROOT (read-only に置かれた <code>TheHole</code> シングルトン HeapObject へのポインタ) で初期化します。これは write barrier なしで行えます (<code>the_hole_value</code> は read-only space にあり世代間ポインタを作ることがないため)。</p>
+
+<p>値を格納する行 325 <code>vector.StoreResult(targetIndex, element);</code> は <code>FlatVector</code> の macro 経由で <code>fixedArray.objects[index] = result</code> を実行します。最後に <code>vector.CreateJSArray(info.targetKind)</code> (行 349) で対応 Map を <code>LoadJSArrayElementsMap(targetKind, LoadNativeContext(context))</code> で取って <code>NewJSArray(map, fixedArray)</code> を組み立てて返します。</p>
+
+<h3 id="section-7-3">7.3 結果検証</h3>
+
+<p>両経路の最後 (行 274、行 348) で <code>if (targetIndex != flattenedLength) goto Bailout</code> の整合性チェックがあります。第一パスで計算した長さと第二パスで実際に書き込んだ件数が一致しなかった場合の最後の安全弁です。get accessor 中で配列の状態が変わるなど、Recheck で捕捉できなかった微妙な差分が出た場合の保険になります。</p>
+
+<hr/>
+

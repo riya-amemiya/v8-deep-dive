@@ -1,0 +1,96 @@
+<section class="bridge" id="bridge-4">
+<h2>第 4 章への導入</h2>
+
+<div class="chapter-prelude">
+<div class="prelude-card">
+<h4>第 3 章までで学んだこと</h4>
+<p>V8 ヒープの仕組み、GC、そしてビルトインを書くための言語 Torque を理解しました。 ここまでは V8 の基盤を学ぶフェーズでした。 ここから先は「実際の JavaScript オブジェクトはどう実装されているか」を見ていきます。</p>
+</div>
+<div class="prelude-card next">
+<h4>この章で学ぶこと</h4>
+<ul>
+<li>JSArray のオブジェクトレイアウト</li>
+<li>ElementsKind の全種類と遷移ラティス (第 1 章で概観したものを精密に)</li>
+<li>PACKED と HOLEY の根本的な違いと性能差</li>
+<li>Smi / Unboxed Double / Hole の物理表現</li>
+<li>FixedArray / FixedDoubleArray のメモリレイアウト</li>
+<li>容量の拡大アルゴリズム (1.5x + 16)</li>
+<li>Right Trim と Left Trim</li>
+<li>Copy-on-Write 配列</li>
+<li>Dictionary Mode への降格条件</li>
+<li>Protector cells による楽観的最適化</li>
+<li>SIMD 命令を使った高速ビルトイン</li>
+</ul>
+</div>
+</div>
+
+<p>第 1 章で「ElementsKind は 13 種類以上ある」と紹介しました。 この章でその全種類が登場します。 さらに第 2 章で見た「Tagged Pointer」「Write Barrier」「Dictionary」がすべて配列の文脈で再登場し、第 3 章で学んだ Torque のコード片も登場します。</p>
+
+<div class="callout tip">
+<span class="callout-label">なぜ配列を取り上げるのか</span>
+<p>配列は JavaScript の最も重要なオブジェクト型で、V8 の最適化の精華が詰まっています。 ElementsKind による多段スペシャライゼーション、Hole の NaN-tagging 表現、Copy-on-Write、Protector による楽観的高速化、これらすべてが配列ひとつに統合されています。 配列を理解できれば、他のあらゆる V8 内部オブジェクトの設計思想が見通せるようになります。</p>
+</div>
+
+<div class="svg-container">
+<svg viewBox="0 0 800 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ElementsKind 遷移ラティス">
+<defs>
+<marker id="arr4" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+<path d="M0,0 L0,6 L9,3 z" fill="#c2410c"/>
+</marker>
+</defs>
+
+<rect x="20" y="20" width="760" height="320" rx="12" fill="#fbfaf7" stroke="#b8af96" stroke-width="2"/>
+<text x="400" y="48" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="800" fill="#0d1117">ElementsKind 遷移ラティス (一方通行)</text>
+
+<g>
+<rect x="300" y="70" width="200" height="50" rx="8" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+<text x="400" y="92" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#14532d">PACKED_SMI_ELEMENTS</text>
+<text x="400" y="108" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#14532d">FixedArray ・ 全要素 Smi ・ 穴なし (最高速)</text>
+</g>
+
+<g>
+<rect x="80" y="150" width="200" height="50" rx="8" fill="#fef3c7" stroke="#c2410c" stroke-width="2"/>
+<text x="180" y="172" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#7c2d12">HOLEY_SMI_ELEMENTS</text>
+<text x="180" y="188" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#7c2d12">穴を含む</text>
+</g>
+
+<g>
+<rect x="520" y="150" width="200" height="50" rx="8" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+<text x="620" y="172" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#1e3a8a">PACKED_DOUBLE_ELEMENTS</text>
+<text x="620" y="188" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#1e3a8a">FixedDoubleArray ・ unboxed</text>
+</g>
+
+<g>
+<rect x="300" y="220" width="200" height="50" rx="8" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+<text x="400" y="242" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#1e3a8a">HOLEY_DOUBLE_ELEMENTS</text>
+<text x="400" y="258" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#1e3a8a">穴は kHoleNanInt64 で表現</text>
+</g>
+
+<g>
+<rect x="80" y="290" width="200" height="50" rx="8" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+<text x="180" y="312" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#5b21b6">PACKED_ELEMENTS</text>
+<text x="180" y="328" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b21b6">任意 Object</text>
+</g>
+
+<g>
+<rect x="520" y="290" width="200" height="50" rx="8" fill="#fce7f3" stroke="#be185d" stroke-width="3"/>
+<text x="620" y="312" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#9f1239">HOLEY_ELEMENTS</text>
+<text x="620" y="328" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#9f1239">TERMINAL (最も汎用・最終)</text>
+</g>
+
+<path d="M330,120 Q230,130 200,150" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arr4)"/>
+<text x="248" y="135" font-family="sans-serif" font-size="9" fill="#7c2d12">delete or sparse 代入</text>
+
+<path d="M470,120 Q560,130 600,150" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arr4)"/>
+<text x="490" y="135" font-family="sans-serif" font-size="9" fill="#1e3a8a">double 代入</text>
+
+<path d="M180,200 Q180,250 300,250" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arr4)"/>
+<path d="M620,200 Q620,260 500,250" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arr4)"/>
+
+<path d="M280,260 Q220,280 200,290" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arr4)"/>
+<path d="M180,340 Q400,355 520,322" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arr4)"/>
+<path d="M400,270 Q540,290 600,290" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arr4)"/>
+</svg>
+<div class="svg-caption">図 B4-1 / ElementsKind の遷移は不可逆な一方通行 (詳細は本章で展開)</div>
+</div>
+</section>

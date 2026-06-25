@@ -1,0 +1,12 @@
+<h2 id="section-11">11. flatMap との関係とコンパイル時特殊化</h2>
+
+<p><code>ArrayPrototypeFlatMap</code> (行 580-609) は仕様上 <code>FlattenIntoArray</code> を depth = 1 固定で mapperFunction 付きで呼ぶエイリアスで、array-flat.tq 行 605 <code>FlattenIntoArrayWithMapFn(a, o, len, 0, 1, mapfn, t)</code> がその仕様を 1 対 1 でなぞります。</p>
+
+<p>dispatcher <code>FlattenIntoArray</code> (行 500-513) は <code>hasMapper: constexpr bool</code> というコンパイル時定数引数を取り、これを <code>FlattenIntoArrayFast</code> と <code>FlattenIntoArraySlow</code> の両方に渡します。両 macro の内部 (行 384-388、行 459-463) で <code>if constexpr (hasMapper) { element = Call(context, mapfn, thisArgs, element, sourceIndex, source); }</code> というガードを置いており、<code>if constexpr</code> は Torque のコンパイル時条件分岐で false の場合は当該ブロックがそもそも生成コードに残らず完全に消えます。</p>
+
+<p>具体的には flat から呼ばれる <code>FlattenIntoArrayWithoutMapFn</code> は <code>FlattenIntoArray(..., false, Undefined, Undefined)</code> を呼ぶので、特殊化された生成コードでは Call 命令も、mapfn / thisArgs を保持するレジスタやスタックスロットも生成されません。flatMap から呼ばれる <code>FlattenIntoArrayWithMapFn</code> は <code>true, mapfn, t</code> を渡し、別個の特殊化が生成されます。結果として二つの builtin はそれぞれ独立した機械語コードを持ち、flat 経由のコードに mapper 関連のオーバーヘッドはまったく載りません。</p>
+
+<p>ただし <code>TryFastFlat</code> (行 184-350) は mapper を受け取らない直接実装で flat 専用です。flatMap 側は dispatcher の <code>FlattenIntoArrayFast</code> に直接入り、そこで <code>if constexpr (hasMapper)</code> 分岐を経由します。これは flatMap の depth = 1 という制約のため再帰や <code>TryFastFlat</code> のような明示スタック手法を採る必要が薄いという設計判断によるものです。</p>
+
+<hr/>
+

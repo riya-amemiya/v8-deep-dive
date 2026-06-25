@@ -1,0 +1,53 @@
+<h2 id="chapter8">第8章 Protector cells ― 楽観的最適化の鍵</h2>
+
+<p>V8 の配列メソッドが高速に動くのは、ECMAScript の仕様が定める「フックポイント」のうち実際にはほぼ誰も触らないものを楽観的に無視するからです。たとえば <code>Array.prototype.map</code> は仕様上、結果配列のコンストラクタを <code>Symbol.species</code> 経由で取得すべきですが、ほとんどの実コードでは <code>Array[Symbol.species]</code> は元の Array のままです。</p>
+
+<p>V8 はこの「ほぼ全コードで成り立つ条件」を Protector cell という1bit のグローバル状態として保持し、最適化されたコードは Protector cell が有効である限りその仕様分岐を省略します。<code>Symbol.species</code> が改変された瞬間、Protector cell が無効化され、それに依存していた最適化コードはすべて deopt します。</p>
+
+<p>Protector の一覧は <code class="file-ref">src/execution/protectors.h:18</code> の <code>DECLARED_PROTECTORS_ON_ISOLATE</code> マクロで宣言されています。</p>
+
+<pre><code class="language-cpp">class Protectors : public AllStatic {
+ public:
+  static const int kProtectorValid = 1;
+  static const int kProtectorInvalid = 0;
+
+#define DECLARED_PROTECTORS_ON_ISOLATE(V)                                   \
+  V(ArrayBufferDetaching, ArrayBufferDetachingProtector, ...)               \
+  V(ArrayBufferMutable, ArrayBufferMutableProtector, ...)                   \
+  V(ArrayIteratorLookupChain, ArrayIteratorProtector, ...)                  \
+  V(ArraySpeciesLookupChain, ArraySpeciesProtector, ...)                    \
+  V(IsConcatSpreadableLookupChain, IsConcatSpreadableProtector, ...)        \
+  V(NoElements, NoElementsProtector, no_elements_protector)                 \
+  ...
+</code></pre>
+
+<p>各 Protector は isolate root に格納される PropertyCell で、<code>Smi(1)</code> なら intact、<code>Smi(0)</code> なら invalidated を意味します。一度 invalidate されると不可逆です。</p>
+
+<p>Invalidate のコードは <code class="file-ref">src/execution/protectors.cc:48</code> のマクロで生成されます。</p>
+
+<pre><code class="language-cpp">#define INVALIDATE_PROTECTOR_ON_ISOLATE_DEFINITION(name, unused_index, cell) \
+  void Protectors::Invalidate##name(Isolate* isolate) {                     \
+    DCHECK(IsSmi(isolate-&gt;factory()-&gt;cell()-&gt;value()));                     \
+    DCHECK(Is##name##Intact(isolate));                                      \
+    ...                                                                     \
+    isolate-&gt;factory()-&gt;cell()-&gt;InvalidateProtector(isolate);               \
+    DCHECK(!Is##name##Intact(isolate));                                     \
+  }
+</code></pre>
+
+<p><code>InvalidateProtector</code> は PropertyCell の中身を <code>Smi(0)</code> に書き換え、それに依存している最適化済みコード (DependentCode の weak リンク集合) を deopt キューに入れます。</p>
+
+<p>配列まわりで最も重要な4つを取り上げます。</p>
+
+<p>ArraySpeciesProtector は <code>Array.prototype.constructor</code> や <code>Array[Symbol.species]</code> が元のままであるかを保証します。これが有効な間は <code>map</code>、<code>filter</code>、<code>slice</code> などの結果は必ず <code>new Array()</code> で作れます。無効化条件は <code>Array.prototype.constructor</code> の書き換え、<code>Array[Symbol.species]</code> の書き換えや削除、<code>Object.setPrototypeOf</code> による prototype 変更などです。</p>
+
+<p>ArrayIteratorProtector は <code>Array.prototype[Symbol.iterator]</code> と <code>%ArrayIteratorPrototype%.next</code> が元のままであるかを保証します。これが有効な間は <code>for-of</code> ループや spread 構文を fast path でインライン化できます。</p>
+
+<p>NoElementsProtector は <code>Array.prototype</code> と <code>Object.prototype</code> に整数添字のプロパティが追加されていないことを保証します。これにより HOLEY な配列で穴を読んだとき、プロトタイプチェーンを実際に辿らずに即座に <code>undefined</code> を返せます。<code>Array.prototype[10] = 'x'</code> のような操作はこの Protector を即座に無効化し、世界中の全ての HOLEY 配列の最適化を壊します。</p>
+
+<p>IsConcatSpreadableProtector は <code>Array.prototype[Symbol.isConcatSpreadable]</code> がデフォルトであり、JSArray 以外のオブジェクトを <code>concat</code> でスプレッド対象にしないことを保証します。これが有効な間、concat の fast path は引数を全て1つの単位として連結できます。</p>
+
+<p>これらの Protector はオブジェクト初期化の極めて早い段階でセットされ、ユーザーコードが該当のフックポイントを touch するまで有効に保たれます。Web アプリケーションのコードベースで <code>Symbol.species</code> を実際に使う割合は数パーセント未満と推定され、V8 はこの圧倒的多数のケースで分岐を省略する戦略を取っています。</p>
+
+<hr>
+

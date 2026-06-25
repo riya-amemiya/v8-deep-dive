@@ -1,0 +1,399 @@
+<h2 id="ch2">第2章 HeapObject と Object 階層</h2>
+
+<h3 id="ch2-1">2.1 V8_OBJECT マクロと #pragma pack(4)</h3>
+
+<p>V8 のヒープオブジェクトはすべて <code>V8_OBJECT</code> マクロで装飾されたクラスで定義されます。このマクロは <code>#pragma pack(4)</code> を発行して構造体のアライメントを 4 バイトに切り詰め、さらに <code>-Wpadded</code> をエラー化します。</p>
+
+<pre><code class="language-cpp">// src/objects/object-macros.h:43-50
+#if V8_CC_GNU
+#define V8_OBJECT_PUSH                                                    \
+  _Pragma("pack(push)") _Pragma("pack(4)") _Pragma("GCC diagnostic push") \
+      _Pragma("GCC diagnostic error \"-Wpadded\"")
+</code></pre>
+
+<p>これによって V8 のヒープオブジェクトは「想定外の padding が一切ない」ことがコンパイル時に保証されます。バイトレイアウトが GC のスキャンや bytecode 生成と密接に絡んでいるため、padding が入り込むと不整合になります。</p>
+
+<h3 id="ch2-2">2.2 HeapObject の本体</h3>
+
+<p><code>src/objects/heap-object.h:62-399</code> で HeapObject の本体が定義されています。</p>
+
+<pre><code class="language-cpp">// src/objects/heap-object.h:60-66
+// HeapObject is the superclass for all classes describing heap allocated
+// objects.
+V8_OBJECT class HeapObject {
+ public:
+  DECL_GETTER(map, Tagged&lt;Map&gt;)
+</code></pre>
+
+<p>そして最終的なメンバ変数の宣言は次のとおりです。</p>
+
+<pre><code class="language-cpp">// src/objects/heap-object.h:397-401
+ public:
+  TaggedMember&lt;Map&gt; map_;
+} V8_OBJECT_END;
+
+static_assert(offsetof(HeapObject, map_) == Internals::kHeapObjectMapOffset);
+</code></pre>
+
+<p><code>Internals::kHeapObjectMapOffset</code> の値を確認します。</p>
+
+<pre><code class="language-cpp">// include/v8-internal.h:1027
+static const int kHeapObjectMapOffset = 0;
+</code></pre>
+
+<p>HeapObject の先頭バイト (offset 0) は必ず Map ポインタです。これは V8 の最も基本的な不変条件であり、GC、JIT、インラインキャッシュ、デバッガすべてがこの前提に依存しています。</p>
+
+<p>メモリレイアウトを図示するとこのようになります。ポインタ圧縮なし 64 ビット環境の場合です。</p>
+
+<pre><code class="language-text">Tagged&lt;HeapObject&gt; ptr (例 0x7fff0001abcdef01)
+    |
+    | (-1 でタグを除去)
+    v
+HeapObject インスタンス (実アドレス 0x7fff0001abcdef00)
+    +--------------------------------+ offset 0
+    | TaggedMember&lt;Map&gt; map_         |  ← この 8 バイトが MapWord
+    +--------------------------------+ offset 8
+    | サブクラス固有のフィールド ... |
+    | ...                            |
+    +--------------------------------+
+</code></pre>
+
+<p>ポインタ圧縮ありの場合は <code>TaggedMember&lt;Map&gt;</code> が 4 バイトになります。</p>
+
+<pre><code class="language-text">+----------------+ offset 0
+| Tagged_t map_  |  ← 4 バイト圧縮された Map ポインタ
++----------------+ offset 4
+| サブクラス固有 |
+</code></pre>
+
+<h3 id="ch2-3">2.3 MapWord の役割</h3>
+
+<p>通常時、HeapObject の offset 0 は <code>Tagged&lt;Map&gt;</code> の値を持ちますが、GC 中は forwarding pointer になり得ます。この「Map ポインタかもしれないし、forwarding pointer かもしれない値」を抽象化したのが <code>MapWord</code> クラスです。</p>
+
+<pre><code class="language-cpp">// src/objects/map-word.h:16-30
+// Heap objects typically have a map pointer in their first word.  However,
+// during GC other data (e.g. mark bits, forwarding addresses) is sometimes
+// encoded in the first word.  The class MapWord is an abstraction of the
+// value in a heap object's first word.
+//
+// When external code space is enabled forwarding pointers are encoded as
+// Smi values representing a diff from the source or map word host object
+// address in kObjectAlignment chunks.
+class MapWord {
+ public:
+  // Normal state: the map word contains a map pointer.
+  static inline MapWord FromMap(const Tagged&lt;Map&gt; map);
+</code></pre>
+
+<p><code>HeapObject::map()</code> は <code>map_word(kRelaxedLoad).ToMap()</code> を呼び出し、まず MapWord として読み、Map に変換します。</p>
+
+<pre><code class="language-cpp">// src/objects/heap-object-inl.h:22-34
+MapWord HeapObject::map_word(RelaxedLoadTag tag) const {
+  return MapField::Relaxed_Load_Map_Word(this);
+}
+
+MapWord HeapObject::map_word(AcquireLoadTag tag) const {
+  return MapField::Acquire_Load_No_Unpack(this);
+}
+
+Tagged&lt;Map&gt; HeapObject::map() const { return map_word(kRelaxedLoad).ToMap(); }
+</code></pre>
+
+<p><code>MapField</code> の定義は heap-object.h の 354 行です。</p>
+
+<pre><code class="language-cpp">// src/objects/heap-object.h:354
+using MapField = TaggedField&lt;MapWord, 0&gt;;
+</code></pre>
+
+<p>「offset 0 にある MapWord 型のフィールド」というメタ情報を <code>TaggedField</code> テンプレートで表現しています。</p>
+
+<h3 id="ch2-4">2.4 HeapObject::FromAddress と address(), ptr()</h3>
+
+<pre><code class="language-cpp">// src/objects/heap-object.h:131-141
+static inline Tagged&lt;HeapObject&gt; FromAddress(Address address) {
+  DCHECK_TAG_ALIGNED(address);
+  return Tagged&lt;HeapObject&gt;(address + kHeapObjectTag);
+}
+
+inline Address address() const { return reinterpret_cast&lt;Address&gt;(this); }
+
+Address ptr() const { return address() + kHeapObjectTag; }
+</code></pre>
+
+<p><code>HeapObject::FromAddress(addr)</code> は raw address にタグ 1 を足します。<code>HeapObject::address()</code> は逆にタグなしの実アドレスを返し、<code>HeapObject::ptr()</code> はタグ付き値を返します。<code>address</code> と <code>ptr</code> の差は <code>kHeapObjectTag</code> で、これがコード中で意味するところは「raw pointer か tagged value か」です。</p>
+
+<h3 id="ch2-5">2.5 HeapObject コピー禁止</h3>
+
+<pre><code class="language-cpp">// src/objects/heap-object.h:389-396
+// HeapObjects shouldn't be copied or moved by C++ code, only by the GC.
+HeapObject(HeapObject&amp;&amp;) V8_NOEXCEPT = delete;
+HeapObject(const HeapObject&amp;) V8_NOEXCEPT = delete;
+HeapObject&amp; operator=(HeapObject&amp;&amp;) V8_NOEXCEPT = delete;
+HeapObject&amp; operator=(const HeapObject&amp;) V8_NOEXCEPT = delete;
+</code></pre>
+
+<p>HeapObject のコピーコンストラクタとムーブコンストラクタはすべて <code>delete</code> されています。これは「HeapObject は V8 ヒープ上にしか存在してはならず、C++ オブジェクトとしてコピーすることは GC との不整合を生む」という保守的な姿勢の表れです。</p>
+
+<h3 id="ch2-6">2.6 Object クラス階層と InstanceType</h3>
+
+<h4>Object は AllStatic である</h4>
+
+<p><code>Object</code> クラスは値を保持しません。</p>
+
+<pre><code class="language-cpp">// src/objects/objects.h:135-148
+// Object is the abstract superclass for all classes in the
+// object hierarchy.
+// Object does not use any virtual functions to avoid the
+// allocation of the C++ vtable.
+// There must only be a single data member in Object: the Address ptr,
+// containing the tagged heap pointer that this Object instance refers to.
+class Object : public AllStatic {
+ public:
+  enum class Conversion {
+    kToNumber,  // Number = Smi or HeapNumber
+    kToNumeric  // Numeric = Smi or HeapNumber or BigInt
+  };
+</code></pre>
+
+<p><code>AllStatic</code> は V8 で定義された基底クラスで、<code>new</code> できない、コンストラクタを呼べない純粋な名前空間的クラスです。「Object 階層」と呼ばれているのは型システム上の論理的な階層であり、C++ クラス継承では実現されていません。これと対照的に、<code>HeapObject</code> は実際に値を持つクラスです。</p>
+
+<h4>InstanceType の役割</h4>
+
+<p>ヒープ上の各オブジェクトはその Map に <code>instance_type</code> という 16 ビットのタグを持ちます。これがオブジェクトの種類を決定します。</p>
+
+<pre><code class="language-cpp">// src/objects/instance-type.h:22-25
+// We use the full 16 bits of the instance_type field to encode heap object
+// instance types. All the high-order bits (bits 7-15) are cleared if the object
+// is a string, and contain set bits if it is not a string.
+const uint32_t kIsNotStringMask = ~((1 &lt;&lt; 7) - 1);
+const uint32_t kStringTag = 0x0;
+</code></pre>
+
+<p>つまり InstanceType の上位 9 ビット (bit 7-15) が 0 なら string、それ以外なら非 string です。下位 7 ビットは string の中での更なる分類 (representation, encoding, internalized, shared など) に使われます。</p>
+
+<pre><code class="language-cpp">// src/objects/instance-type.h:28-37
+const uint32_t kStringRepresentationMask = (1 &lt;&lt; 3) - 1;
+enum StringRepresentationTag {
+  kSeqStringTag = 0x0,
+  kConsStringTag = 0x1,
+  kExternalStringTag = 0x2,
+  kSlicedStringTag = 0x3,
+  kThinStringTag = 0x5
+};
+</code></pre>
+
+<p>V8 が「ある HeapObject が <code>String</code> なのか <code>JSObject</code> なのか」を判定する際に、<code>map-&gt;instance_type &amp; kIsNotStringMask</code> のような単純なビット演算で済むようにする工夫です。</p>
+
+<p>「FIRST_xxx_TYPE」と「LAST_xxx_TYPE」が連続する整数値となるよう、Torque が型階層に基づいて自動的に番号を振ります。これによって <code>IsJSReceiver(obj)</code> のような判定は「<code>FIRST_JS_RECEIVER_TYPE &lt;= type &amp;&amp; type &lt;= LAST_JS_RECEIVER_TYPE</code>」という単純な範囲チェックで実装できます (実際には branch-less に <code>unsigned(type - FIRST) &lt;= (LAST - FIRST)</code> で書く)。</p>
+
+<h3 id="ch2-7">2.7 主要な型階層</h3>
+
+<p>V8 における代表的な型階層を整理すると以下のようになります。</p>
+
+<pre><code class="language-text">Object (論理的)
+ ├ Smi
+ └ HeapObject
+    ├ HeapNumber          (boxed double)
+    ├ Name
+    │  ├ String
+    │  │  ├ SeqString (SeqOneByteString / SeqTwoByteString)
+    │  │  ├ ConsString
+    │  │  ├ ExternalString
+    │  │  ├ SlicedString
+    │  │  └ ThinString
+    │  └ Symbol
+    ├ BigInt
+    ├ Oddball             (undefined, null, true, false)
+    ├ Hole                (the_hole, uninitialized, optimized_out, ...)
+    ├ Map
+    ├ FixedArrayBase
+    │  ├ FixedArray
+    │  ├ FixedDoubleArray
+    │  ├ ByteArray
+    │  ├ WeakFixedArray
+    │  ├ NameDictionary, NumberDictionary
+    │  ├ SwissNameDictionary
+    │  └ ArrayList, ScriptContextTable
+    ├ JSReceiver
+    │  ├ JSObject
+    │  │  ├ JSArray
+    │  │  ├ JSFunction
+    │  │  ├ JSArrayBuffer, JSDataView, JSTypedArray
+    │  │  ├ JSMap, JSSet, JSWeakMap, JSWeakSet
+    │  │  ├ JSPromise, JSRegExp, JSDate
+    │  │  └ JSGlobalObject, JSGlobalProxy
+    │  └ JSProxy
+    ├ Struct              (内部用構造体)
+    │  ├ FeedbackCell
+    │  ├ AllocationSite
+    │  ├ AccessorInfo, AccessorPair
+    │  └ Script, ScopeInfo, SharedFunctionInfo
+    ├ FeedbackVector      (型フィードバック収集)
+    ├ Code, InstructionStream  (JIT compiled code)
+    └ Foreign             (C++ オブジェクトのポインタ保持)
+</code></pre>
+
+<h3 id="ch2-8">2.8 キャストの実装</h3>
+
+<p>V8 のキャストは「<code>CastTraits&lt;T&gt;::AllowFrom(value)</code> でランタイム判定し、許容されればポインタを <code>Tagged&lt;T&gt;</code> として再解釈する」というパターンで実装されます。</p>
+
+<pre><code class="language-cpp">// src/objects/casting.h:42-53
+template &lt;typename To&gt;
+struct CastTraits;
+
+template &lt;typename T, typename U&gt;
+inline bool Is(Tagged&lt;U&gt; value) {
+  return CastTraits&lt;T&gt;::AllowFrom(value);
+}
+</code></pre>
+
+<p>具体的な特殊化を見ます。</p>
+
+<pre><code class="language-cpp">// src/objects/casting.h:451-466
+template &lt;&gt;
+struct CastTraits&lt;Object&gt; {
+  static inline bool AllowFrom(Tagged&lt;Object&gt; value) { return true; }
+};
+template &lt;&gt;
+struct CastTraits&lt;Smi&gt; {
+  static inline bool AllowFrom(Tagged&lt;Object&gt; value) { return value.IsSmi(); }
+  static inline bool AllowFrom(Tagged&lt;HeapObject&gt; value) { return false; }
+};
+template &lt;&gt;
+struct CastTraits&lt;HeapObject&gt; {
+  static inline bool AllowFrom(Tagged&lt;Object&gt; value) {
+    return value.IsHeapObject();
+  }
+  static inline bool AllowFrom(Tagged&lt;HeapObject&gt; value) { return true; }
+};
+</code></pre>
+
+<p><code>CastTraits&lt;Smi&gt;::AllowFrom(Tagged&lt;HeapObject&gt;)</code> が <code>false</code> を返すことに注目してください。<code>Tagged&lt;HeapObject&gt;</code> であることが分かっている時点で Smi ではあり得ないため、コンパイル時に分岐を排除できます。</p>
+
+<p><code>InstanceType</code> ごとの判定は <code>INSTANCE_TYPE_CHECKERS</code> マクロから自動生成されます。</p>
+
+<pre><code class="language-cpp">// src/objects/heap-object-inl.h:42-49
+#define TYPE_CHECKER(type, ...)                                          \
+  bool Is##type(Tagged&lt;HeapObject&gt; obj) {                                \
+    Tagged&lt;Map&gt; map_object = obj-&gt;map();                                 \
+    return InstanceTypeChecker::Is##type(map_object);                    \
+  }
+
+INSTANCE_TYPE_CHECKERS(TYPE_CHECKER)
+</code></pre>
+
+<p><code>IsJSObject(obj)</code> は <code>obj-&gt;map()-&gt;instance_type()</code> を読んで <code>InstanceTypeChecker::IsJSObject(map)</code> を呼びます。これは型範囲チェックを行います。</p>
+
+<h3 id="ch2-9">2.9 Handle, DirectHandle, MaybeHandle</h3>
+
+<p>V8 では <code>Tagged&lt;T&gt;</code> を直接持つことは GC を跨いだ寿命の保証ができないため、長期的に値を保持するには <code>Handle&lt;T&gt;</code> か <code>DirectHandle&lt;T&gt;</code> を使う必要があります。</p>
+
+<h4>なぜ Handle が必要なのか</h4>
+
+<p>V8 の GC (特に Scavenger による young generation GC) は「コピーする GC」です。生存しているオブジェクトはコピー元の領域からコピー先の領域に物理的に移動されます。つまりオブジェクトのアドレスが GC のたびに変わる可能性があります。</p>
+
+<p>C++ コード上で <code>Tagged&lt;JSObject&gt; obj = ...</code> のように保持している値は、次に <code>obj</code> を使う時点で別のアドレスに移動している可能性があり、<code>obj</code> の値が stale になります。これを防ぐには、GC に「私はこのオブジェクトを使っているから動かしたら教えて」と申告する仕組みが必要です。これが Handle です。</p>
+
+<h4>Handle の本体</h4>
+
+<p>Handle は内部に <code>Address*</code> を持つダブルポインタです。</p>
+
+<pre><code class="language-cpp">// src/handles/handles.h:55-136 抜粋
+class HandleBase {
+ public:
+  V8_INLINE bool is_identical_to(const HandleBase&amp; that) const;
+  V8_INLINE bool is_null() const { return location_ == nullptr; }
+
+  V8_INLINE Address address() const {
+    return reinterpret_cast&lt;Address&gt;(location_);
+  }
+  ...
+ protected:
+  // This uses type Address* as opposed to a pointer type to a typed
+  // wrapper class, because it doesn't point to instances of such a
+  // wrapper class.
+  Address* location_;
+};
+</code></pre>
+
+<p><code>location_</code> は HandleScope が管理するスロット (Address の配列) を指します。そのスロットの中身がオブジェクトの tagged pointer です。GC が動くと、GC は HandleScope のスロット全てを走査し、その中身を新しいアドレスに更新します。Handle 自体 (= <code>Address*</code> の値) は変化しませんが、その指す先の値が GC によって書き換えられるため、<code>*handle</code> で読み出した値は常に最新のアドレスを返します。</p>
+
+<pre><code class="language-cpp">// src/handles/handles.h:181-203
+V8_INLINE Tagged&lt;T&gt; operator*() const {
+  static_assert(is_taggable_v&lt;T&gt;, "static type violation");
+  SLOW_DCHECK(IsDereferenceAllowed());
+  return Tagged&lt;T&gt;(*location());
+}
+</code></pre>
+
+<h4>HandleScope と寿命管理</h4>
+
+<pre><code class="language-cpp">// src/handles/handles.h:251-345 抜粋
+class V8_NODISCARD HandleScope {
+ public:
+  explicit V8_INLINE HandleScope(Isolate* isolate);
+  V8_INLINE ~HandleScope();
+
+  V8_INLINE static Address* CreateHandle(Isolate* isolate, Address value);
+
+ private:
+  Isolate* isolate_;
+  Address* prev_next_;
+  Address* prev_limit_;
+};
+</code></pre>
+
+<p><code>HandleScope</code> はスタック上に置かれる RAII オブジェクトで、デストラクタで自分の有効範囲内に作られたすべての Handle を解放します。これは stack-discipline な寿命管理で、Lisp の dynamic-wind のような働きをします。</p>
+
+<p><code>CreateHandle</code> は HandleScope の先頭スロット (= <code>next_</code>) に値を書き込み、<code>next_</code> をインクリメントします。これは O(1) のアロケーションです。</p>
+
+<h4>DirectHandle と Conservative Stack Scanning</h4>
+
+<p><code>DirectHandle</code> は最近導入された新機能で、Handle のような間接参照層を作らず、スタック上に直接 <code>Address</code> を持つハンドルです。</p>
+
+<pre><code class="language-cpp">// src/handles/handles.h:386-477
+class V8_TRIVIAL_ABI DirectHandleBase :
+    public api_internal::StackAllocated&lt;...&gt;
+{
+ public:
+  V8_INLINE Address address() const { return obj_; }
+ protected:
+  // This is a direct pointer to either a tagged object or SMI.
+  Address obj_;
+</code></pre>
+
+<p>DirectHandle は内部に <code>Address obj_</code> を直接保持します。これは Handle の <code>Address* location_</code> よりも一段少ない間接参照になります。</p>
+
+<p>問題は「GC がコピーした際にどうやって更新するか」です。DirectHandle はスタック上にしか存在できない設計 (<code>StackAllocated</code> を継承) で、GC が conservative stack scanning を有効にしている前提で動きます。</p>
+
+<p>conservative stack scanning とは「スタック上の全ワードを走査し、もし HeapObject っぽい値があったらそれを生きていると見なす (動かさない、または動かしたら同じスタックワードを書き換える)」というアプローチです。これにより、スタック上に <code>Address obj_</code> を直接置いておけば、GC は自動的にそれを認識して保護してくれます。</p>
+
+<p>DirectHandle の利点は、アクセスが一段速い、HandleScope のメモリアロケーションが不要、キャッシュ局所性が良くなる点です。欠点は conservative stack scanning が必要で、ヒープ上のデータ構造には埋め込めない点です。</p>
+
+<h4>MaybeHandle</h4>
+
+<pre><code class="language-cpp">// src/handles/maybe-handles.h:28-102
+template &lt;typename T&gt;
+class MaybeHandle final : public HandleBase {
+ public:
+  V8_INLINE MaybeHandle() : HandleBase(nullptr) {}
+
+  V8_INLINE Handle&lt;T&gt; ToHandleChecked() const {
+    Check();
+    return Handle&lt;T&gt;(location_);
+  }
+
+  template &lt;typename S&gt;
+  V8_WARN_UNUSED_RESULT V8_INLINE bool ToHandle(Handle&lt;S&gt;* out) const {
+    if (is_null()) {
+      *out = Handle&lt;T&gt;::null();
+      return false;
+    } else {
+      *out = Handle&lt;T&gt;(location_);
+      return true;
+    }
+  }
+</code></pre>
+
+<p><code>MaybeHandle&lt;T&gt;</code> は「<code>Handle&lt;T&gt;</code> または empty」を表します。例外 (JavaScript の throw) のために、関数の戻り値を <code>MaybeHandle&lt;T&gt;</code> にしておき、empty なら例外発生、そうでなければ値があると解釈します。<code>std::optional</code> 相当の役割をハンドルに対して果たします。</p>
+

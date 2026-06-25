@@ -5,10 +5,22 @@
   "observability": {
     "enabled": true
   },
+  "placement": {
+    "mode": "smart"
+  },
   "assets": {
-    "directory": "."
+    "directory": "./dist"
   },
   "compatibility_flags": [
     "nodejs_compat"
+  ],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "v8-deep-dive.tokidux.com",
+      "zone_name": "tokidux.com",
+      "custom_domain": true
+    }
   ]
 }

@@ -1,0 +1,18 @@
+<h2 id="section-2">2. ECMAScript 仕様アルゴリズム</h2>
+
+<p>仕様 (https://tc39.es/proposal-flatMap/#sec-Array.prototype.flat と https://tc39.es/proposal-flatMap/#sec-FlattenIntoArray) は <code>Array.prototype.flat ( [ depth ] )</code> 本体と抽象操作 <code>FlattenIntoArray</code> の二段構成です。</p>
+
+<p>本体は 7 ステップで、ステップ 1 で <code>Let O be ? ToObject(this value)</code> により受信者をオブジェクトへ強制変換、ステップ 2 で <code>Let sourceLen be ? ToLength(? Get(O, "length"))</code> により長さを正規化、ステップ 3 で <code>Let depthNum be 1</code> と既定値を設定、ステップ 4 で <code>depth</code> 引数が undefined でなければ <code>ToInteger(depth)</code> により整数化、ステップ 5 で <code>Let A be ? ArraySpeciesCreate(O, 0)</code> により結果配列を作成、ステップ 6 で <code>Perform ? FlattenIntoArray(A, O, sourceLen, 0, depthNum)</code> を実行し、ステップ 7 で A を返します。</p>
+
+<p><code>FlattenIntoArray(target, source, sourceLen, start, depth [, mapperFunction, thisArg])</code> の擬似コードは以下の流れです。<code>targetIndex</code> を <code>start</code> で、<code>sourceIndex</code> を 0 で初期化し、<code>sourceIndex &lt; sourceLen</code> の間ループします。各反復で <code>P = ToString(sourceIndex)</code>、<code>exists = ? HasProperty(source, P)</code> を取得し、<code>exists</code> が true のときのみ <code>element = ? Get(source, P)</code> を読み込みます。mapper が指定されていれば <code>element = ? Call(mapperFunction, thisArg, « element, sourceIndex, source »)</code> で置き換えます。<code>shouldFlatten</code> を false で初期化し、<code>depth &gt; 0</code> なら <code>shouldFlatten = ? IsArray(element)</code> と更新します。<code>shouldFlatten</code> が true なら <code>elementLen = ? ToLength(? Get(element, "length"))</code> を求め、<code>targetIndex = ? FlattenIntoArray(target, element, elementLen, targetIndex, depth - 1, ...)</code> で再帰します。そうでなければ <code>targetIndex &gt;= 2^53-1</code> のとき <code>TypeError</code> を投げ、<code>? CreateDataPropertyOrThrow(target, ! ToString(targetIndex), element)</code> で書き込み、<code>targetIndex</code> をインクリメントします。最後に <code>sourceIndex</code> を 1 進めます。ループ終了後 <code>targetIndex</code> を返します。</p>
+
+<p>この仕様の本質的な性質が四つあります。第一に <code>HasProperty</code> を経由するため穴 (sparse な箇所、すなわち実体のないインデックス) はスキップされ、<code>[1, , 3].flat()</code> は <code>[1, 3]</code> を返します。第二に flatten の対象判定に <code>@@isConcatSpreadable</code> ではなく <code>IsArray</code> (Array exotic か、Proxy がそれを包む場合) が使われており、<code>Array.prototype.concat</code> との重要な意味論的差異になっています。第三にステップ 5 の <code>ArraySpeciesCreate</code> を通じて <code>Symbol.species</code> をサポートしています。第四に <code>targetIndex &gt;= 2^53-1</code> (<code>Number.MAX_SAFE_INTEGER = 9007199254740991</code>) を超えると TypeError を投げる安全弁が組み込まれています。</p>
+
+<p>V8 のエラーメッセージ <code>FlattenPastSafeLength</code> は <code class="file-ref">src/common/message-template.h</code> 行 620 で定義され、<code>"Flattening % elements on an array-like of length % is disallowed, as the total surpasses 2**53-1"</code> という文面です。Torque 側で <code>kFlattenPastSafeLength</code> として <code class="file-ref">src/builtins/base.tq</code> から参照されており、array-flat.tq 行 422-426 と 482-486 で投げられます。</p>
+
+<p>仕様の <code>IsArray</code> 抽象操作は array-flat.tq の <code>ArrayIsArray_Inline</code> マクロ (行 7-17) として実装されています。要素が <code>JSArray</code> なら直接 <code>True</code>、<code>JSProxy</code> なら <code>runtime::ArrayIsArray</code> 経由で Proxy のターゲットを判定、それ以外なら <code>False</code> を返します。これは Proxy が <code>Array.isArray</code> で配列と判定されうるケース (Proxy が JSArray をラップしている場合) を仕様通りに処理する仕掛けです。</p>
+
+<p><code>depth</code> の境界処理は array-flat.tq 行 553-562 で行われます。<code>Cast&lt;PositiveSmi&gt;</code> に成功すれば <code>depthSmi</code> として使い、失敗した場合は <code>if (depthNum &lt;= 0) depthSmi = 0; else depthSmi = kSmiMax;</code> で挟みます。Infinity は <code>ToInteger</code> 後も <code>Number(Infinity)</code> のままなので <code>PositiveSmi</code> キャストに必ず失敗し <code>kSmiMax</code> (32 ビットでは 2^30-1、64 ビット非圧縮では 2^31-1) に切り詰められます。コメント 551-552 行が「stack overflows before reaching kSmiMax」と明記している通り、観測可能な差は発生しません。</p>
+
+<hr/>
+

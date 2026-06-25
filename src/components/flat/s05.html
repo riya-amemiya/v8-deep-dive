@@ -1,0 +1,56 @@
+<h2 id="section-5">5. 高速パス (TryFastFlat) の二パス設計</h2>
+
+<p><code>TryFastFlat</code> (行 184-350) は二パス構成です。第一パスで <code>CalculateFlattenedLengthFast</code> (行 54-182) が最終長と target ElementsKind を確定し、第二パスで一度きりのバッキングストア確保と値の流し込みを行います。</p>
+
+<h3 id="section-5-1">5.1 なぜ二パスか</h3>
+
+<p>一パスのみで実装する場合、<code>growable_fixed_array::GrowableFixedArray</code> (<code class="file-ref">src/builtins/growable-fixed-array.tq</code> 行 7-43) を使ってノードを訪問するたびに <code>Push</code> する形になります。このコードを見ると <code>EnsureCapacity</code> の成長則は <code>new_capacity = current_capacity + (current_capacity &gt;&gt; 1) + 16</code> で、<code>JSObject::NewElementsCapacity</code> と同じ係数 1.5 の幾何級数です。これは均衡償却 O(n) ではあるものの、その過程で要素の再配置 (<code>ExtractFixedArray</code>) が複数回発生し、書き込み総コストは <code>O(n log_{1.5}(n))</code> 程度のメモリトラフィックになります。さらに 1 パス案では結果のサイズが事前に分からないため、<code>GrowableFixedArray.ToJSArray</code> で最終長に切り詰めるための追加コピーが必要です。</p>
+
+<p>2 パス案だと走査が 2 回になりますが、各セルへの書き込みは 1 回ずつになり、再配置や末尾の縮小コピーは発生しません。さらに重要なのは ElementsKind を 1 パス目で確定できる点です。<code>FixedDoubleArray</code> はビット表現が <code>float64_or_undefined_or_hole</code> で tagged ポインタとは互換性がないため、growable で <code>Object</code> を集めてから <code>PACKED_DOUBLE_ELEMENTS</code> に変換するには結局すべての値を <code>Number→float64</code> 変換しながら専用配列にコピーする 3 パス目が必要になります。事前に長さと kind を求めれば、2 パス目で <code>AllocateFixedDoubleArrayWithHoles(SmiUntag(flattenedLength))</code> (行 203-204) を呼び、<code>doubleElements.values[targetIndex] = Convert&lt;float64_or_undefined_or_hole&gt;(UnsafeCast&lt;Number&gt;(element))</code> (行 251-252) で tagged Number を直接 float64 表現に書き込むことができ、boxing / unboxing が完全に消えます。これが二パスを選んだ最大の理由です。</p>
+
+<h3 id="section-5-2">5.2 反復化と明示スタック</h3>
+
+<p>仕様の <code>FlattenIntoArray</code> は再帰的に自分自身を呼び出します。これをそのまま実装すると、<code>FlattenIntoArrayWithoutMapFn</code> (行 515-523) のような Torque builtin が深さ分だけ JS / C++ stack frame を消費します。1 段あたり数百バイトを使うので、深い入れ子では <code>SIGSEGV</code> を起こすか、<code>PerformStackCheck</code> で <code>RangeError</code> が投げられます。</p>
+
+<p><code>TryFastFlat</code> 内の二重 while ループ (行 84-170、行 215-272、行 289-345 の三箇所で同型のパターン) は内側ループで要素を線形に処理し、配列を見つけたら <code>(currentArray, nextIndex, currentDepth)</code> の三タプルを <code>stack.Push</code> し、内部状態を子配列に書き換えて <code>break</code> で内側ループから抜けて再走査します。子の走査が終わると外側ループの末尾 (行 161-169 など) で 3 ポップして親に戻ります。これは末尾呼び出し最適化と同等の効果を、手書きの状態機械として実現したものです。</p>
+
+<p>明示スタックの占有メモリは 1 エントリあたり Object ポインタ 1 つ、合計最大 3072 エントリで <code>3072 * sizeof(intptr_t)</code> バイトです。これは <code>GrowableFixedArray</code> の <code>EnsureCapacity</code> 経由の確保で、64 ビットビルドで 24 KB に収まります。深さ 1024 の C++/JS スタックフレームと比較した場合、フレーム 1 つあたり Torque builtin の引数 (<code>target, source, sourceLength, start, depth, hasMapper, mapfn, thisArgs</code> の 8 引数) と保存レジスタ、戻りアドレス等で軽く数百バイトはあるため、再帰では数百 KB から MB オーダーに膨らみ OS のガードページに達して <code>SIGSEGV</code> を起こします。一方明示スタックはヒープ上にあるため上限を <code>kMaxFlatFastStackEntries</code> で固定的に制御でき、超えても <code>goto Bailout</code> で slow path に切り替えるだけで済みます。</p>
+
+<h3 id="section-5-3">5.3 kMaxFlatFastStackEntries = 3072</h3>
+
+<p>行 49-52 の定数宣言にコメントが付いており、「Fast path safety valve: avoid unbounded explicit stack growth on cyclic nesting by bailing out to the slow path after a fixed depth. 3 entries per depth: array, index, depth (depth limit = 1024)」と書かれています。深さ 1024 段 × 1 段あたり 3 値で 3072 になります。</p>
+
+<p>サイクル <code>a.push(a)</code> のように自己参照する配列であっても、fast path ではバイアウトせず探索を続けます。<code>a</code> を 1 階層降りるごとにスタックに 3 エントリ積み、<code>currentDepth</code> を 1 ずつ減らしていきます。<code>a.flat(Infinity)</code> は <code>depthSmi = kSmiMax</code> に切り上げられるため、スタック深さ 1024 で必ず先に行 129 の <code>if (stack.length &gt;= kMaxFlatFastStackEntries) goto Bailout;</code> に到達します。バイアウト後は slow path に切り替わり、<code>FlattenIntoArraySlow</code> の再帰がスタックを食い始め、<code>FlattenIntoArrayWithoutMapFn</code> の行 520 <code>PerformStackCheck()</code> でフレームごとに <code>address_of_jslimit</code> と現在の <code>sp</code> を比較し、限界に達すると <code>Runtime::kStackGuard</code> 経由で <code>RangeError("Maximum call stack size exceeded")</code> を投げます。これが <code class="file-ref">test/mjsunit/regress/regress-8708.js</code> の <code>--stack-size=100</code> 環境で <code>assertThrows(() =&gt; array.flat(Infinity), RangeError)</code> が成立する仕組みです。</p>
+
+<h3 id="section-5-4">5.4 PerformStackCheck が二箇所にある理由</h3>
+
+<p><code>PerformStackCheck()</code> は <code>CalculateFlattenedLengthFast</code> の冒頭 (行 57) と、<code>FlattenIntoArrayWithoutMapFn</code> builtin の冒頭 (行 520) の二箇所に置かれています。これは前者と後者の呼び出されるパスが本質的に独立しているからです。</p>
+
+<p><code>CalculateFlattenedLengthFast</code> は fast path 専用のヘルパーで、自分自身を再帰呼び出ししない反復実装ですが、呼び出し元の <code>TryFastFlat</code> がさらに上の Torque builtin から呼ばれているので、その時点で残りのネイティブスタックが浅い状況もあり得ます。明示スタックでヒープを 24 KB まで食いつつ、<code>growable_fixed_array::NewGrowableFixedArray</code> (行 75) の確保自体や <code>AllocateFixedArrayWithHoles</code> の確保で GC が走り得ます。GC ハンドラ自体がスタックを消費するため、関数頭で <code>PerformStackCheck</code> を入れて事前に余裕があることを確認します。</p>
+
+<p><code>FlattenIntoArrayWithoutMapFn</code> 側のチェックは別の理由です。行 517 のコメント「This builtin might get called recursively, check stack for overflow manually as it has stub linkage」が明示しているとおり、Torque の <code>builtin</code> 宣言はスタブリンケージで、JS フレームではなく内部 ABI で呼ばれます。JS 関数呼び出し境界で V8 が自動挿入する stack guard は、スタブを再帰させる経路には入りません。<code>FlattenIntoArraySlow</code> が行 478-479 で <code>FlattenIntoArrayWithoutMapFn</code> を再帰呼び出ししているため、入れ子配列の各層でこの builtin が呼ばれます。よってこの builtin のエントリは仕様準拠の再帰下降路の唯一のチェックポイントになり、ここで <code>PerformStackCheck</code> を欠かすと深い入れ子で V8 自身が <code>SIGSEGV</code> を起こします。</p>
+
+<p><code>FlattenIntoArrayWithMapFn</code> (行 525-531) のほうに明示の <code>PerformStackCheck</code> がないのは、<code>flatMap</code> の仕様が depth = 1 固定で再帰しないからです。</p>
+
+<h3 id="section-5-5">5.5 PerformStackCheck の中身</h3>
+
+<p><code>PerformStackCheck</code> の宣言は <code class="file-ref">src/builtins/base.tq</code> 行 1645 の <code>extern macro PerformStackCheck(implicit context: Context)(): void;</code>、実装は <code class="file-ref">src/codegen/code-stub-assembler.cc</code> 行 19792 です。</p>
+
+<pre><code class="language-cpp">void CodeStubAssembler::PerformStackCheck(TNode&lt;Context&gt; context) {
+  Label ok(this), stack_check_interrupt(this, Label::kDeferred);
+  TNode&lt;UintPtrT&gt; stack_limit = UncheckedCast&lt;UintPtrT&gt;(
+      Load(MachineType::Pointer(),
+           ExternalConstant(ExternalReference::address_of_jslimit(isolate()))));
+  TNode&lt;BoolT&gt; sp_within_limit = StackPointerGreaterThan(stack_limit);
+  Branch(sp_within_limit, &amp;ok, &amp;stack_check_interrupt);
+  BIND(&amp;stack_check_interrupt);
+  CallRuntime(Runtime::kStackGuard, context);
+  Goto(&amp;ok);
+  BIND(&amp;ok);
+}
+</code></pre>
+
+<p>JS スタックリミットは Isolate ごとに一つあって、<code>isolate-&gt;stack_guard()-&gt;jslimit()</code> の値を外部参照経由でロードします。これはスレッドのスタックの「これ以下を割ったらスタックオーバーフロー」というアドレスです。<code>StackPointerGreaterThan(stack_limit)</code> は SP &gt; stack_limit、つまり「まだ余裕がある」を真にして、そうでなければ deferred な <code>stack_check_interrupt</code> ブロックに飛び <code>Runtime::kStackGuard</code> を呼びます。deferred ラベルなので、通常パスは straight に <code>ok</code> に進み、機械コード上は条件分岐と通常パスが一直線に並びます。</p>
+
+<hr/>
+

@@ -1,0 +1,56 @@
+<section class="bridge" id="bridge-2">
+<h2>第 2 章への導入</h2>
+
+<div class="chapter-prelude">
+<div class="prelude-card">
+<h4>第 1 章で学んだこと</h4>
+<p>V8 の全体地図を取得しました。 Tagged Pointer の仕組み、Map の役割、ElementsKind の存在、Heap Spaces の構造、GC の枠組み、JIT パイプラインまで、すべての主要概念を 1 章で押さえました。</p>
+</div>
+<div class="prelude-card next">
+<h4>この章で学ぶこと</h4>
+<ul>
+<li>第 I 部 オブジェクト表現とタグ付きポインタ (詳細)</li>
+<li>第 II 部 ヒープ構造とメモリ空間 (Page / MemoryChunk / CodeRange)</li>
+<li>第 III 部 ガベージコレクション (Cheney / MC / MinorMS / Conservative Stack Scan / CppGC)</li>
+<li>第 IV 部 最適化機構 (Inline Cache / Sandbox / External Pointer Table / Handle API)</li>
+<li>第 V 部 オブジェクトのメモリ表現 (String / JSArray / TypedArray / HeapNumber / BigInt)</li>
+</ul>
+</div>
+</div>
+
+<p>第 1 章で「Tagged Pointer はこんなもの」「GC はこういう仕組み」と概要を学びました。 この章ではその一つひとつをソースコード行番号レベルで掘り下げ、なぜ V8 がメモリ使用量と GC コストの両方を抑えられているかを解き明かします。</p>
+
+<p>分量が多いため第 I 部から第 V 部までの 5 部構成になっていますが、興味のある部から飛び込んで構いません。 たとえば「Write Barrier の動作」「Sandbox の脅威モデル」「文字列の Cons 表現」だけ知りたい場合、関連する部だけ読めば独立して理解できます。</p>
+
+<div class="svg-container">
+<svg viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="メモリ階層の俯瞰">
+<rect x="20" y="20" width="760" height="280" rx="12" fill="#fbfaf7" stroke="#b8af96" stroke-width="2"/>
+<text x="400" y="48" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="800" fill="#0d1117">V8 メモリ階層 (本章で扱う領域)</text>
+
+<rect x="50" y="70" width="340" height="100" rx="10" fill="#fef3c7" stroke="#c2410c" stroke-width="2"/>
+<text x="220" y="92" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#7c2d12">論理レイヤ</text>
+<text x="220" y="115" text-anchor="middle" font-family="sans-serif" font-size="11">JSObject / JSArray / String / HeapNumber</text>
+<text x="220" y="135" text-anchor="middle" font-family="sans-serif" font-size="11">Map (Hidden Class) / DescriptorArray</text>
+<text x="220" y="155" text-anchor="middle" font-family="sans-serif" font-size="11">FixedArray / FixedDoubleArray / Dictionary</text>
+
+<rect x="410" y="70" width="340" height="100" rx="10" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+<text x="580" y="92" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#1e3a8a">物理レイヤ</text>
+<text x="580" y="115" text-anchor="middle" font-family="sans-serif" font-size="11">Tagged Pointer (32 / 64 bit)</text>
+<text x="580" y="135" text-anchor="middle" font-family="sans-serif" font-size="11">Page (256KB) / MemoryChunk / Slot Set</text>
+<text x="580" y="155" text-anchor="middle" font-family="sans-serif" font-size="11">Pointer Compression Cage (4GB)</text>
+
+<rect x="50" y="190" width="340" height="100" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+<text x="220" y="212" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#14532d">回収レイヤ (GC)</text>
+<text x="220" y="235" text-anchor="middle" font-family="sans-serif" font-size="11">Scavenger / Minor MS (Young)</text>
+<text x="220" y="255" text-anchor="middle" font-family="sans-serif" font-size="11">Mark-Compact (Old)</text>
+<text x="220" y="275" text-anchor="middle" font-family="sans-serif" font-size="11">Write Barrier / Remembered Set</text>
+
+<rect x="410" y="190" width="340" height="100" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+<text x="580" y="212" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#5b21b6">保護レイヤ (Sandbox)</text>
+<text x="580" y="235" text-anchor="middle" font-family="sans-serif" font-size="11">Sandbox (1TB 仮想領域)</text>
+<text x="580" y="255" text-anchor="middle" font-family="sans-serif" font-size="11">External / Trusted / Code Pointer Table</text>
+<text x="580" y="275" text-anchor="middle" font-family="sans-serif" font-size="11">CppGC との統合</text>
+</svg>
+<div class="svg-caption">図 B2-1 / 本章で扱うメモリ階層の俯瞰</div>
+</div>
+</section>

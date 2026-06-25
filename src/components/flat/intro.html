@@ -1,0 +1,71 @@
+<h1>V8 Array.prototype.flat 完全解説</h1>
+
+<nav class="toc">
+<h2>目次</h2>
+<ol>
+<li><a href="#section-1">1. 全体像</a></li>
+<li><a href="#section-2">2. ECMAScript 仕様アルゴリズム</a></li>
+<li><a href="#section-3">3. JSArray と FixedArray、FixedDoubleArray の物理表現</a>
+<ol>
+<li><a href="#section-3-1">3.1 JSArray のヘッダ構造</a></li>
+<li><a href="#section-3-2">3.2 FixedArray の物理レイアウト</a></li>
+<li><a href="#section-3-3">3.3 FixedDoubleArray の物理レイアウト</a></li>
+<li><a href="#section-3-4">3.4 Smi とポインタ圧縮</a></li>
+<li><a href="#section-3-5">3.5 HeapNumber</a></li>
+</ol>
+</li>
+<li><a href="#section-4">4. ElementsKind とその遷移</a>
+<ol>
+<li><a href="#section-4-1">4.1 hole の二つの表現</a></li>
+<li><a href="#section-4-2">4.2 kEmptyFixedArray シングルトン</a></li>
+<li><a href="#section-4-3">4.3 NoElementsProtector</a></li>
+</ol>
+</li>
+<li><a href="#section-5">5. 高速パス (TryFastFlat) の二パス設計</a>
+<ol>
+<li><a href="#section-5-1">5.1 なぜ二パスか</a></li>
+<li><a href="#section-5-2">5.2 反復化と明示スタック</a></li>
+<li><a href="#section-5-3">5.3 kMaxFlatFastStackEntries = 3072</a></li>
+<li><a href="#section-5-4">5.4 PerformStackCheck が二箇所にある理由</a></li>
+<li><a href="#section-5-5">5.5 PerformStackCheck の中身</a></li>
+</ol>
+</li>
+<li><a href="#section-6">6. CalculateFlattenedLengthFast の詳細</a>
+<ol>
+<li><a href="#section-6-1">6.1 PACKED 数値配列での早期短絡</a></li>
+<li><a href="#section-6-2">6.2 target ElementsKind の判定</a></li>
+</ol>
+</li>
+<li><a href="#section-7">7. TryFastFlat 第二パス</a>
+<ol>
+<li><a href="#section-7-1">7.1 PACKED_DOUBLE 専用経路</a></li>
+<li><a href="#section-7-2">7.2 PACKED_ELEMENTS / PACKED_SMI_ELEMENTS 経路</a></li>
+<li><a href="#section-7-3">7.3 結果検証</a></li>
+</ol>
+</li>
+<li><a href="#section-8">8. FastJSArrayWitness と Cast 階層</a>
+<ol>
+<li><a href="#section-8-1">8.1 透過型階層</a></li>
+<li><a href="#section-8-2">8.2 Witness パターン</a></li>
+</ol>
+</li>
+<li><a href="#section-9">9. Bailout の分類</a></li>
+<li><a href="#section-10">10. FlattenIntoArraySlow と仕様準拠</a></li>
+<li><a href="#section-11">11. flatMap との関係とコンパイル時特殊化</a></li>
+<li><a href="#section-12">12. flat と concat の意味論的差異</a></li>
+<li><a href="#section-13">13. Torque から機械語までの変換パイプライン</a>
+<ol>
+<li><a href="#section-13-1">13.1 TrySmiAdd / TrySmiSub</a></li>
+<li><a href="#section-13-2">13.2 ArraySpeciesCreate</a></li>
+</ol>
+</li>
+<li><a href="#section-14">14. growable_fixed_array</a></li>
+<li><a href="#section-18">15. 全体まとめ</a></li>
+<li><a href="#section-references">主要参照ファイル一覧</a></li>
+</ol>
+</nav>
+
+<p>本稿は登壇資料の参考文献として作成された、V8 における <code>Array.prototype.flat</code> の低レイヤ実装解説です。エントリポイントの Torque ソースから、ElementsKind とメモリレイアウト、Witness パターン、Bailout 設計、ECMAScript 仕様との対応までを通しでカバーします。参照行番号は V8 のローカルツリー (HEAD <code>0ade545a</code>、shallow boundary <code>33ca8a4017b75d3c7e81f0f88760fe1871b016bf</code>、2026-05-21) に基づきます。</p>
+
+<hr/>
+

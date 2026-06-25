@@ -1,0 +1,294 @@
+<h2 id="chapter-5">第 5 章 Torque コンパイラの内部</h2>
+
+<p>ここまでは Torque プログラマから見た言語仕様でした。本章ではコンパイラの内部構造、特にどのフェーズで何が起きるかを <code>src/torque/</code> のソースを直接引きながら見ていきます。</p>
+
+<h3 id="sec-5-1">5.1 起動とパイプライン</h3>
+
+<p><code class="file-ref">src/torque/torque.cc:22-88</code> の <code>WrappedMain</code> がコマンドライン引数を捌きます。受け取るオプションは <code>-o</code>、<code>-v8-root</code>、<code>-m32</code>、<code>-annotate-ir</code>、<code>-torque-dwarf</code>、<code>-strip-v8-root</code>、<code>-output-tsa</code> です。<code>.tq</code> ファイル群をベクタに集め、<code>CompileTorque(files, options)</code> を呼びます。</p>
+
+<h3 id="sec-5-2">5.2 Earley パーサー</h3>
+
+<p>Torque は独自に Earley パーサーを実装しています。Earley を選ぶ理由は、任意の文脈自由文法 (左再帰、空生成、曖昧性検出含む) を扱えるためで、宣言と式の構文が相互に絡みあう Torque の文法では取り回しが良いという判断です。</p>
+
+<p>実装の中核は <code class="file-ref">src/torque/earley-parser.cc:188-264</code> の <code>RunEarleyAlgorithm</code> です。<code>Item</code> は (ルール、ドット位置、開始位置、現在位置) のクワドラプルで、アルゴリズムの 3 段階「Complete」「Scan」「Predict」をそのまま反映しています。</p>
+
+<pre><code class="language-cpp">const Item* RunEarleyAlgorithm(
+    Symbol* start, const LexerResult&amp; tokens,
+    std::unordered_set&lt;Item, base::hash&lt;Item&gt;&gt;* processed) {
+  Symbol top_level;
+  top_level.AddRule(Rule({start}));
+  worklist.push_back(Item{top_level.rule(0), 0, 0, 0});
+
+  size_t input_length = tokens.token_symbols.size();
+  for (size_t pos = 0; pos &lt;= input_length; ++pos) {
+    while (!worklist.empty()) {
+      if (item.IsComplete()) {
+        // 'Complete' phase
+      } else {
+        Symbol* next = item.NextSymbol();
+        // 'Scan' phase
+        if (pos &lt; tokens.token_symbols.size() &amp;&amp;
+            tokens.token_symbols[pos] == next) {
+          future_items.push_back(item.Advance(pos + 1, nullptr));
+        }
+        // 'Predict' phase
+      }
+    }
+    std::swap(worklist, future_items);
+  }
+}
+</code></pre>
+
+<p>特徴的なのは曖昧性検出を組み込んでいる点です。すでに処理済みの <code>Item</code> を再び挿入しようとしたとき、<code>item.CheckAmbiguity(worklist.back(), tokens)</code> を呼んで二通りの構文木にできる箇所をその場で報告します。</p>
+
+<p>文法定義は <code class="file-ref">src/torque/torque-parser.cc</code> の <code>TorqueGrammar</code> 構造体に詰まっています。基本パターンは「左辺になる <code>Symbol</code> を非静的メンバとして宣言し、<code>Rule({...右辺...}, action)</code> で右辺と意味アクションを結びつける」形です。</p>
+
+<pre><code class="language-cpp">// torque-parser.cc:2485-2499
+Symbol simpleType = {
+    Rule({Token("("), &amp;type, Token(")")}),
+    Rule({&amp;namespaceQualification, CheckIf(Token("constexpr")), &amp;identifier,
+          TryOrDefault&lt;std::vector&lt;TypeExpression*&gt;&gt;(
+              &amp;genericSpecializationTypeList)},
+         MakeBasicTypeExpression),
+    Rule({Token("builtin"), Token("("), typeList, Token(")"), Token("=&gt;"),
+          &amp;simpleType},
+         MakeFunctionTypeExpression),
+    Rule({CheckIf(Token("const")), Token("&amp;"), &amp;simpleType},
+         MakeReferenceTypeExpression)};
+
+Symbol type = {Rule({&amp;simpleType}),
+               Rule({&amp;type, Token("|"), &amp;simpleType}, MakeUnionTypeExpression)};
+</code></pre>
+
+<p>ファイル全体は <code>file</code> シンボルとして <code>import</code> 宣言と declaration の繰り返しで構成されます。</p>
+
+<pre><code class="language-cpp">Symbol file = {Rule({&amp;file, Token("import"), &amp;externalString},
+                    ProcessTorqueImportDeclaration),
+               Rule({&amp;file, &amp;declaration}, AddGlobalDeclarations), Rule({})};
+</code></pre>
+
+<h3 id="sec-5-3">5.3 AST</h3>
+
+<p>AST のノードは X-macro で列挙されています (<code class="file-ref">src/torque/ast.h:24-99</code>)。<code>AstNode::Kind</code> 列挙、<code>AstNodeClassCheck::IsInstanceOf</code> の実装、各 Visitor の <code>switch</code> 分岐が全てこのリストから自動生成されます。</p>
+
+<p>根クラス <code>AstNode</code> は <code>Kind</code> タグと <code>SourcePosition</code> を持つだけのシンプルな構造です。派生は 5 系統 (<code>Expression</code>、<code>LocationExpression</code>、<code>Statement</code>、<code>TypeExpression</code>、<code>Declaration</code>)。各派生クラスは <code>DEFINE_AST_NODE_LEAF_BOILERPLATE</code> で <code>cast</code> と <code>DynamicCast</code> の安全ダウンキャストを定義しています。</p>
+
+<p><code>ClassDeclaration</code> は特に多くの情報を保持します (<code class="file-ref">ast.h:1253-1273</code>)。<code>flags: ClassFlags</code>、<code>super: TypeExpression*</code>、<code>generates: optional&lt;string&gt;</code>、<code>methods: vector&lt;Declaration*&gt;</code>、<code>fields: vector&lt;ClassFieldExpression&gt;</code>、<code>instance_type_constraints: InstanceTypeConstraints</code> を持ちます。</p>
+
+<p>AST そのものの所有権は <code>Ast</code> クラスが持ち、ノードはユニークポインタの <code>nodes_</code> ベクタに蓄積されます。<code>MakeNode&lt;T&gt;(...)</code> がノード生成のヘルパで、現在の <code>CurrentSourcePosition</code> を自動でセットしながら AST に登録します。</p>
+
+<h3 id="sec-5-4">5.4 二段階宣言と型の有限化</h3>
+
+<p>V8 のオブジェクトモデルは相互参照だらけです。Map は JSObject を指し、JSObject は Map を持ち、HeapObject は Map を含み、Map は HeapObject を継承する、というように単純な top-down 解決では破綻します。</p>
+
+<p>第一段階 <code>PredeclarationVisitor::Predeclare</code> は AST を最初に駆け抜けて、<code>Namespace</code>、<code>TypeAlias</code>、<code>GenericCallable</code>、<code>Macro</code>、<code>Builtin</code>、<code>Const</code> などのシンボル名前空間だけを先に作ります。</p>
+
+<p>第二段階 <code>ResolvePredeclarations</code> および <code>DeclarationVisitor::Visit</code> で、Predeclare で作ったシンボルの中身を順次解決します。型の <code>extends</code> 句や union 句、フィールド型などはここで Type オブジェクトに変換されます。</p>
+
+<p>最後に <code>TypeOracle::FinalizeAggregateTypes()</code> でクラス・struct のフィールドオフセットが計算され、<code>@cppObjectLayoutDefinition</code> 付きクラスは静的アサート用の情報を蓄えます。</p>
+
+<p><code class="file-ref">src/torque/type-oracle.h:20-200</code> の <code>TypeOracle</code> がこの解決中の中央レジストリで、<code>GetAbstractType</code>、<code>GetStructType</code>、<code>GetBitFieldStructType</code>、<code>GetClassType</code>、<code>GetUnionType</code>、<code>GetReferenceType</code> などの登録 / 取得 API を提供します。Union 型はインスタンスが正規化される (<code>A|B = B|A</code> を <code>IsSubtypeOf</code> で判定して縮約) ので、<code>union_types_</code> のセットに重複なく管理されます。</p>
+
+<p>ジェネリクス特殊化のキャッシュは <code>TypeOracle::GetGenericTypeInstance</code> にあります (<code class="file-ref">type-oracle.cc:36-62</code>)。型引数の組合せをキーとしてキャッシュし、初回呼び出し時のみ <code>TypeVisitor::ComputeType</code> で実体化します。</p>
+
+<p>implicit conversion は <code>TypeOracle::ImplicitlyConvertableFrom</code> が判定します。これは <code>from</code> の各祖先に対して、汎用マクロ <code>FromConstexpr</code> の特殊化が存在するか問い合わせる素朴な方式で、Torque のソース側で <code>FromConstexpr&lt;Smi, constexpr int31&gt;(x: constexpr int31): Smi</code> のように書かれた変換マクロを順に試します。</p>
+
+<h4 id="sec-5-4-1">5.4.1 型推論</h4>
+
+<p>ジェネリック呼び出し側 (<code>Pick&lt;Smi&gt;(1, aSmi)</code> のような形) では、型引数を明示せずに書ける場合の方がはるかに多いため、Torque は型引数推論を持っています。推論アルゴリズムは <code class="file-ref">src/torque/type-inference.cc</code> の <code>TypeArgumentInference</code> に実装されており、与えられた仮型表現と実引数型を再帰的にマッチさせて、ジェネリックパラメータ <code>T</code> に対する具体型を一意に決定します。整合しない制約があれば <code>Fail</code> し、未解決のパラメータが残ったら同じく <code>Fail</code> します。</p>
+
+<h3 id="sec-5-5">5.5 ImplementationVisitor</h3>
+
+<p>AST を CFG に落とすのが <code>ImplementationVisitor</code> (<code class="file-ref">src/torque/implementation-visitor.h:449-612</code>) です。クラスは膨大な <code>Visit(...)</code> メソッド群を持ち、AST 各ノードを対応する <code>CfgAssembler</code> 操作に変換します。</p>
+
+<p>ディスパッチは X-macro と <code>switch</code> で簡潔に書かれています。</p>
+
+<pre><code class="language-cpp">// implementation-visitor.cc:44-74
+VisitResult ImplementationVisitor::Visit(Expression* expr) {
+  CurrentSourcePosition::Scope scope(expr-&gt;pos);
+  switch (expr-&gt;kind) {
+#define ENUM_ITEM(name)        \
+  case AstNode::Kind::k##name: \
+    return Visit(name::cast(expr));
+    AST_EXPRESSION_NODE_KIND_LIST(ENUM_ITEM)
+#undef ENUM_ITEM
+    default:
+      UNREACHABLE();
+  }
+}
+</code></pre>
+
+<p><code>StackScope</code> (<code class="file-ref">implementation-visitor.h:632-679</code>) は値の生存範囲を表すスコープオブジェクトで、<code>Yield</code> で「このスロットを生かして残りを破棄」、destructor で <code>DeleteRangeInstruction</code> 発行、という典型的 RAII パターンを実装します。これにより AST 解釈の各レベルでスタック規律が自動的に保たれます。</p>
+
+<pre><code class="language-cpp">class V8_NODISCARD StackScope {
+ public:
+  explicit StackScope(ImplementationVisitor* visitor) : visitor_(visitor) {
+    base_ = visitor_-&gt;assembler().CurrentStack().AboveTop();
+  }
+  VisitResult Yield(VisitResult result) {
+    DCHECK(!closed_);
+    closed_ = true;
+    if (!result.IsOnStack()) {
+      if (!visitor_-&gt;assembler().CurrentBlockIsComplete()) {
+        visitor_-&gt;assembler().DropTo(base_);
+      }
+      return result;
+    }
+    // 中間スロットを削除し、Yieldする値だけ残す
+  }
+};
+</code></pre>
+
+<p><code>LocationReference</code> (<code class="file-ref">implementation-visitor.h:34-226</code>) は左辺値の表現で、<code>VariableAccess</code> (代入可能なスタックスロット)、<code>Temporary</code> (代入不可)、<code>HeapReference</code> (タグ付きベースとオフセット)、<code>HeapSlice</code> (タグ付きベースとオフセットと長さ)、<code>ArrayAccess</code>、<code>FieldAccess</code>、<code>BitFieldAccess</code> の 7 種類があります。代入式 (<code>a.b = c</code>) は <code>LocationReference</code> の <code>IsAssignable()</code> を経て、対応する Store 系命令を発行します。</p>
+
+<p>代入式の処理 (<code class="file-ref">implementation-visitor.cc:972-988</code>):</p>
+
+<pre><code class="language-cpp">VisitResult ImplementationVisitor::Visit(AssignmentExpression* expr) {
+  StackScope scope(this);
+  LocationReference location_ref = GetLocationReference(expr-&gt;location);
+  VisitResult assignment_value;
+  if (expr-&gt;op) {
+    VisitResult location_value = GenerateFetchFromLocation(location_ref);
+    assignment_value = Visit(expr-&gt;value);
+    Arguments args;
+    args.parameters = {location_value, assignment_value};
+    assignment_value = GenerateCall(*expr-&gt;op, args);
+    GenerateAssignToLocation(location_ref, assignment_value);
+  } else {
+    assignment_value = Visit(expr-&gt;value);
+    GenerateAssignToLocation(location_ref, assignment_value);
+  }
+  return scope.Yield(assignment_value);
+}
+</code></pre>
+
+<h3 id="sec-5-6">5.6 中間表現 (Instruction)</h3>
+
+<p><code class="file-ref">src/torque/instructions.h:27-60</code> の <code>TORQUE_INSTRUCTION_LIST</code> マクロが定義する命令種別は以下です。</p>
+
+<p>backend 非依存命令には <code>PeekInstruction</code> (スタック上の値を覗く)、<code>PokeInstruction</code> (スタック上の値を書き換える)、<code>DeleteRangeInstruction</code> (スタックの範囲を削除する) があります。</p>
+
+<p>backend 依存命令には <code>PushUninitializedInstruction</code>、<code>PushBuiltinPointerInstruction</code>、<code>LoadReferenceInstruction</code>、<code>StoreReferenceInstruction</code>、<code>LoadBitFieldInstruction</code>、<code>StoreBitFieldInstruction</code>、<code>CallCsaMacroInstruction</code>、<code>CallIntrinsicInstruction</code>、<code>NamespaceConstantInstruction</code>、<code>CallCsaMacroAndBranchInstruction</code>、<code>CallBuiltinInstruction</code>、<code>CallRuntimeInstruction</code>、<code>CallBuiltinPointerInstruction</code>、<code>BranchInstruction</code>、<code>ConstexprBranchInstruction</code>、<code>GotoInstruction</code>、<code>GotoExternalInstruction</code>、<code>MakeLazyNodeInstruction</code>、<code>ReturnInstruction</code>、<code>PrintErrorInstruction</code>、<code>AbortInstruction</code>、<code>UnsafeCastInstruction</code> があります。</p>
+
+<p><code>CallCsaMacroInstruction</code> の型整合チェック (<code class="file-ref">instructions.cc:208-233</code>):</p>
+
+<pre><code class="language-cpp">void CallCsaMacroInstruction::TypeInstruction(Stack&lt;const Type*&gt;* stack,
+                                              ControlFlowGraph* cfg) const {
+  std::vector&lt;const Type*&gt; parameter_types =
+      LowerParameterTypes(macro-&gt;signature().parameter_types);
+  for (intptr_t i = parameter_types.size() - 1; i &gt;= 0; --i) {
+    const Type* arg_type = stack-&gt;Pop();
+    const Type* parameter_type = parameter_types.back();
+    parameter_types.pop_back();
+    if (arg_type != parameter_type) {
+      ReportError("parameter ", i, ": expected type ", *parameter_type,
+                  " but found type ", *arg_type);
+    }
+  }
+  if (macro-&gt;IsTransitioning()) {
+    InvalidateTransientTypes(stack);
+  }
+  // ...
+  stack-&gt;PushMany(LowerType(macro-&gt;signature().return_type));
+}
+</code></pre>
+
+<p>全ての命令は「スタック型をどう変化させるか」を <code>TypeInstruction</code> で表現することにより、抽象解釈ベースの型チェックを行います。<code>LowerType</code> は構造体型を要素 TNode の列に「下げる」操作で、Torque の構造体は実行時には複数の TNode に展開されて C++ 上に並びます。</p>
+
+<p><code>DefinitionLocation</code> は SSA ライクな「値の出所」を表す型で、<code>kParameter</code>、<code>kPhi</code>、<code>kInstruction</code> の 3 種類があります。<code>Block::input_definitions_</code> に各ブロック入口での値の出所を蓄積し、複数経路から来る場合は <code>DefinitionLocation::Phi(this, offset)</code> が立ちます。これがコード生成時の変数命名 (<code>phi_bb12_3</code> 等) に使われます。</p>
+
+<h3 id="sec-5-7">5.7 CFG と CfgAssembler</h3>
+
+<p><code class="file-ref">src/torque/cfg.h:23-145</code> で定義される <code>Block</code> と <code>ControlFlowGraph</code> は素直な basic block CFG です。<code>Block</code> は命令列、入力スタック型 (<code>InputTypes</code>)、入力定義位置スタック (<code>InputDefinitions</code>)、命令列 (<code>instructions_</code>)、id、deferred フラグを持ちます。</p>
+
+<p><code>ControlFlowGraph</code> は <code>std::list&lt;Block&gt;</code> でブロックを保有 (アドレスを安定させるためベクタではなくリスト)、<code>placed_blocks_</code> で配置順を保持します。これは生成順とは独立に「コード生成時にどの順で出力するか」を制御できるようにするための工夫で、これが deferred ブロックを末尾に並べる仕組みです。</p>
+
+<p><code>CfgAssembler</code> (<code class="file-ref">cfg.h:147-216</code>) は Torque IR を書き出すアセンブラ風 API で、<code>current_stack_</code> に「現在のスタック型」を、<code>current_block_</code> に「今書き込み中のブロック」を持ち、<code>Emit(instruction)</code> を呼ぶたびに命令の <code>TypeInstruction</code> を実行して <code>current_stack_</code> を更新します。</p>
+
+<pre><code class="language-cpp">void Emit(Instruction instruction) {
+  instruction.TypeInstruction(&amp;current_stack_, &amp;cfg_);
+  current_block_-&gt;Add(std::move(instruction));
+}
+</code></pre>
+
+<p><code>Result()</code> は完了処理を行い、<code>OptimizeCfg()</code> で goto-only ブロックを潰す軽い最適化を実行し、<code>ComputeInputDefinitions()</code> で SSA 形式の定義位置を伝搬させます。</p>
+
+<p>ブロック合流時の型合流ロジックは <code>Block::SetInputTypes</code> で、既存の入力型と今回の型を要素ごとに <code>TypeOracle::GetUnionType</code> で結合します。型が広がった場合は <code>Retype()</code> を呼んでブロック内の命令を再走査し直すため、型推論は固定点反復となります。</p>
+
+<h3 id="sec-5-8">5.8 コード生成バックエンドの比較</h3>
+
+<p><code>CompileCurrentAst</code> の後半 (<code class="file-ref">torque-compiler.cc:99-122</code>) で次のジェネレータが呼ばれます。</p>
+
+<p><code>CSAGenerator</code> (<code class="file-ref">src/torque/csa-generator.cc</code>、1,085 行) はメインのバックエンドで、CodeStubAssembler の C++ API を呼ぶコードを出します。CFG を入力に取り、Block を順に EmitBlock していきます。</p>
+
+<p><code>CCGenerator</code> (<code class="file-ref">cc-generator.cc</code>、528 行) は plain C++ コード (heap verifier、class debug reader、body descriptor 等) の生成に使われ、<code>CSAGenerator</code> より軽量です。<code>PushUninitializedInstruction</code> は「C++ では未初期化値は危険なので不許可」と <code>ReportError</code> を出すなど、CSA 向け命令の一部を意図的にサポートしません。</p>
+
+<p><code>TSAGenerator</code> (<code class="file-ref">tsa-generator.cc</code>、1,808 行、実験的) は <code>V8_ENABLE_EXPERIMENTAL_TQ_TO_TSA</code> 有効時に CFG 経由ではなく <strong>AST から直接</strong> TurboShaft Assembler を呼ぶコードを生成します。<code class="file-ref">tsa-generator.cc:42-46</code> で <code>AstVisitor&lt;TSAGenerator&gt;</code> を継承しています。</p>
+
+<p><code>TorqueCodeGenerator::EmitInstruction</code> の本体 (<code class="file-ref">torque-code-generator.cc:27-43</code>):</p>
+
+<pre><code class="language-cpp">void TorqueCodeGenerator::EmitInstruction(const Instruction&amp; instruction,
+                                          Stack&lt;std::string&gt;* stack) {
+  if (GlobalContext::torque_dwarf() &amp;&amp; !IsEmptyInstruction(instruction)) {
+    EmitSourcePosition(instruction-&gt;pos);
+  }
+  switch (instruction.kind()) {
+#define ENUM_ITEM(T)                                  \
+  case InstructionKind::k##T:                         \
+    if (GlobalContext::annotate_ir()) {               \
+      EmitIRAnnotation(instruction.Cast&lt;T&gt;(), stack); \
+    }                                                 \
+    return EmitInstruction(instruction.Cast&lt;T&gt;(), stack);
+    TORQUE_INSTRUCTION_LIST(ENUM_ITEM)
+#undef ENUM_ITEM
+  }
+}
+</code></pre>
+
+<h3 id="sec-5-9">5.9 CSAGenerator::EmitGraph の具体例</h3>
+
+<p><code class="file-ref">csa-generator.cc:18-68</code> の <code>EmitGraph</code> はまずブロックごとに <code>compiler::CodeAssemblerParameterizedLabel&lt;...&gt;</code> を宣言します。</p>
+
+<pre><code class="language-cpp">for (Block* block : cfg_.blocks()) {
+  if (block-&gt;IsDead()) continue;
+  out() &lt;&lt; "  compiler::CodeAssemblerParameterizedLabel&lt;";
+  // Phi になっているスロットの型を並べる
+  for (BottomOffset i = {0}; i &lt; block-&gt;InputTypes().AboveTop(); ++i) {
+    if (block-&gt;InputDefinitions().Peek(i).IsPhiFromBlock(block)) {
+      out() &lt;&lt; block-&gt;InputTypes().Peek(i)-&gt;GetGeneratedTNodeTypeName();
+    }
+  }
+  out() &lt;&lt; "&gt; " &lt;&lt; BlockName(block) &lt;&lt; "(&amp;ca_, compiler::CodeAssemblerLabel::"
+        &lt;&lt; (block-&gt;IsDeferred() ? "kDeferred" : "kNonDeferred") &lt;&lt; ");\n";
+}
+</code></pre>
+
+<p><code>BranchInstruction</code> は <code>ca_.Branch(cond, &amp;true_label, ..., &amp;false_label, ...)</code> に展開され、Phi スロットの値が両分岐に渡されます (<code class="file-ref">csa-generator.cc:769-800</code>)。<code>Goto</code> は <code>ca_.Goto(&amp;label, phi_values...)</code>、<code>Return</code> は <code>CodeStubAssembler(state_).Return(values...)</code>、<code>Unreachable</code> は <code>CodeStubAssembler(state_).Unreachable()</code> に展開されます。</p>
+
+<h3 id="sec-5-10">5.10 生成成果物の例</h3>
+
+<p><code>GenerateImplementation</code> が <code>-tq-csa.cc</code>、<code>-tq-csa.h</code>、<code>-tq.inc</code>、<code>-tq-inl.inc</code>、<code>-tq.cc</code> の 5 種をソースごとに書き出します (<code class="file-ref">implementation-visitor.cc:1833-1870</code>)。</p>
+
+<p><code>GenerateBitFields</code> は <code>bit-fields.h</code> に <code>base::BitField</code> の <code>using</code> 定義をマクロとして出力します。</p>
+
+<pre><code class="language-cpp">// implementation-visitor.cc:3960-4005 (要約)
+header &lt;&lt; "#define DEFINE_TORQUE_GENERATED_"
+       &lt;&lt; CapifyStringWithUnderscores(type-&gt;name()) &lt;&lt; "() \\\n";
+header &lt;&lt; "  using " &lt;&lt; CamelifyString(field.name_and_type.name)
+       &lt;&lt; suffix &lt;&lt; " = base::BitField&lt;" &lt;&lt; field_type_name &lt;&lt; ", "
+       &lt;&lt; field.offset &lt;&lt; ", " &lt;&lt; field.num_bits &lt;&lt; ", " &lt;&lt; type_name
+       &lt;&lt; "&gt;; \\\n";
+</code></pre>
+
+<p><code>GenerateBuiltinDefinitionsAndInterfaceDescriptors</code> は <code>builtin-definitions.h</code> と <code>interface-descriptors.inc</code> を出力します。Torque ビルトインは <code>BUILTIN_LIST_FROM_TORQUE(CPP, TFJ_TSA, TFJ, TFC_TSA, TFC, TFS, TFH, ASM)</code> マクロを介して V8 の組込みリストに合流します。</p>
+
+<p><code>GenerateClassDebugReaders</code> は外部 (postmortem) デバッガがオブジェクトレイアウトを読めるようにする C++ ヘルパを生成します。各クラスは <code>TqObject</code> の派生として <code>GetProperties(d::MemoryAccessor)</code>、<code>GetName()</code> などをオーバーライドします。これにより <code>debug_helper</code> ライブラリは V8 ランタイムをリンクせずにヒープを歩けます。</p>
+
+<h3 id="sec-5-11">5.11 デバッグ・ツール対応</h3>
+
+<p><code>src/torque/kythe-data.cc/h</code> は Kythe (Google のソースインデックス) 用のシンボル情報出力です。</p>
+
+<p><code>src/torque/server-data.h</code> の <code>LanguageServerData</code> は LSP (Language Server Protocol) 向けで、コンパイル中にトークンと定義位置の対応 (<code>DefinitionsMap</code>)、ファイルごとのシンボルリスト (<code>SymbolsMap</code>) を蓄積します。IDE からの Hover、Find-Reference、Completion 等を支える土台です。</p>
+
+<hr>
+

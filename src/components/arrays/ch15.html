@@ -1,0 +1,70 @@
+<h2 id="chapter15">第15章 ArrayBoilerplateDescription ― 配列リテラルの内部</h2>
+
+<p><code>[1, 2, 3]</code> のような配列リテラルは、テンプレートとなる「boilerplate」配列をコンパイル時に生成しておき、リテラルが評価される度にそれを deep-clone するという仕組みになっています。これにより同じソース位置で何度配列リテラルを評価しても、Map と elements_kind が一致した形で生成され、Hidden Class の inline cache が効きやすくなります。</p>
+
+<p><code class="file-ref">src/objects/literal-objects.h:116</code> の ArrayBoilerplateDescription</p>
+
+<pre><code class="language-cpp">V8_OBJECT class ArrayBoilerplateDescription : public Struct {
+ public:
+  inline ElementsKind elements_kind() const;
+  inline void set_elements_kind(ElementsKind kind);
+  inline bool is_empty() const;
+  inline Tagged&lt;Smi&gt; flags() const;
+  inline Tagged&lt;FixedArrayBase&gt; constant_elements() const;
+  ...
+ private:
+  TaggedMember&lt;Smi&gt; flags_;
+  TaggedMember&lt;FixedArrayBase&gt; constant_elements_;
+};
+</code></pre>
+
+<p><code>flags_</code> (Smi) は ElementsKind と speculation 関連のビットフィールドを格納し、<code>constant_elements_</code> はパース時に確定した実値の FixedArray (or FixedDoubleArray) を指します。</p>
+
+<p>配列リテラルが評価されるフローは次のとおりです。</p>
+
+<pre><code class="language-text">Source: arr = [1, 2.5, 'x']
+         │
+         ▼
+Parser builds AST node ArrayLiteral
+         │
+         ▼
+AstValueFactory creates ArrayBoilerplateDescription{
+    elements_kind: PACKED_ELEMENTS
+    constant_elements: FixedArray[ Smi(1), HeapNumber(2.5), String("x") ]
+}
+         │
+         ▼ (実行時)
+CreateArrayLiteral builtin:
+    AllocationSite を feedback vector から取得 or 作成
+    JSArray (+ AllocationMemento) を NEW_SPACE に確保
+    FixedArray を clone して elements にセット
+    length を 3 に設定 (Smi)
+         │
+         ▼
+JSArray が動的拡張されると ElementsKind が遷移し
+AllocationSite を update してフィードバックを残す
+</code></pre>
+
+<p><code>Factory::NewJSArray</code> (<code class="file-ref">src/heap/factory.cc:3718</code>) が実体の確保を担います。</p>
+
+<pre><code class="language-cpp">Handle&lt;JSArray&gt; Factory::NewJSArray(ElementsKind elements_kind, uint32_t length,
+                                    uint32_t capacity,
+                                    ArrayStorageAllocationMode mode,
+                                    AllocationType allocation) {
+  DCHECK(capacity &gt;= length);
+  if (capacity == 0) {
+    return NewJSArrayWithElements(empty_fixed_array(), elements_kind, length,
+                                  allocation);
+  }
+  ...
+  DirectHandle&lt;FixedArrayBase&gt; elms =
+      NewJSArrayStorage(elements_kind, capacity, mode);
+  return inner_scope.CloseAndEscape(NewJSArrayWithUnverifiedElements(
+      elms, elements_kind, length, allocation));
+}
+</code></pre>
+
+<p>capacity = 0 のときは canonical な empty_fixed_array を共有して FixedArray を新規確保しません。これにより、空配列同士は同じ backing store を共有しメモリを節約します。</p>
+
+<hr>
+

@@ -1,0 +1,54 @@
+<h2 id="chapter13">第13章 TypedArray ― 別世界の配列</h2>
+
+<p>JSArray は仕様に基づき動的・スパース・型混合が許される一般的な配列ですが、TypedArray (Uint8Array, Int32Array, Float64Array, ...) は固定型・固定長・dense のみで、より C/C++ の配列に近い性質を持ちます。</p>
+
+<h3 id="sec13-1">13.1 JSTypedArrayの構造</h3>
+
+<p><code class="file-ref">src/objects/js-array-buffer.h:460</code> の JSTypedArray は次のフィールドを持ちます。</p>
+
+<pre><code class="language-cpp">V8_OBJECT class JSTypedArray : public JSArrayBufferView {
+ public:
+  ...
+  UnalignedValueMember&lt;uintptr_t&gt; raw_length_;
+  UnalignedValueMember&lt;Address&gt; external_pointer_;
+  TaggedMember&lt;Object&gt; base_pointer_;
+};
+</code></pre>
+
+<p><code>external_pointer + base_pointer</code> がデータの実効ポインタです。データそのものは ArrayBuffer (もしくは SharedArrayBuffer) のバッキングストアにあり、TypedArray はそこへのビューに過ぎません。</p>
+
+<p>ElementsKind としては UINT8_ELEMENTS から FLOAT16_ELEMENTS までが TypedArray 用です。要素のサイズシフトは <code class="file-ref">elements-kind.h:213</code> の <code>ElementsKindToShiftSize</code> で指定され、<code>arr[i]</code> の実効アドレスは <code>data + (i &lt;&lt; shift)</code> という単純なシフト演算で計算できます。HeapNumber も Tagged Pointer も介さず、CPU の load 命令にほぼ直結します。</p>
+
+<p>TypedArray のもう一つの特徴は穴がないことです。仕様上、未代入の要素には型に応じたゼロ値 (整数なら 0、float なら +0.0) が入っており、<code>arr[i]</code> でアクセスしてもプロトタイプチェーンを辿る必要はありません。これにより HOLEY 判定の分岐コストが全く発生せず、純粋に C 配列と同じ性能で動作します。</p>
+
+<p><code>kMaxSizeInHeap = 64</code> (<code class="file-ref">js-array-buffer.h:559</code>) より小さい TypedArray はオブジェクト本体の末尾に in-place で確保される on-heap 形式になり、それ以上のサイズだと ArrayBuffer のバッキングストアが off-heap に切り出されます。on-heap 形式は GC で移動可能な分、ポインタが圧縮できる利点があります。</p>
+
+<h3 id="sec13-2">13.2 RAB/GSAB</h3>
+
+<p>Resizable ArrayBuffer / Growable Shared ArrayBuffer 系の TypedArray は長さが動的に変わるため、要素アクセスのたびに bound check と detach check を入れる必要があり、専用の RAB_GSAB_ から始まる Kind を持っています。</p>
+
+<p><code class="file-ref">src/objects/js-array-buffer.h:435</code> で</p>
+
+<pre><code class="language-cpp">DECL_BOOLEAN_ACCESSORS(is_length_tracking)
+DECL_BOOLEAN_ACCESSORS(is_backed_by_rab)
+inline bool IsVariableLength() const;
+</code></pre>
+
+<p><code>is_length_tracking</code> は TypedArray の長さが buffer のリサイズに追従するかを示し、<code>is_backed_by_rab</code> は GSAB ではなく RAB に裏付けられているかを示します。</p>
+
+<h3 id="sec13-3">13.3 SharedArrayBuffer と Atomics</h3>
+
+<p>SharedArrayBuffer は複数の Worker スレッドから同時アクセスできるため、<code>SHARED_ARRAY_ELEMENTS</code> という ElementsKind と Atomic 操作 (<code class="file-ref">elements-kind.h:174</code>) を伴います。</p>
+
+<pre><code class="language-cpp">FIRST_VALID_ATOMICS_TYPED_ARRAY_ELEMENTS_KIND = UINT8_ELEMENTS,
+LAST_VALID_ATOMICS_TYPED_ARRAY_ELEMENTS_KIND = BIGINT64_ELEMENTS,
+</code></pre>
+
+<p><code>Atomics.load</code>、<code>Atomics.store</code>、<code>Atomics.compareExchange</code> などはこの範囲の Kind に対して動作します。</p>
+
+<h3 id="sec13-4">13.4 BackingStore</h3>
+
+<p><code class="file-ref">src/objects/backing-store.h:48</code> の BackingStore はヒープ外の通常 malloc/mmap 領域を所有するクラスで、<code>byte_length</code> と <code>byte_capacity</code> を区別します (リサイズ可能な場合、capacity が確保された最大サイズ、length が現在使用中サイズ)。<code>is_shared</code>、<code>is_resizable_by_js</code>、<code>is_immutable</code>、<code>is_wasm_memory</code> といったフラグを保持します。</p>
+
+<hr>
+

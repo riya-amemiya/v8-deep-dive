@@ -1,0 +1,469 @@
+<h2 id="ch10">第10章 Orinoco GC - Scavenger と Mark-Compact</h2>
+
+<h3 id="ch10-1">10.1 Orinoco 全体アーキテクチャ</h3>
+
+<p>Orinoco は V8 のガベージコレクション・サブシステム全体の総称であり、特定のアルゴリズム名ではありません。歴史的にこのコードネームは「メインスレッドを長時間止めないこと」を最優先目標として導入されました。具体的には、世代別 GC、並列 Scavenger、インクリメンタル＆並行マーキング、並行・遅延 Sweeping、そして Cppgc との統合 (Unified Heap) を組み合わせた一連の改良群を指します。</p>
+
+<p><code>HeapState</code> は単純な列挙体として定義されています。</p>
+
+<pre><code class="language-cpp">// src/heap/heap.h:275-281
+enum HeapState {
+  NOT_IN_GC,
+  SCAVENGE,
+  MARK_COMPACT,
+  MINOR_MARK_SWEEP,
+  TEAR_DOWN
+};
+</code></pre>
+
+<p>Orinoco は 4 種類の状態を持ち、Young Generation GC として <code>SCAVENGE</code> または <code>MINOR_MARK_SWEEP</code> のいずれかが、Old Generation GC として <code>MARK_COMPACT</code> が走ります。</p>
+
+<pre><code class="language-cpp">// src/heap/heap.h:381-384
+static inline GarbageCollector YoungGenerationCollector() {
+  return (v8_flags.minor_ms) ? GarbageCollector::MINOR_MARK_SWEEPER
+                             : GarbageCollector::SCAVENGER;
+}
+</code></pre>
+
+<h4>「並行・並列・インクリメンタル」の三段階</h4>
+
+<p>並列 (parallel) はマーキングや Evacuation で複数のスレッドが同時に GC 作業を行う形態を指します。ミューテータ (JavaScript の実行スレッド) は止まっています。</p>
+
+<p>並行 (concurrent) はミューテータが走っているのと同時に GC スレッドが作業をする形態を指します。Write Barrier やマーキングバリアによって整合性を保ちます。</p>
+
+<p>インクリメンタル (incremental) はメインスレッド上で GC 作業を細切れに行い、その合間に JavaScript を実行する形態を指します。マーキングを少しずつ進めることで Stop-the-World 時間を分散させます。</p>
+
+<p>Orinoco においては、Major GC (<code>MarkCompactCollector</code>) はこの 3 つすべてを同時に活用しています。</p>
+
+<h3 id="ch10-2">10.2 Scavenger (Minor GC, Cheney's Algorithm)</h3>
+
+<p>Scavenger は Cheney (1970) のコピーアルゴリズムを並列化したものです。Young Generation を From-Space と To-Space という 2 つの半空間 (semi-space) に分け、GC のたびに役割を入れ替えます (flip)。</p>
+
+<pre><code class="language-text">GC前:                              GC後:
++-----+ +-----+                   +-----+ +-----+
+|From | |To   |                   |From | |To   |
+|     | |空   |    -- flip --&gt;   |空   | |生存 |
+|object|||                       |     | |     |
++-----+ +-----+                   +-----+ +-----+
+
+生存オブジェクトを From -&gt; To へコピー
+</code></pre>
+
+<h4>GC の主要フェーズ</h4>
+
+<p><code>ScavengerCollector::CollectGarbage()</code> は次のフェーズで進行します。</p>
+
+<p>最初に <code>SwapSemiSpaces()</code> で From と To を入れ替えます。</p>
+
+<pre><code class="language-cpp">// src/heap/new-spaces.cc:194-211
+void SemiSpace::Swap(SemiSpace* from, SemiSpace* to) {
+  // We swap all properties but id_.
+  std::swap(from-&gt;memory_chunk_list_, to-&gt;memory_chunk_list_);
+  std::swap(from-&gt;current_page_, to-&gt;current_page_);
+  ...
+  to-&gt;FixPagesFlags();
+  from-&gt;FixPagesFlags();
+}
+</code></pre>
+
+<p><code>id_</code> は入れ替えないため、識別子と中身の対応が反転する形になります。</p>
+
+<p>次にワークリスト・空チャンクリスト・JSWeakRef リスト・WeakCell リスト・Ephemeron テーブルリストを準備し、<code>num_scavenge_tasks</code> 個の <code>Scavenger</code> インスタンスをスレッド数ぶん生成します。</p>
+
+<p>その後、Old-to-New の Remembered Set を持つチャンクを集めます。</p>
+
+<pre><code class="language-cpp">// src/heap/scavenger.cc:1698-1706
+OldGenerationMemoryChunkIterator::ForAll(
+    heap_, [&amp;old_to_new_chunks](MutablePage* chunk) {
+      if (chunk-&gt;slot_set&lt;OLD_TO_NEW&gt;() ||
+          chunk-&gt;typed_slot_set&lt;OLD_TO_NEW&gt;() ||
+          chunk-&gt;slot_set&lt;OLD_TO_NEW_BACKGROUND&gt;()) {
+        old_to_new_chunks.emplace_back(ParallelWorkItem{}, chunk);
+      }
+    });
+</code></pre>
+
+<p><code>OLD_TO_NEW</code> Remembered Set とは、Old 領域にあるオブジェクトのどのスロットが New 領域のオブジェクトを指しているかを記録する集合です。これは Write Barrier によって維持されます。Old 領域全体を辿らずに、ここに登録された場所だけを擬似ルートとして扱えば、Young Generation の生存オブジェクトを漏れなく走査できます。これが世代別 GC の最大の効率源です。</p>
+
+<h4>移動・昇格・CAS</h4>
+
+<p>オブジェクト 1 つを移動するコアロジックは <code>TryMigrateObject</code> です。この関数は並行する複数の Scavenger ワーカーが同じオブジェクトを移動しようとしたときの競合を CAS で解決します。</p>
+
+<pre><code class="language-cpp">// src/heap/scavenger.cc:1951-2002 抜粋
+template &lt;typename THeapObjectSlot, typename OnSuccessCallback&gt;
+bool Scavenger::TryMigrateObject(Tagged&lt;Map&gt; map, THeapObjectSlot slot,
+                                 Tagged&lt;HeapObject&gt; source,
+                                 SafeHeapObjectSize object_size,
+                                 AllocationSpace space,
+                                 OnSuccessCallback on_success) {
+  Tagged&lt;HeapObject&gt; target;
+  if (!allocator_
+           .Allocate(space, object_size,
+                     HeapObject::RequiredAlignment(space, map))
+           .To(&amp;target)) [[unlikely]] {
+    return false;
+  }
+  DCHECK(heap()-&gt;marking_state()-&gt;IsUnmarked(target));
+
+  // This CAS can be relaxed because we do not access the object body if the
+  // object was already copied by another thread.
+  if (!source-&gt;relaxed_compare_and_swap_map_word_forwarded(
+          MapWord::FromMap(map), target)) {
+    // Other task migrated the object.
+    allocator_.FreeLast(space, target, object_size);
+    const MapWord map_word = source-&gt;map_word(kRelaxedLoad);
+    UpdateHeapObjectReferenceSlot(slot, map_word.ToForwardingAddress(source));
+    return true;
+  }
+
+  // Copy the content of source to target. Note that we do this on purpose
+  // *after* the CAS.
+  target-&gt;set_map_word(map, kRelaxedStore);
+  heap()-&gt;CopyBlock(target.address() + kTaggedSize,
+                    source.address() + kTaggedSize,
+                    object_size.value() - kTaggedSize);
+</code></pre>
+
+<p>重要な点は 3 つあります。第一に、Forwarding Pointer は MapWord に保存されます。Map 領域の先頭ワードは通常はオブジェクトのマップ (型情報) ですが、Scavenger が動作しているあいだ移動後はその場所が自分の新しいアドレスを指すよう書き換えられます。</p>
+
+<p>第二に、<code>relaxed_compare_and_swap_map_word_forwarded</code> で MapWord を CAS することで、複数スレッドが同じオブジェクトを移動しようとしても、勝ったスレッドだけが実際にコピー作業を行います。負けたスレッドは自分が割り当てた <code>target</code> を <code>FreeLast</code> で解放し、勝者の指す forwarding address を読み取って自分のスロット更新に使います。</p>
+
+<p>第三に、コピー (<code>CopyBlock</code>) は CAS の後に行われます。これは敗者がいた場合の無駄なコピーを避けるためであり、また CAS で relaxed メモリ順序を使えるようにするためでもあります。</p>
+
+<h4>Promotion 判定</h4>
+
+<p><code>ShouldBePromoted</code> は <code>semi_space_new_space()-&gt;ShouldBePromoted(object_address)</code> を呼びます。これは「Age Mark より下にあるかどうか」で判定する仕組みです。Age Mark は前回 GC 終了時の Top ポインタの位置を覚えておく仕組みで、Age Mark より古い (下にある) オブジェクトはすでに 1 回 Scavenge を生き延びていることを意味し、昇格対象となります。</p>
+
+<h4>計算量と性能特性</h4>
+
+<p>Scavenger の本質的な計算量は O(S) です。S は Young Generation 中の生存オブジェクトの総サイズです。死んだオブジェクトには一切触れません。これが Scavenger の高速性の本質です。世代別仮説により S ≪ Young Generation 全体サイズなので、新空間が満杯になるたびに走らせても短い時間で終わります。</p>
+
+<p>ただし Old → New 参照については Old 全体ではなく Remembered Set を辿るので O(R) (R = 記録されたスロット数) で済みます。総計算量は O(S + R) となります。</p>
+
+<h3 id="ch10-3">10.3 Paged New Space と Minor Mark-Sweep</h3>
+
+<p>Cheney 流の Semi-Space は単純で高速ですが、本質的に Young Generation のために 2 倍の物理メモリが必要です。常に半分は空の To-Space として確保されます。組み込み機器やモバイルでは無視できないコストです。</p>
+
+<p>Paged New Space はこの問題を解決するために導入されました。Paged New Space では Young Generation のページが Free List ベースで管理されるため、To-Space を予約する必要がありません。</p>
+
+<h4>Sticky Mark Bits とは</h4>
+
+<p>Paged New Space と組み合わせて使われるのが Sticky Mark Bits です。これは Major GC と Minor GC でマーキングビットマップを共有する仕組みで、Minor GC の合間に Mark ビットがリセットされない点が特徴です。生き残り続けるオブジェクトはずっと Mark されたままになり「sticky (粘着的)」と呼ばれます。</p>
+
+<p>Sticky Mark Bits により Minor GC は「未マークのものだけを掃除する」Sweep ベースの戦略を取れるようになります。これが <code>MinorMarkSweepCollector</code> です。</p>
+
+<p>Minor MS は旧来「Minor Mark-Compact」と呼ばれていましたが、現在は Compaction を行わない名前に変わっています。Compaction が不要なのは、Old Generation と同じく Free List 管理の Sweep ベースの仕組みを採用しているためです。コピーが発生しないので生存オブジェクトの量が多い「死ににくいワークロード」では Scavenger より効率的になります。逆に「すぐ死ぬオブジェクト」が支配的なら Scavenger のほうが速いケースもあります。</p>
+
+<h3 id="ch10-4">10.4 Mark-Compact (Major GC)</h3>
+
+<p>Major GC を担う <code>MarkCompactCollector</code> のエントリポイントは <code>CollectGarbage()</code> で、おおまかには 6 つのフェーズに分かれます。</p>
+
+<pre><code class="language-cpp">// src/heap/mark-compact.cc:532-560
+void MarkCompactCollector::CollectGarbage() {
+  ...
+  MarkLiveObjects();
+  ...
+  RecordObjectStats();
+  ClearNonLiveReferences();
+  VerifyMarking();
+  ...
+  Sweep();
+  Evacuate();
+  Finish();
+}
+</code></pre>
+
+<h4>Tri-color Marking と Marking Bitmap</h4>
+
+<p>Mark-Compact は Tri-color (三色) マーキングを採用しています。これは Dijkstra (1978) によって提唱された古典的アルゴリズムで、各オブジェクトを以下の 3 色に分類します。</p>
+
+<pre><code class="language-text">白 (white):   未訪問。死んでいる可能性がある。
+灰 (grey):    訪問済みだが子要素は未訪問。ワークリストに入っている。
+黒 (black):   訪問済み、かつ子要素も訪問済み (またはワークリストに入った)。
+
+不変条件 (tri-color invariant):
+  「黒のオブジェクトは白のオブジェクトを直接指してはいけない」
+
+これを満たす限り、白は安全に解放できる。
+</code></pre>
+
+<p>V8 のマーキング Bitmap は 1 ページ (V8 では 256KB) あたり「タグドサイズごとに 1 ビット」の Mark Bit を持ちます。タグドサイズが 8 バイトなら 256KB/8 = 32768 ビット = 4KB のビットマップになります。</p>
+
+<p>V8 の Marking Bitmap では「灰」を「Bit 1 + ワークリストに存在」、「黒」を「Bit 1 + ワークリストに不在」として表現します。ビット自体は 2 状態しかありませんが、組み合わせで 3 色を表現します。</p>
+
+<h4>Mark Live Objects</h4>
+
+<pre><code class="language-cpp">// src/heap/mark-compact.cc:2582-2671 抜粋
+void MarkCompactCollector::MarkLiveObjects() {
+  const bool was_marked_incrementally =
+      !heap_-&gt;incremental_marking()-&gt;IsStopped();
+  if (was_marked_incrementally) {
+    DCHECK(incremental_marking-&gt;IsMajorMarking());
+    incremental_marking-&gt;Stop();
+    MarkingBarrier::PublishAll(heap_);
+    ...
+  }
+
+  RootMarkingVisitor root_visitor(this);
+
+  {
+    TRACE_GC(heap_-&gt;tracer(), GCTracer::Scope::MC_MARK_ROOTS);
+    MarkRoots(&amp;root_visitor);
+  }
+  ...
+  if (v8_flags.parallel_marking &amp;&amp; UseBackgroundThreadsInCycle()) {
+    parallel_marking_ = true;
+    MarkTransitiveClosureFixpoint();
+    parallel_marking_ = false;
+  }
+  ...
+  MarkRootsFromConservativeStack(&amp;root_visitor);
+  ...
+  if (!MarkTransitiveClosureFixpoint()) {
+    MarkTransitiveClosureLinear();
+  }
+</code></pre>
+
+<p>注目すべきは 2 点です。第一に、インクリメンタルマーキングがすでに進んでいた場合は途中状態を引き継ぎます。Write Barrier によって維持されていた黒→白参照の追跡情報を <code>MarkingBarrier::PublishAll(heap_)</code> で全 LocalHeap から集めます。</p>
+
+<p>第二に、Conservative Stack Scanning はパラレルマーキングのあとに別フェーズとして行います。これはスタックスキャンによってピン留めされるオブジェクトを最後に確定させるためです。</p>
+
+<p><code>MarkTransitiveClosureFixpoint()</code> は ephemeron が絡むため不動点反復になり、まずこれを試します。ephemeron の数が多くて fixpoint が高コストになった場合は <code>MarkTransitiveClosureLinear()</code> というアルゴリズムに切り替えます。</p>
+
+<p>擬似コードで Mark Live Objects を表すと以下のようになります。</p>
+
+<pre><code class="language-text">function MarkLiveObjects():
+    worklist = empty
+    for each root r in roots:
+        mark r grey   // bit を立て、worklist に push
+    while worklist is not empty:
+        obj = worklist.pop()
+        for each field f of obj:
+            child = *f
+            if child is white:
+                mark child grey
+        mark obj black  // 単に worklist から外す
+</code></pre>
+
+<h4>Concurrent Marking</h4>
+
+<p><code>ConcurrentMarking</code> クラスはバックグラウンドスレッドで Marking を行います。実体は <code>JobTaskMajor</code> および <code>JobTaskMinor</code> という JobTask で、バックグラウンドプールで実行されます。</p>
+
+<p>並行マーキングのキモは Write Barrier との協調です。ミューテータが <code>parent.field = child</code> を実行したとき、もし parent が黒で child が白なら tri-color 不変条件が壊れます。これを防ぐのが Marking Barrier の役目です。</p>
+
+<h4>Incremental Marking</h4>
+
+<pre><code class="language-cpp">// src/heap/incremental-marking.cc:245
+void IncrementalMarking::StartMarkingMajor() {
+  ...
+  is_compacting_ = major_collector_-&gt;StartCompaction(
+      MarkCompactCollector::StartCompactionMode::kIncremental);
+  ...
+  marking_mode_ = MarkingMode::kMajorMarking;
+  heap_-&gt;SetIsMarkingFlag(true);
+
+  MarkingBarrier::ActivateAll(heap(), is_compacting_);
+  isolate()-&gt;traced_handles()-&gt;SetIsMarking(true);
+
+  StartBlackAllocation();
+  ...
+  if (v8_flags.concurrent_marking &amp;&amp; !heap_-&gt;IsTearingDown()) {
+    heap_-&gt;concurrent_marking()-&gt;TryScheduleJob(
+        GarbageCollector::MARK_COMPACTOR);
+  }
+</code></pre>
+
+<p><code>MarkingBarrier::ActivateAll</code> で全 LocalHeap のマーキングバリアを有効化し、<code>StartBlackAllocation</code> で新規確保オブジェクトを黒色にする設定を入れ、最後に <code>concurrent_marking-&gt;TryScheduleJob</code> でバックグラウンドマーキングを開始します。</p>
+
+<h4>Sweeping (掃除)</h4>
+
+<p><code>Sweep()</code> は Old Space の各ページを Free List 化する処理です。<code>Sweeper::RawSweep</code> が 1 ページぶんの処理を担います。</p>
+
+<p>ページを Mark Bit に従って線形に走査し、生存オブジェクト間の空き範囲を Free List に登録します。さらに、その空き範囲にあった Remembered Set のエントリを掃除し、最後にビットマップをクリアします。計算量は O(P)、P = ページサイズです。</p>
+
+<p>V8 では Sweeping を並行・遅延に行います。並行 Sweeping の利点は、Atomic Pause で Sweep を完了する必要がなくなることです。Atomic Pause では Sweeping を「開始する」だけで、実際の作業はバックグラウンドや mutator がアロケーションを試みた瞬間 (Lazy Sweeping) に進みます。</p>
+
+<h4>Evacuation (Compaction)</h4>
+
+<p><code>Evacuate()</code> は断片化したページからオブジェクトを別ページにコピーしてフラグメンテーションを解消します。すべてのページを対象にすると重いので、<code>evacuation_candidates_</code> というメンバに対象を絞ります。</p>
+
+<pre><code class="language-cpp">// src/heap/mark-compact.cc:606
+void MarkCompactCollector::ComputeEvacuationHeuristics(
+    size_t area_size, int* target_fragmentation_percent,
+    size_t* max_evacuated_bytes) {
+  ...
+  const int kTargetFragmentationPercent = 70;
+</code></pre>
+
+<p>通常モードでは 70% より高い断片化率のページが対象です。</p>
+
+<h3 id="ch10-5">10.5 Conservative Stack Scanning</h3>
+
+<p>伝統的な V8 はスタック上のすべてのポインタを精密に追跡するため <code>Handle</code> クラスを使う Handlification を要求していました。Conservative Stack Scanning は「スタック上の任意のワードがヒープポインタである可能性があるなら、それを保守的にルートとみなす」ことで Handlification の負担を軽減します。</p>
+
+<p>これによって導入されたのが <code>DirectHandle</code> です。これはスタック上に直接ポインタを置く軽量ハンドルで、Conservative Stack Scanner がそれらを発見するため正しく追跡されます。</p>
+
+<p><code>FindBasePtr</code> 内部では <code>MarkingBitmap::FindPreviousValidObject</code> を呼びます。</p>
+
+<pre><code class="language-cpp">// src/heap/marking-inl.h:197-209
+// This method provides a basis for inner-pointer resolution. It expects a
+// page and a maybe_inner_ptr that is contained in that page. It returns the
+// highest address in the page that is not larger than maybe_inner_ptr, has
+// its markbit set, and whose previous address (if it exists) does not have
+// its markbit set.
+static inline Address FindPreviousValidObject(const NormalPage* page,
+                                              Address maybe_inner_ptr);
+</code></pre>
+
+<p>Mark Bitmap を逆向きに走査して「直近の Mark Bit が立っているアドレス」を見つけ、それをオブジェクトヘッダとみなします。これによって、たとえばスタックに <code>obj.address + 16</code> のような内部ポインタが残っていても、対応する <code>obj</code> を正しくルートとして特定できます。</p>
+
+<h4>Pinning</h4>
+
+<p>Scavenger では Conservative Stack Scanning と組み合わせるとオブジェクトをピン留め (pinning) する仕組みが必要です。スタック上に内部ポインタがあると、そのオブジェクトを移動 (Scavenge) できないため、移動を諦めて in-place で生存させます。ピン留めされたオブジェクトを含むページは Quarantined Page となり、当該ページは GC 後に sweep されますが、対象オブジェクトは元の位置に残ります。</p>
+
+<h3 id="ch10-6">10.6 メモリ管理の最適化</h3>
+
+<h4>Black Allocation</h4>
+
+<p>Black Allocation は Concurrent Marking 中に確保された新規オブジェクトを最初から「黒」として扱う最適化です。なぜこれが必要かというと、Concurrent Marking 中に新しいオブジェクトを白で確保すると、白かつ参照されている状態が一時的に生まれてしまい、それが回収される危険があるからです。最初から黒にすればこのリスクは消えますが、副作用としてマーキング中に生まれたオブジェクトは Floating Garbage として今回の GC では回収されません。</p>
+
+<h4>Concurrent Allocation (CAS-based bump pointer)</h4>
+
+<p>Linear Allocation Area (LAB) は通常はスレッドごとに保持されますが、共有空間や複数スレッドが触る空間では Bump Pointer の更新を CAS で行います。</p>
+
+<pre><code class="language-text">function ConcurrentAllocate(space, size):
+    loop:
+        old_top = atomic_load(space.top)
+        new_top = old_top + size
+        if new_top &gt; space.limit:
+            slow_path(size)
+            continue
+        if compare_and_swap(&amp;space.top, old_top, new_top):
+            return old_top
+</code></pre>
+
+<h4>Memory Reducer</h4>
+
+<p><code>MemoryReducer</code> クラスはアイドル時にメモリを返却することを目的とした有限状態機械です。</p>
+
+<pre><code class="language-text">22: // The goal of the MemoryReducer class is to detect transition of the mutator
+23: // from high allocation phase to low allocation phase and to collect potential
+24: // garbage created in the high allocation phase.
+26: // States:
+29: // - DONE &lt;last_gc_time_ms&gt;
+30: // - WAIT &lt;started_gcs&gt; &lt;next_gc_start_ms&gt; &lt;last_gc_time_ms&gt;
+31: // - RUN &lt;started_gcs&gt; &lt;last_gc_time_ms&gt;
+</code></pre>
+
+<p>DONE → WAIT → RUN → DONE の循環で、ミューテータが活発に確保している間は静かにし、収まってきたら追加で GC を仕掛けてメモリを返却します。</p>
+
+<h3 id="ch10-7">10.7 Finalization Registry と WeakRef</h3>
+
+<h4>FinalizationRegistry の構造</h4>
+
+<p><code>JSFinalizationRegistry</code> は ES2021 で導入された API です。</p>
+
+<pre><code class="language-cpp">// src/objects/js-weak-refs.h:113-119
+TaggedMember&lt;NativeContext&gt; native_context_;
+TaggedMember&lt;JSReceiver&gt; cleanup_;
+TaggedMember&lt;UnionOf&lt;WeakCell, Undefined&gt;&gt; active_cells_;
+TaggedMember&lt;UnionOf&lt;WeakCell, Undefined&gt;&gt; cleared_cells_;
+TaggedMember&lt;Object&gt; key_map_;
+TaggedMember&lt;UnionOf&lt;JSFinalizationRegistry, Undefined&gt;&gt; next_dirty_;
+TaggedMember&lt;Smi&gt; flags_;
+</code></pre>
+
+<p><code>active_cells_</code> は登録された対象がまだ生きている WeakCell の連結リスト、<code>cleared_cells_</code> は対象が死んだ WeakCell の連結リストです。</p>
+
+<h4>WeakCell の構造</h4>
+
+<pre><code class="language-cpp">// src/objects/js-weak-refs.h:190-197
+TaggedMember&lt;JSFinalizationRegistry&gt; finalization_registry_;
+TaggedMember&lt;JSAny&gt; holdings_;
+TaggedMember&lt;UnionOf&lt;Symbol, JSReceiver, Undefined&gt;&gt; target_;
+TaggedMember&lt;UnionOf&lt;Symbol, JSReceiver, Undefined&gt;&gt; unregister_token_;
+TaggedMember&lt;UnionOf&lt;WeakCell, Undefined&gt;&gt; prev_;
+TaggedMember&lt;UnionOf&lt;WeakCell, Undefined&gt;&gt; next_;
+TaggedMember&lt;UnionOf&lt;WeakCell, Undefined&gt;&gt; key_list_prev_;
+TaggedMember&lt;UnionOf&lt;WeakCell, Undefined&gt;&gt; key_list_next_;
+</code></pre>
+
+<p><code>target_</code> は弱参照対象、<code>holdings_</code> は finalizer に渡される値、<code>unregister_token_</code> は登録解除用トークンです。</p>
+
+<h4>GC 中の WeakCell 処理</h4>
+
+<p>Scavenger では <code>target</code> が死んでいた場合 <code>weak_cell-&gt;Nullify</code> で target を null 化し、所属する FinalizationRegistry を Dirty Registry リストに繋ぎます。GC 後に <code>JSFinalizationRegistry::Cleanup</code> がマイクロタスクとして呼ばれ、登録された finalizer が JavaScript レベルで呼ばれます。</p>
+
+<h3 id="ch10-8">10.8 Ephemeron Hash Table</h3>
+
+<p>Ephemeron は (key, value) のペアで、value の生存が key の生存に依存する弱参照構造です。WeakMap と WeakSet が代表例です。</p>
+
+<p>問題は「key と value のどちらも、それぞれの ephemeron 経由以外からは到達できないが、key と value が相互参照している」というケースです。素朴に標準のマーキングを走らせると、m から v が直接参照されているように見えてしまい、v が誤って生存と判定されます。</p>
+
+<pre><code class="language-cpp">// src/heap/mark-compact.cc:2404-2437
+MarkCompactCollector::EphemeronResult
+MarkCompactCollector::ApplyEphemeronSemantics(Tagged&lt;HeapObject&gt; key,
+                                              Tagged&lt;HeapObject&gt; value) {
+  ...
+  if (MarkingHelper::IsMarkedOrAlwaysLive(heap_, marking_state_, key)) {
+    if (MarkingHelper::TryMarkAndPush(...)) {
+      return EphemeronResult::kMarkedValue;
+    } else {
+      return EphemeronResult::kResolved;
+    }
+  } else {
+    if (marking_state_-&gt;IsMarked(value)) {
+      return EphemeronResult::kResolved;
+    } else {
+      return EphemeronResult::kUnresolved;
+    }
+  }
+}
+</code></pre>
+
+<p>ロジックを読み解くと、第一に key がマーク済み (生存確定) であれば value をマークする。これが Ephemeron Semantics の本質です。第二に key が未マーク (現時点では死んでいる候補) であれば、value もマークしない。第三に Unresolved な ephemeron は不動点反復で再評価します。</p>
+
+<h3 id="ch10-9">10.9 GC のグランドツアー</h3>
+
+<p>典型的な Major GC の流れを時系列で整理します。</p>
+
+<pre><code class="language-text">時刻 →
+
+Mutator: ████████████████░░░░░░░░░░░░░░░░░░░░░░░░████████░░░░░░██████
+                          ↑                              ↑       ↑
+                          GC開始                         Atomic   GC終了
+                                                         Pause
+
+Concurrent Marking:         ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+Incremental Marking:      ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+Concurrent Sweeping:                                            ▓▓▓▓▓▓▓▓▓
+</code></pre>
+
+<ol>
+<li>旧 GC 終了後、<code>HeapLimits</code> がアロケーション上限を更新する。</li>
+<li>ミューテータが Limit に近づくと <code>IncrementalMarking::Start</code> が呼ばれる。</li>
+<li><code>StartMarkingMajor</code> が走り、Marking Barrier が ON、Black Allocation 開始、Concurrent Marking ジョブが投入される。</li>
+<li>ミューテータの実行と並行して Concurrent Marker がワークリストを処理。</li>
+<li>Allocation Limit を完全に超えるかタスク timeout で <code>MarkCompactCollector::CollectGarbage</code> が呼ばれ Atomic Pause に入る。</li>
+<li><code>MarkLiveObjects</code> で残ったマーキングを完了、Conservative Stack Scan、Embedder Tracing、Ephemeron Fixpoint or Linear を実施。</li>
+<li><code>ClearNonLiveReferences</code> で WeakRef, WeakCell, ephemeron 等の弱参照を整理。</li>
+<li><code>Sweep()</code> で Sweep Job を起動 (実際の Sweeping は Concurrent)。</li>
+<li><code>Evacuate()</code> で並列に Evacuation Candidate を移動。</li>
+<li><code>Finish()</code> で Statistics 集計、<code>HeapLimits::UpdateAllocationLimits</code> で新しい Limit を計算。</li>
+<li>Concurrent Sweeping は Atomic Pause 後もバックグラウンドで継続。</li>
+</ol>
+
+<p>時系列の中でメインスレッドが完全に止まっている時間 (Atomic Pause) は全体のごく一部に圧縮されており、これが Orinoco の最大の達成です。実測では数 MB のヒープに対して数ミリ秒、数 GB のヒープでも数十ミリ秒程度に収まることが多いです。</p>
+
+<h3 id="ch10-10">10.10 性能特性のまとめ</h3>
+
+<p>各 GC のトレードオフを以下のように整理します。</p>
+
+<p>Scavenger は Pause Time が短く (典型 1〜10ms)、Throughput は高く、Footprint はやや悪い (Semi-Space で 2 倍領域必要)。最適用途は短命オブジェクトが大量のワークロードです。</p>
+
+<p>Minor Mark-Sweep は Pause Time がやや長く (10〜30ms)、Throughput は中程度、Footprint は良好 (Free List ベース)。最適用途は中程度の生存率を持つワークロードや、メモリ制約が厳しい環境です。</p>
+
+<p>Major Mark-Compact は Pause Time は数十 ms ですが Concurrent Marking と Incremental Marking のおかげで Atomic Pause は劇的に短く (典型 10〜50ms)。Throughput は高く、Footprint は Compaction によって最良です。</p>
+
+<p>Lazy/Concurrent Sweeping は Atomic Pause を最小化する代償としてバックグラウンド CPU を消費しますが、ユーザー体感に対するペイオフは大きいです。</p>
+

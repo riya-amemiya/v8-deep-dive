@@ -1,0 +1,91 @@
+<h2 id="chapter12">第12章 AllocationSite と AllocationMemento</h2>
+
+<p>V8 は同じソースコード位置で何度もアロケーションされる配列について、過去の Kind 履歴を保持して「次に同じ位置から作られる配列もきっと同じ Kind になるだろう」という学習をします。これを担うのが AllocationSite (<code class="file-ref">src/objects/allocation-site.h</code>) と AllocationMemento です。</p>
+
+<h3 id="sec12-1">12.1 AllocationSite構造</h3>
+
+<p><code class="file-ref">src/objects/allocation-site.h:23</code> で</p>
+
+<pre><code class="language-cpp">V8_OBJECT class AllocationSite : public HeapObject {
+ public:
+  enum PretenureDecision {
+    kUndecided = 0,
+    kDontTenure = 1,
+    kMaybeTenure = 2,
+    kTenure = 3,
+  };
+  ...
+  using ElementsKindBits = base::BitField&lt;ElementsKind, 0, 6&gt;;
+  using SpeculationDisabledBit = base::BitField&lt;bool, 6, 1&gt;;
+  ...
+ private:
+  TaggedMember&lt;UnionOf&lt;Smi, JSObject&gt;&gt; transition_info_or_boilerplate_;
+  TaggedMember&lt;UnionOf&lt;Smi, AllocationSite&gt;&gt; nested_site_;
+  TaggedMember&lt;DependentCode&gt; dependent_code_;
+  std::atomic&lt;int32_t&gt; pretenure_data_;
+  int32_t pretenure_create_count_;
+};
+</code></pre>
+
+<p><code>transition_info_or_boilerplate_</code> の下位 7bit が ElementsKind (6bit) と speculation 関連の 1bit で、配列リテラルの場合は ElementsKind が、JSArray コンストラクタ呼び出しの場合は boilerplate が記録されます。</p>
+
+<h3 id="sec12-2">12.2 ElementsKindの学習</h3>
+
+<p>たとえばあるソース行で <code>[1, 2, 3]</code> というリテラルがあると、最初は PACKED_SMI で確保されます。後でその同じ行から作られた配列に <code>2.5</code> が代入されて PACKED_DOUBLE へ遷移すると、AllocationSite が「ここから生まれる配列の transition_info を PACKED_DOUBLE に格上げ」します。</p>
+
+<p><code class="file-ref">src/objects/allocation-site-inl.h:232</code> の <code>DigestTransitionFeedback</code></p>
+
+<pre><code class="language-cpp">template &lt;AllocationSiteUpdateMode update_or_check&gt;
+bool AllocationSite::DigestTransitionFeedback(Isolate* isolate,
+                                              DirectHandle&lt;AllocationSite&gt; site,
+                                              ElementsKind to_kind) {
+  ...
+  ElementsKind kind = site-&gt;GetElementsKind();
+  if (IsHoleyElementsKind(kind)) {
+    to_kind = GetHoleyElementsKind(to_kind);
+  }
+  if (IsMoreGeneralElementsKindTransition(kind, to_kind)) {
+    ...
+    site-&gt;SetElementsKind(to_kind);
+    DependentCode::DeoptimizeDependencyGroups(
+        isolate, *site,
+        DependentCode::kAllocationSiteTransitionChangedGroup);
+    result = true;
+  }
+  return result;
+}
+</code></pre>
+
+<p>ElementsKind が一般化されると、それに依存していた最適化コードはすべて deopt キューに入れられます。そして以降同じソース行で生成される配列は、最初から新しい Kind で確保されます。これにより、初回の transition コスト (FixedArray から FixedDoubleArray への書き換え) を以降のアロケーションでは省略できます。</p>
+
+<h3 id="sec12-3">12.3 AllocationMemento</h3>
+
+<p>AllocationMemento は割り当てられた JSArray の直後に「親 AllocationSite」へのリンクを記録する小さな足跡です。</p>
+
+<pre><code class="language-cpp">V8_OBJECT class AllocationMemento : public Struct {
+ public:
+  inline Tagged&lt;AllocationSite&gt; GetAllocationSite() const;
+  ...
+ private:
+  TaggedMember&lt;AllocationSite&gt; allocation_site_;
+} V8_OBJECT_END;
+</code></pre>
+
+<p>JSArray のレイアウトはこうなります。</p>
+
+<pre><code class="language-text">JSArray (kHeaderSize bytes)             AllocationMemento (aligned)
++----+----+----+----+----+----+----+----+----+----+----+----+----+----+
+|        map        |  properties_or_   |   elements   | length |map_memento|allocation_site_   |
++----+----+----+----+----+----+----+----+----+----+----+----+----+----+
+                                                          ↑
+                                          AllocationSite (Old space) を参照
+</code></pre>
+
+<p>Young space で JSArray が作られると、隣に Memento が同居します。GC は古い JSArray の場合だけ Memento を読み出し、AllocationSite に「mementoFoundCount」を加算します。AllocationMemento の存在自体がメモリオーバーヘッドなので、配列が一定の使われ方を示した時点で memento は消去され、以降は site だけで管理されます。</p>
+
+<h3 id="sec12-4">12.4 Pretenuring</h3>
+
+<p><code>pretenure_data_</code> (<code class="file-ref">allocation-site.h:64</code>) は MementoFoundCountBits (26bit) と PretenureDecisionBits (3bit) と DeoptDependentCodeBit (1bit) を含む int32 です。Young 世代でアロケーションされた配列が一定回数生存した (= Memento が GC で発見された) と判明すると、<code>PretenureDecision</code> を <code>kTenure</code> に更新し、以降は最初から Old 世代に配置するようになります。これにより短命前提のアロケーションコストを最初から払わずに済む配列の判定が学習できます。</p>
+
+<hr>
+

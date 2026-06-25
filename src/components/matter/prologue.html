@@ -1,0 +1,312 @@
+<!-- BEGIN PROLOGUE -->
+<section class="prologue" id="prologue">
+<h1>はじめに ― V8 を深く理解するための学習ロードマップ</h1>
+
+<p>V8 は Google が開発する JavaScript エンジンで、Chrome、Node.js、Deno、Edge、Cloudflare Workers など、現代の Web プラットフォームのほぼすべてを支えています。 仕様 (ECMAScript) を読むだけでは「なぜ JavaScript はあの挙動なのか」「なぜこのコードはあのコードより速いのか」が分かりません。 答えは V8 のソースコードにあります。</p>
+
+<p>本アーティファクトは、その V8 を 5 つの章で段階的に紐解いていく解説書です。 一気通読すると合計 16,000 行ほどの分量がありますが、上から順に読むことで「全体俯瞰 → メモリ基盤 → 実装ツール → 具体オブジェクト → 実装事例」という自然な学習曲線を描けるよう構成しています。</p>
+
+<h2>本書の構成と読み方</h2>
+
+<div class="roadmap-box">
+<h3>推奨される読み進めかた</h3>
+
+<div class="roadmap-step">
+<div class="step-num">1</div>
+<div class="step-content">
+<h4>第 1 章 V8 内部の全体像</h4>
+<p>Tagged Pointer・HeapObject・Map・JSObject・ElementsKind・String・Pointer Compression・Heap Spaces・Orinoco GC・実行パイプライン・Inline Cache まで、V8 のあらゆる主要概念の全体像を一気に押さえます。 ここで頭の地図ができれば、以降の各章はすべて「この章のあの部分の深堀り」として位置付けられます。</p>
+</div>
+</div>
+
+<div class="roadmap-step">
+<div class="step-num">2</div>
+<div class="step-content">
+<h4>第 2 章 メモリ管理と GC</h4>
+<p>V8 の最深部であるメモリ管理機構を 5 部構成で徹底解説します。 タグ付きポインタのビットレイアウト、Page と MemoryChunk、Scavenger と Mark-Compact、Write Barrier と Remembered Set、Sandbox による隔離、すべてが本章にまとまっています。 第 1 章で得た地図に立体感を与える章です。</p>
+</div>
+</div>
+
+<div class="roadmap-step">
+<div class="step-num">3</div>
+<div class="step-content">
+<h4>第 3 章 Torque ビルトイン言語</h4>
+<p>V8 のビルトイン (組み込み関数) はどう書かれているかを解説します。 Torque という V8 専用 DSL の言語仕様、コンパイラの内部構造、CodeStubAssembler と TurboShaft への統合、そして実際のビルトイン実装例まで踏み込みます。 第 4 章以降のソースを読み解く土台になります。</p>
+</div>
+</div>
+
+<div class="roadmap-step">
+<div class="step-num">4</div>
+<div class="step-content">
+<h4>第 4 章 JS 配列の実装</h4>
+<p>具体的なオブジェクト実装の代表として JavaScript 配列を取り上げます。 ElementsKind の遷移ラティス、PACKED と HOLEY の区別、Smi と Unboxed Double と Hole の表現、容量の拡大と縮小、Copy-on-Write、Dictionary Mode への降格まで、配列ひとつでこれだけのトピックが詰まっています。</p>
+</div>
+</div>
+
+<div class="roadmap-step">
+<div class="step-num">5</div>
+<div class="step-content">
+<h4>第 5 章 flat 実装ケーススタディ</h4>
+<p>Array.prototype.flat の実装を 1 行 1 行追いかけ、これまで学んだ概念が実際にどう組み合わさるかを観察します。 二パス設計、FastJSArrayWitness、Bailout 設計、Protector による楽観的最適化、そして 4 倍超の高速化を達成した実装変遷までを扱います。 V8 内部の知識を統合する仕上げの章です。</p>
+</div>
+</div>
+</div>
+
+<h2>V8 全体アーキテクチャ俯瞰図</h2>
+
+<p>これから読み進める内容を 1 枚の図にまとめると以下のようになります。 V8 は大きく分けて、JS ソースを実行可能な形に変換するパイプライン、値を格納するヒープ、ビルトインの実装、そしてセキュリティ境界を提供する Sandbox から構成されます。</p>
+
+<div class="svg-container">
+<svg viewBox="0 0 900 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="V8 全体アーキテクチャ">
+<defs>
+<linearGradient id="gradHero" x1="0%" y1="0%" x2="100%" y2="0%">
+<stop offset="0%" stop-color="#1e2227"/>
+<stop offset="100%" stop-color="#3b1f0d"/>
+</linearGradient>
+<linearGradient id="gradAccent" x1="0%" y1="0%" x2="0%" y2="100%">
+<stop offset="0%" stop-color="#f59e0b"/>
+<stop offset="100%" stop-color="#c2410c"/>
+</linearGradient>
+<linearGradient id="gradCool" x1="0%" y1="0%" x2="0%" y2="100%">
+<stop offset="0%" stop-color="#60a5fa"/>
+<stop offset="100%" stop-color="#1d4ed8"/>
+</linearGradient>
+<linearGradient id="gradGreen" x1="0%" y1="0%" x2="0%" y2="100%">
+<stop offset="0%" stop-color="#86efac"/>
+<stop offset="100%" stop-color="#15803d"/>
+</linearGradient>
+<linearGradient id="gradPurple" x1="0%" y1="0%" x2="0%" y2="100%">
+<stop offset="0%" stop-color="#c4b5fd"/>
+<stop offset="100%" stop-color="#6d28d9"/>
+</linearGradient>
+<marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+<path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
+</marker>
+</defs>
+
+<rect x="20" y="20" width="860" height="500" rx="14" fill="#fbfaf7" stroke="#b8af96" stroke-width="2"/>
+<text x="450" y="48" text-anchor="middle" font-family="sans-serif" font-size="16" font-weight="800" fill="#0d1117">V8 Isolate</text>
+
+<rect x="50" y="80" width="380" height="180" rx="10" fill="white" stroke="url(#gradAccent)" stroke-width="2"/>
+<text x="240" y="105" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="800" fill="#c2410c">JavaScript 実行パイプライン</text>
+<rect x="70" y="120" width="105" height="44" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
+<text x="122" y="138" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">Parser</text>
+<text x="122" y="152" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#78350f">JS → AST</text>
+<rect x="180" y="120" width="105" height="44" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
+<text x="232" y="138" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">Ignition</text>
+<text x="232" y="152" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#78350f">Bytecode 実行</text>
+<rect x="290" y="120" width="125" height="44" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
+<text x="352" y="138" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">Sparkplug</text>
+<text x="352" y="152" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#78350f">ノンオプティマイズJIT</text>
+<rect x="70" y="180" width="160" height="44" rx="6" fill="#fed7aa" stroke="#c2410c"/>
+<text x="150" y="198" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">Maglev</text>
+<text x="150" y="212" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#78350f">中間最適化コンパイラ</text>
+<rect x="240" y="180" width="175" height="44" rx="6" fill="#fed7aa" stroke="#c2410c"/>
+<text x="327" y="198" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">TurboFan / TurboShaft</text>
+<text x="327" y="212" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#78350f">最適化コンパイラ</text>
+<text x="240" y="244" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5c6471" font-style="italic">Inline Cache がフィードバックを蓄積</text>
+
+<rect x="450" y="80" width="410" height="180" rx="10" fill="white" stroke="url(#gradCool)" stroke-width="2"/>
+<text x="655" y="105" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="800" fill="#1d4ed8">Heap (Garbage Collected)</text>
+<rect x="470" y="120" width="180" height="38" rx="6" fill="#dbeafe" stroke="#3b82f6"/>
+<text x="560" y="138" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">NewSpace (Young)</text>
+<text x="560" y="151" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#1e3a8a">Scavenger / Minor MS</text>
+<rect x="660" y="120" width="180" height="38" rx="6" fill="#dbeafe" stroke="#3b82f6"/>
+<text x="750" y="138" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">OldSpace</text>
+<text x="750" y="151" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#1e3a8a">Mark-Compact</text>
+<rect x="470" y="170" width="120" height="38" rx="6" fill="#dbeafe" stroke="#3b82f6"/>
+<text x="530" y="188" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">CodeSpace</text>
+<text x="530" y="201" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#1e3a8a">実行可能</text>
+<rect x="600" y="170" width="120" height="38" rx="6" fill="#dbeafe" stroke="#3b82f6"/>
+<text x="660" y="188" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">LargeObject</text>
+<text x="660" y="201" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#1e3a8a">128KB 超</text>
+<rect x="730" y="170" width="110" height="38" rx="6" fill="#dbeafe" stroke="#3b82f6"/>
+<text x="785" y="188" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">RO_SPACE</text>
+<text x="785" y="201" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#1e3a8a">不変・共有</text>
+<text x="655" y="232" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5c6471" font-style="italic">Tagged Pointer + Pointer Compression (4GB Cage)</text>
+<text x="655" y="248" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5c6471" font-style="italic">Map (Hidden Class) でオブジェクトの形状を記述</text>
+
+<rect x="50" y="280" width="380" height="100" rx="10" fill="white" stroke="url(#gradGreen)" stroke-width="2"/>
+<text x="240" y="305" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="800" fill="#15803d">Builtins (V8 標準ライブラリ実装)</text>
+<rect x="70" y="320" width="170" height="40" rx="6" fill="#dcfce7" stroke="#22c55e"/>
+<text x="155" y="338" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">Torque (.tq DSL)</text>
+<text x="155" y="351" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#14532d">型安全な高水準記述</text>
+<rect x="250" y="320" width="165" height="40" rx="6" fill="#dcfce7" stroke="#22c55e"/>
+<text x="332" y="338" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">CodeStubAssembler</text>
+<text x="332" y="351" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#14532d">中間 IR / TurboShaft</text>
+
+<rect x="450" y="280" width="410" height="100" rx="10" fill="white" stroke="url(#gradPurple)" stroke-width="2"/>
+<text x="655" y="305" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="800" fill="#6d28d9">Sandbox (セキュリティ境界 ≒ 1TB)</text>
+<rect x="470" y="320" width="120" height="40" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+<text x="530" y="338" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">PtrCompr Cage</text>
+<text x="530" y="351" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#5b21b6">4GB ヒープ</text>
+<rect x="600" y="320" width="120" height="40" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+<text x="660" y="338" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">External Ptr Table</text>
+<text x="660" y="351" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#5b21b6">512MB</text>
+<rect x="730" y="320" width="110" height="40" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+<text x="785" y="338" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700">Code Ptr Table</text>
+<text x="785" y="351" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#5b21b6">128MB</text>
+
+<rect x="50" y="400" width="810" height="100" rx="10" fill="white" stroke="#b8af96" stroke-width="2" stroke-dasharray="6,4"/>
+<text x="455" y="425" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="800" fill="#0d1117">本書の章マッピング</text>
+<rect x="65" y="440" width="155" height="46" rx="6" fill="#fffbeb" stroke="#c2410c"/>
+<text x="142" y="458" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#7c2d12">Ch.1 V8 内部</text>
+<text x="142" y="472" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#7c2d12">全体俯瞰・基本概念</text>
+<rect x="230" y="440" width="155" height="46" rx="6" fill="#fffbeb" stroke="#c2410c"/>
+<text x="307" y="458" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#7c2d12">Ch.2 メモリ管理</text>
+<text x="307" y="472" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#7c2d12">Heap・GC・Sandbox 深堀り</text>
+<rect x="395" y="440" width="155" height="46" rx="6" fill="#fffbeb" stroke="#c2410c"/>
+<text x="472" y="458" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#7c2d12">Ch.3 Torque</text>
+<text x="472" y="472" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#7c2d12">ビルトイン実装言語</text>
+<rect x="560" y="440" width="135" height="46" rx="6" fill="#fffbeb" stroke="#c2410c"/>
+<text x="627" y="458" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#7c2d12">Ch.4 配列実装</text>
+<text x="627" y="472" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#7c2d12">具体例として配列</text>
+<rect x="705" y="440" width="140" height="46" rx="6" fill="#fffbeb" stroke="#c2410c"/>
+<text x="775" y="458" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#7c2d12">Ch.5 flat 実装</text>
+<text x="775" y="472" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#7c2d12">統合ケーススタディ</text>
+</svg>
+<div class="svg-caption">図 P-1 / V8 の主要構成要素と本書の章マッピング</div>
+</div>
+
+<h2>各章の依存関係</h2>
+
+<p>各章は前章を前提として書かれていますが、興味のあるトピックから飛び込んでも読めるよう、章間ブリッジで前提知識を確認しています。 厳密な依存関係は次のとおりです。</p>
+
+<div class="svg-container">
+<svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="章の依存関係">
+<defs>
+<marker id="arrow2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+<path d="M0,0 L0,6 L9,3 z" fill="#c2410c"/>
+</marker>
+</defs>
+
+<g>
+<rect x="20" y="100" width="140" height="80" rx="10" fill="#fffbeb" stroke="#c2410c" stroke-width="2"/>
+<text x="90" y="125" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="800" fill="#7c2d12">第 1 章</text>
+<text x="90" y="145" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700">V8 内部の全体像</text>
+<text x="90" y="163" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5c6471">基本概念の地図</text>
+</g>
+
+<g>
+<rect x="190" y="20" width="140" height="80" rx="10" fill="#fffbeb" stroke="#c2410c" stroke-width="2"/>
+<text x="260" y="45" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="800" fill="#7c2d12">第 2 章</text>
+<text x="260" y="65" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700">メモリ管理と GC</text>
+<text x="260" y="83" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5c6471">Heap の深堀り</text>
+</g>
+
+<g>
+<rect x="190" y="180" width="140" height="80" rx="10" fill="#fffbeb" stroke="#c2410c" stroke-width="2"/>
+<text x="260" y="205" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="800" fill="#7c2d12">第 3 章</text>
+<text x="260" y="225" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700">Torque 言語</text>
+<text x="260" y="243" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5c6471">ビルトインの記述</text>
+</g>
+
+<g>
+<rect x="380" y="100" width="140" height="80" rx="10" fill="#fffbeb" stroke="#c2410c" stroke-width="2"/>
+<text x="450" y="125" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="800" fill="#7c2d12">第 4 章</text>
+<text x="450" y="145" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700">配列の実装</text>
+<text x="450" y="163" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5c6471">具体オブジェクトの例</text>
+</g>
+
+<g>
+<rect x="570" y="100" width="160" height="80" rx="10" fill="#fed7aa" stroke="#c2410c" stroke-width="3"/>
+<text x="650" y="125" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="800" fill="#7c2d12">第 5 章</text>
+<text x="650" y="145" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700">flat ケーススタディ</text>
+<text x="650" y="163" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5c6471">全体の統合</text>
+</g>
+
+<path d="M160,130 Q175,75 190,60" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow2)"/>
+<path d="M160,150 Q175,205 190,220" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow2)"/>
+<path d="M330,60 Q355,90 380,130" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow2)"/>
+<path d="M330,220 Q355,190 380,150" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow2)"/>
+<path d="M520,140 L570,140" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow2)"/>
+</svg>
+<div class="svg-caption">図 P-2 / 章の依存関係 (矢印は推奨される読み進めかた)</div>
+</div>
+
+<h2>読者別の読みかた</h2>
+
+<div class="learning-card">
+<div class="card">
+<h3>初学者の方</h3>
+<p>第 1 章を時間をかけてゆっくり読み、用語と全体構造を頭に入れます。 第 2 章以降は太字部分と図を中心に拾い読みでも十分です。 第 5 章 (flat 実装) は最後に読むことで「自分はこれを理解できるようになった」という実感が得られます。</p>
+</div>
+<div class="card">
+<h3>JS は分かるが V8 は初めての方</h3>
+<p>第 1 章で全体地図を作り、興味のある章 (GC が好きなら第 2 章、配列ベンチマークに興味があれば第 4 章) に進みます。 各章は独立して読めるよう書かれているので、寄り道しても迷子になりません。</p>
+</div>
+<div class="card">
+<h3>V8 経験者の方</h3>
+<p>第 5 章 (flat ケーススタディ) から逆向きに読むのもよい選択です。 個別の最適化テクニックがどう積み重なって 4 倍の高速化を生んでいるかを観察し、必要に応じて第 4 章・第 3 章へ遡ることで未知の領域を効率よく補強できます。</p>
+</div>
+</div>
+
+<h2 id="glossary">先に知っておきたい主要用語</h2>
+
+<p>本書を読み進める前に押さえておくと理解が楽になる用語を集めました。 詳しい説明は各章の本文を参照してください。</p>
+
+<dl class="glossary-grid">
+<div class="glossary-item">
+<dt>Tagged Pointer</dt>
+<dd>V8 のすべての値を表現する 32 / 64 bit のワード。 最下位ビットで Smi か HeapObject かを区別します。</dd>
+</div>
+<div class="glossary-item">
+<dt>Smi (Small Integer)</dt>
+<dd>ヒープを介さず即値として保持される小整数。 31 / 32 bit の整数値を Tagged Pointer に直接埋め込みます。</dd>
+</div>
+<div class="glossary-item">
+<dt>HeapObject</dt>
+<dd>V8 ヒープ上に確保されるオブジェクト。 先頭ワードに必ず Map ポインタを持ち、レイアウトと型情報を提供します。</dd>
+</div>
+<div class="glossary-item">
+<dt>Map (Hidden Class)</dt>
+<dd>HeapObject の形状情報を記述するメタオブジェクト。 instance_type、ElementsKind、prototype、descriptors を保持します。</dd>
+</div>
+<div class="glossary-item">
+<dt>ElementsKind</dt>
+<dd>JS 配列の要素ストレージ表現を示す内部状態。 PACKED_SMI / HOLEY_DOUBLE など 13 種類以上があり、Map の bit_field2 に格納されます。</dd>
+</div>
+<div class="glossary-item">
+<dt>Pointer Compression</dt>
+<dd>64 bit 環境で Tagged Pointer を 32 bit に圧縮して格納する仕組み。 4GB のケージ内オフセットだけを保持します。</dd>
+</div>
+<div class="glossary-item">
+<dt>Torque</dt>
+<dd>V8 のビルトインを記述するための型付き DSL。 ECMAScript 仕様の擬似コードに近い見た目で書け、CSA / TSA を経て機械語になります。</dd>
+</div>
+<div class="glossary-item">
+<dt>CodeStubAssembler (CSA)</dt>
+<dd>プラットフォーム抽象化された型付きアセンブラ。 Torque のコンパイル先で、最終的に TurboFan が機械語を生成します。</dd>
+</div>
+<div class="glossary-item">
+<dt>Scavenger</dt>
+<dd>Young Generation (NewSpace) を対象とする Minor GC。 Cheney 風の Copying GC で、生きたオブジェクトを To-Space に複製します。</dd>
+</div>
+<div class="glossary-item">
+<dt>Mark-Compact</dt>
+<dd>Old Generation を対象とする Major GC。 マーク・スイープ・コンパクションの三段階でメモリ断片化を解消します。</dd>
+</div>
+<div class="glossary-item">
+<dt>Inline Cache (IC)</dt>
+<dd>プロパティアクセスの動的最適化機構。 Map ごとに専用パスを生成し、Polymorphic / Megamorphic 状態に遷移して JIT 最適化のヒントを蓄積します。</dd>
+</div>
+<div class="glossary-item">
+<dt>Protector</dt>
+<dd>「ある仮定がまだ破られていない」ことを保証する Isolate-wide のセル。 NoElementsProtector や ArraySpeciesProtector など多数があり、楽観的最適化の前提となります。</dd>
+</div>
+<div class="glossary-item">
+<dt>Sandbox</dt>
+<dd>V8 ヒープ内の任意書き換えが外部に影響しないよう設計された約 1TB の仮想領域。 External Pointer Table 経由で外部リソースを参照します。</dd>
+</div>
+<div class="glossary-item">
+<dt>Bailout</dt>
+<dd>最適化パスから汎用パスへの脱出。 ホットパスの前提条件が崩れたときに発火し、安全な実装に切り替えます。</dd>
+</div>
+</dl>
+
+<div class="callout tip">
+<span class="callout-label">読み方のヒント</span>
+<p>各章の冒頭に「この章で学ぶこと」と「前章までで学んだこと」のカードがあります。 章が長く感じたときはこのカードに戻って現在地を確認してください。 また、行数で位置を測りたい場合はサイドバーの目次から目的の章にジャンプできます。</p>
+</div>
+
+</section>

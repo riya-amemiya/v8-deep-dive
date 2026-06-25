@@ -1,0 +1,38 @@
+<h2 id="section-13">13. Torque から機械語までの変換パイプライン</h2>
+
+<p>Torque は V8 が自分の builtin を書くために作った DSL です。ソースは <code class="file-ref">src/torque/</code> 配下の C++ 実装で、ビルド時の独立した実行可能ファイルとして走り、<code>.tq</code> ファイルを CSA を呼び出す C++ コード (<code>*-tq-csa.cc</code>、<code>*-tq-csa.h</code>) に変換します。詳細は <code class="file-ref">docs/torque/architecture.md</code> と <code class="file-ref">docs/torque/user-manual.md</code> にまとめられています。</p>
+
+<p><code>array-flat.tq</code> 冒頭の <code>transitioning macro ArrayIsArray_Inline(implicit context: Context)(element: JSAny): Boolean</code> を例にとり、修飾子の意味を順に追います。</p>
+
+<p><code>macro</code> はインラインで展開される関数で、Torque コンパイラがその本体をその場で呼び出し側の CSA コードに展開します。ABI 境界をまたぐ呼び出しは発生しません。これに対して <code>builtin</code> は単一のコードオブジェクトに集約されたコードで、呼ぶ側はそのアドレスに通常のコールを発行します。array-flat.tq の行 515 の <code>transitioning builtin FlattenIntoArrayWithoutMapFn</code> がこの形で、<code>PerformStackCheck()</code> を呼んでから自身を間接的に再帰させるため、独立した stack frame を持つ必要があるからこそ macro でなく builtin になっています。</p>
+
+<p><code>javascript builtin</code> は JavaScript の呼び出し規約 (this、arguments、target、newTarget) で呼ばれることを示します。array-flat.tq 行 534 の <code>transitioning javascript builtin ArrayPrototypeFlat(js-implicit context: NativeContext, receiver: JSAny)(...arguments): JSAny</code> がこれで、<code>js-implicit</code> は native context、レシーバ、ターゲット、newTarget の四つだけ受けられる特殊な暗黙パラメタです。V8 では builtin closure に native context が直接埋め込まれているため、<code>NativeContext</code> を直接受け取ることで <code>LoadNativeContext(context)</code> を一回省けるという最適化があります。</p>
+
+<p><code>implicit context: Context</code> の方は Scala 風の暗黙パラメタで、呼び出し側のスコープに同名の値が存在すれば自動的に渡されます。CSA への lowering 時には explicit 引数と一緒に並べられて単一の C++ 関数引数列になります。</p>
+
+<p><code>transitioning</code> 修飾子は transient type の安全性の根幹で、「この macro / builtin は任意の JS を実行しうる」ことをコンパイラに伝えます。<code>Call(callback)</code> のようなものや、<code>runtime::*</code> のような C++ への呼び出し、ユーザ定義 getter を踏むあらゆる操作が transitioning です。Torque の型システムは、transient type の値 (<code>FastJSArray</code>、<code>FastJSArrayForRead</code> 等) を transitioning な呼び出しをまたいで使うことをコンパイル時に禁じます。array-flat の全てのトップレベルが <code>transitioning</code> 修飾されているのは、mapper コールバックや getter、proxy trap、<code>runtime::ArrayIsArray</code> の呼び出しなど、JS の挙動が連鎖する可能性のある全箇所をコンパイラに認識させるためです。</p>
+
+<p><code>labels Bailout</code> の意味は、ローカルな非局所ジャンプで、generated CSA コードでは <code>CodeStubAssemblerLabel*</code> がそのマクロのシグネチャに引数として追加されます。<code>CalculateFlattenedLengthFast(...) labels Bailout</code> は、呼び出し側で <code>otherwise Bailout</code> を書くことで bailout 先のブロックを必須にし、macro 内では <code>goto Bailout</code> でその外側のブロックへ脱出します。これによって fast path 用の macro が「失敗時は呼び出し側がスローパスに落とす」という制御フローを ABI コストなしで表現できます。</p>
+
+<p>CSA は <code class="file-ref">src/codegen/code-stub-assembler.h</code> 行 70-72 で <code>class V8_EXPORT_PRIVATE CodeStubAssembler : public compiler::CodeAssembler, public TorqueGeneratedExportedMacrosAssembler</code> と宣言されている、<code>compiler::CodeAssembler</code> の派生クラスです。<code>CodeAssembler</code> (<code class="file-ref">src/compiler/code-assembler.h</code> 行 407) は TurboFan のグラフを直接組み立てるための C++ ファサードで、内部に <code>std::unique_ptr&lt;RawMachineAssembler&gt; raw_assembler_;</code> と <code>JSGraph* jsgraph_;</code> を持ちます。</p>
+
+<p>Torque から CSA への変換は次の流れです。<code class="file-ref">src/torque/torque-compiler.cc</code> の <code>CompileCurrentAst</code> がエントリで、<code>PredeclarationVisitor::Predeclare</code> → <code>PredeclarationVisitor::ResolvePredeclarations</code> → <code>DeclarationVisitor::Visit</code> → <code>TypeOracle::FinalizeAggregateTypes</code> → <code>ImplementationVisitor::VisitAllDeclarables</code> という順で進みます。<code>ImplementationVisitor</code> は AST を CFG (<code class="file-ref">src/torque/cfg.h</code>) に変換し、CFG のブロックには <code>instructions.h</code> で定義された低水準命令 (Branch、Goto、CallCsaMacro、CallBuiltin、Return、LoadReference、StoreReference、UnsafeCast 等) が入ります。</p>
+
+<p>CSA バックエンドの実体は <code class="file-ref">src/torque/csa-generator.cc</code> で、<code>CSAGenerator::EmitGraph</code> がブロックを走査し、各命令を <code>EmitInstruction</code> のオーバーロード群が C++ ソースとして書き出します。生成物は <code class="file-ref">out/&lt;config&gt;/gen/torque-generated/src/builtins/array-flat-tq-csa.cc</code> のようなファイルで、<code>mksnapshot</code> のビルドに含まれます。<code>mksnapshot</code> 実行時に、これらの C++ 関数が <code>CodeAssemblerState</code> を介して <code>RawMachineAssembler</code> にノードを追加します。これが sea-of-nodes 表現の本体で、<code>JSGraph</code> に集約されます。</p>
+
+<p>sea-of-nodes は compiler 配下の TurboFan 表現で、ノードが演算、エッジが control flow と data flow を別々に持ち、同じノードが両方の依存を表現します。Torque の Branch は最終的に IfTrue / IfFalse ノードに、Goto は Merge / Phi の組み合わせに、Call は Call ノードと effect / control エッジに、Load は Load と memory effect エッジに、という風に降りていきます。</p>
+
+<p>そのあと <code>CodeAssemblerCompilationJob</code> (<code class="file-ref">src/compiler/code-assembler-compilation-job.h</code>) が backend (instruction selection、register allocation、code emission) を回します。instruction selection は <code class="file-ref">src/compiler/backend/&lt;arch&gt;/instruction-selector-&lt;arch&gt;.cc</code> でアーキテクチャ依存、register allocation は <code class="file-ref">src/compiler/backend/register-allocator.cc</code>、そして code emission が最終的にバイト列を吐き、<code>mksnapshot</code> がそれをスナップショットに焼きます。起動時にはこれが復元され、<code>Builtins::code(Builtin::kArrayPrototypeFlat)</code> で取り出せる Code オブジェクトとして JS から呼べる状態になります。</p>
+
+<h3 id="section-13-1">13.1 TrySmiAdd / TrySmiSub</h3>
+
+<p>宣言は <code class="file-ref">src/builtins/math.tq</code> の <code>extern macro TrySmiAdd(Smi, Smi): Smi labels Overflow;</code> で、実体は <code class="file-ref">src/codegen/code-stub-assembler.cc</code> 行 1043-1078 です。Smi の機械表現は二通りあって、64 ビットポインタプラットフォームの <code>SmiValuesAre32Bits()</code> の場合、Smi は上位 32 ビットに整数値を持つ tagged word で、下位 32 ビットは tag (0) です。この場合は IntPtrAdd 一発で済み、overflow を見るために CPU の overflow フラグを利用する <code>IntPtrAddWithOverflow</code> を呼びます。32 ビットプラットフォーム (および 64 ビットでも Smi が 31 ビットのケース) では、タグビット 1 つを除いた 31 ビットに値が入っているので、一旦 int32 にトランケートしてから <code>Int32AddWithOverflow</code> で計算し、結果を tagged 形式に戻します。</p>
+
+<p><code>Int32AddWithOverflow</code> は machine operator で、x64 で言えば <code>addl</code> 命令の OF フラグを Boolean として project する仕組みです。オーバーフロー時には <code>GotoIf(overflow, if_overflow)</code> で渡された <code>Label*</code> (Torque から見れば bailout label) に飛びます。array-flat.tq では <code>math::TrySmiAdd(targetLength, subLen) otherwise goto Bailout</code> と書かれており、Smi 範囲を超えそうな加算は即 bailout してスローパスに任せます。これにより fast path は Smi 演算 + branch だけで構成され、boxing も Number への upgrade も発生しません。</p>
+
+<h3 id="section-13-2">13.2 ArraySpeciesCreate</h3>
+
+<p>宣言は <code class="file-ref">src/builtins/base.tq</code> 行 861 の <code>extern macro ArraySpeciesCreate(Context, JSAny, Number): JSReceiver;</code>、実装は <code class="file-ref">src/codegen/code-stub-assembler.cc</code> 行 18469 です。runtime call <code>Runtime_ArraySpeciesConstructor</code> (<code class="file-ref">src/runtime/runtime-array.cc</code> 行 218) は <code>Object::ArraySpeciesConstructor</code> (<code class="file-ref">src/objects/objects.cc</code> 行 1805) を呼びます。この関数の論理は ECMA-262 22.1.3.2 <code>ArraySpeciesCreate</code> の要約で、まず <code>o</code> が JSArray で initial array prototype を持ち、<code>Protectors::IsArraySpeciesLookupChainIntact(isolate)</code> が真なら、すぐに <code>isolate-&gt;array_function()</code> (デフォルトの Array コンストラクタ) を返します。これが fast path です。そうでなければ <code>o.constructor</code> を取り、さらにその <code>[Symbol.species]</code> を取り、もし non-undefined な constructor が得られればそれを使います。</p>
+
+<hr/>
+

@@ -1,0 +1,32 @@
+<h2 id="chapter17">第17章 参考リファレンス</h2>
+
+<p>本書で引用した主要ソースファイルの一覧です。</p>
+
+<p>ElementsKind と型システムは <code class="file-ref">src/objects/elements-kind.h</code>、<code class="file-ref">src/objects/elements-kind.cc</code>、<code class="file-ref">src/objects/elements.h</code>、<code class="file-ref">src/objects/elements.cc</code> に集中しています。</p>
+
+<p>JSArray のレイアウトは <code class="file-ref">src/objects/js-array.h</code>、<code class="file-ref">src/objects/js-array.tq</code>、<code class="file-ref">src/objects/js-array-inl.h</code>、FixedArray 系は <code class="file-ref">src/objects/fixed-array.h</code>、<code class="file-ref">src/objects/fixed-array.cc</code>、<code class="file-ref">src/objects/fixed-array-inl.h</code> です。</p>
+
+<p>Smi と Tagged Pointer は <code class="file-ref">src/objects/smi.h</code>、<code class="file-ref">src/objects/tagged.h</code>、<code class="file-ref">src/objects/tagged-field.h</code>、<code class="file-ref">include/v8-internal.h</code>、Pointer Compression は <code class="file-ref">src/common/ptr-compr.h</code>、<code class="file-ref">src/common/ptr-compr-inl.h</code> にあります。</p>
+
+<p>Dictionary mode は <code class="file-ref">src/objects/dictionary.h</code>、<code class="file-ref">src/objects/dictionary-inl.h</code>、<code class="file-ref">src/objects/hash-table.h</code>、Hole の表現は <code class="file-ref">src/common/globals.h</code>、<code class="file-ref">src/objects/fixed-array-inl.h</code>、<code class="file-ref">src/objects/hole.h</code>、<code class="file-ref">src/objects/object-list-macros.h</code>、<code class="file-ref">src/objects/object-predicates-inl.h</code> です。</p>
+
+<p>配列ビルトインの Torque 実装は <code class="file-ref">src/builtins/array-*.tq</code> 群、C++ ビルトインは <code class="file-ref">src/builtins/builtins-array.cc</code>、CSA 実装 (indexOf 等) は <code class="file-ref">src/builtins/builtins-array-gen.cc</code>、ElementsAccessor は <code class="file-ref">src/objects/elements.cc</code> にあります。sort は <code class="file-ref">third_party/v8/builtins/array-sort.tq</code> にあります。Torque DSL の解説は <code class="file-ref">docs/torque/architecture.md</code>、<code class="file-ref">docs/torque/user-manual.md</code> です。</p>
+
+<p>Protector は <code class="file-ref">src/execution/protectors.h</code>、<code class="file-ref">src/execution/protectors.cc</code>、<code class="file-ref">src/execution/protectors-inl.h</code> です。</p>
+
+<p>TurboFan による配列の最適化は <code class="file-ref">src/compiler/js-call-reducer.cc</code> の <code>IteratingArrayBuiltinReducerAssembler</code> クラス、<code class="file-ref">src/compiler/js-native-context-specialization.cc</code> の <code>BuildElementAccess</code>、<code class="file-ref">src/compiler/load-elimination.cc</code>、<code class="file-ref">src/compiler/simplified-lowering.cc</code>、<code class="file-ref">src/compiler/js-create-lowering.cc</code> にあります。Maglev は <code class="file-ref">src/maglev/maglev-graph-builder.cc</code> の <code>TryReduceArrayPrototype*</code> シリーズと <code class="file-ref">src/maglev/maglev-ir.h</code> の配列ノード定義です。</p>
+
+<p>Inline Cache は <code class="file-ref">src/ic/ic.h</code>、<code class="file-ref">src/ic/ic.cc</code>、<code class="file-ref">src/ic/handler-configuration-inl.h</code>、<code class="file-ref">src/ic/accessor-assembler.cc</code>、Feedback Vector は <code class="file-ref">src/objects/feedback-vector.h</code>、<code class="file-ref">src/objects/feedback-vector.cc</code> です。</p>
+
+<p>ティアアップは <code class="file-ref">src/execution/tiering-manager.cc</code>、<code class="file-ref">src/flags/flag-definitions.h</code>、Deoptimize は <code class="file-ref">src/deoptimizer/deoptimizer.cc</code>、<code class="file-ref">src/deoptimizer/deoptimize-reason.h</code> にあります。</p>
+
+<p>Write Barrier は <code class="file-ref">src/heap/heap-write-barrier.h</code>、<code class="file-ref">src/heap/heap-write-barrier-inl.h</code>、<code class="file-ref">src/heap/WRITE_BARRIER.md</code>、<code class="file-ref">src/objects/objects.h</code>、AllocationSite は <code class="file-ref">src/objects/allocation-site.h</code>、<code class="file-ref">src/objects/allocation-site-inl.h</code>、Factory による配列確保は <code class="file-ref">src/heap/factory.cc</code> の <code>NewJSArray</code> 系メソッド、<code class="file-ref">src/heap/heap-allocator.cc</code> です。</p>
+
+<p>TypedArray は <code class="file-ref">src/objects/js-array-buffer.h</code>、<code class="file-ref">src/objects/js-typed-array.h</code> で、ArrayBuffer の BackingStore は <code class="file-ref">src/objects/backing-store.h</code> に置かれます。</p>
+
+<p>SIMD 最適化は <code class="file-ref">src/objects/simd.cc</code>、<code class="file-ref">src/builtins/builtins-array-gen.cc</code> の indexOf / includes 実装にあります。</p>
+
+<hr>
+
+<p>本書はV8の配列処理について、ソースコードを根拠とした網羅的な技術ガイドを目指して書かれています。V8は活発に開発されているため、特定の実装詳細は将来のバージョンで変化する可能性があります。最新の正確な動作を確認するには、本書に挙げたファイルを直接読むことをおすすめします。</p>
+

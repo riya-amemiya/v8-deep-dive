@@ -1,0 +1,146 @@
+<h2 id="chapter-2">第 2 章 全体アーキテクチャとコンパイルパイプライン</h2>
+
+<p>Torque は「コンパイラ単体で機械語まで吐く」言語ではありません。実態は CSA / CC / TSA という三系統のコード生成バックエンドを持つ C++ コード生成器であり、生成された C++ コードを通常の C++ ツールチェインでビルドした上で、<code>mksnapshot</code> 実行時にビルトインを実機械語へ落とし、それを snapshot blob として最終 V8 バイナリに埋め込みます。</p>
+
+<h3 id="sec-2-1">2.1 コンパイルパイプライン全体図</h3>
+
+<p><code class="file-ref">docs/torque/architecture.md:16-41</code> および <code class="file-ref">src/torque/torque-compiler.cc:53-127</code> (<code>CompileCurrentAst</code>) を一次資料として、パイプラインは以下の段階を踏みます。</p>
+
+<pre><code class="language-text">.tq files
+  │
+  ▼
+[1] Lexing / Earley Parsing       (torque-parser.cc, earley-parser.cc)
+  │ ─▶ AST (ast.h)
+  ▼
+[2] Predeclaration               (declaration-visitor.h, type-oracle.cc)
+  │
+  ▼
+[3] Predeclaration Resolution    (Type 名前→Type オブジェクト)
+  │
+  ▼
+[4] Declaration Visit            (declaration-visitor.cc)
+  │ ─▶ Macro/Builtin/Runtime/Intrinsic/Const objects
+  ▼
+[5] TypeOracle::FinalizeAggregateTypes
+  │ ─▶ クラスフィールドの offset 確定
+  ▼
+[6] ImplementationVisitor::VisitAllDeclarables
+  │   - 各 macro/builtin の body を VisitStatement / VisitExpression
+  │   - CfgAssembler を通じて Instruction 列を CFG に Emit
+  ▼
+[7] Code Generation
+  ├─ CSAGenerator    (csa-generator.cc)  ─▶ *-tq-csa.cc, *-tq-csa.h
+  ├─ CCGenerator     (cc-generator.cc)   ─▶ *-tq.cc, *-tq.inc, *-tq-inl.inc
+  └─ TSAGenerator    (tsa-generator.cc)  ─▶ *-tq-tsa.cc, *-tq-tsa.h (実験的)
+  │
+  ▼
+[8] グローバル一括生成
+   ├─ instance-types.h
+   ├─ bit-fields.h
+   ├─ builtin-definitions.h
+   ├─ interface-descriptors.inc
+   ├─ class-forward-declarations.h
+   ├─ class-debug-readers.{h,cc}
+   ├─ csa-types.h
+   ├─ enum-verifiers.cc
+   ├─ exported-macros-assembler.{h,cc}
+   └─ debug-macros.{h,cc}
+</code></pre>
+
+<h3 id="sec-2-2">2.2 CompileCurrentAst の実コード</h3>
+
+<p><code class="file-ref">src/torque/torque-compiler.cc:53-127</code> の <code>CompileCurrentAst</code> 関数全体が、Torque パイプラインの縮約図そのものです。</p>
+
+<pre><code class="language-cpp">void CompileCurrentAst(TorqueCompilerOptions options) {
+  std::string output_directory = options.output_directory;
+  GlobalContext::Scope global_context(std::move(CurrentAst::Get()));
+  // ... フラグ反映 ...
+  TypeOracle::Scope type_oracle;
+  CurrentScope::Scope current_namespace(GlobalContext::GetDefaultNamespace());
+
+  // Two-step process of predeclaration + resolution allows to resolve type
+  // declarations independent of the order they are given.
+  PredeclarationVisitor::Predeclare(GlobalContext::ast());
+  PredeclarationVisitor::ResolvePredeclarations();
+
+  // Process other declarations.
+  DeclarationVisitor::Visit(GlobalContext::ast());
+
+  // A class types' fields are resolved here, which allows two class fields to
+  // mutually refer to each others.
+  TypeOracle::FinalizeAggregateTypes();
+
+  if (options.output_tsa) {
+#ifdef V8_ENABLE_EXPERIMENTAL_TQ_TO_TSA
+    GenerateTSA(*GlobalContext::ast(), output_directory);
+    return;
+#else
+    UNREACHABLE();
+#endif
+  }
+
+  ImplementationVisitor implementation_visitor;
+  implementation_visitor.SetDryRun(output_directory.empty());
+
+  implementation_visitor.GenerateInstanceTypes(output_directory);
+  implementation_visitor.BeginGeneratedFiles();
+  implementation_visitor.BeginDebugMacrosFile();
+  implementation_visitor.VisitAllDeclarables();
+  ReportAllUnusedMacros();
+
+  implementation_visitor.GenerateBuiltinDefinitionsAndInterfaceDescriptors(...);
+  implementation_visitor.GenerateBitFields(output_directory);
+  implementation_visitor.GenerateClassDefinitions(output_directory);
+  implementation_visitor.GenerateClassDebugReaders(output_directory);
+  implementation_visitor.GenerateEnumVerifiers(output_directory);
+  implementation_visitor.GenerateExportedMacrosAssembler(output_directory);
+  implementation_visitor.GenerateCSATypes(output_directory);
+
+  implementation_visitor.EndGeneratedFiles();
+  implementation_visitor.EndDebugMacrosFile();
+  implementation_visitor.GenerateImplementation(output_directory);
+  // ...
+}
+</code></pre>
+
+<p>二段階の宣言処理 (Predeclare → Resolve → Declare) は、V8 のオブジェクトモデルにありがちな相互参照 (<code>Map</code> が <code>JSObject</code> を指し、<code>JSObject</code> が <code>Map</code> を持つ、など) を解決するために必須です。Predeclare で名前空間とシンボル骨格だけを作っておき、後段で中身を解決する設計になっています。</p>
+
+<h3 id="sec-2-3">2.3 出力されるファイル群</h3>
+
+<p><code>BUILD.gn</code> の <code>run_torque</code> テンプレート (<code class="file-ref">BUILD.gn:2407-2489</code>) が定義する出力ファイルセットは次の通りです。各 <code>.tq</code> ファイル <code>path/to/foo.tq</code> ごとに、</p>
+
+<pre><code class="language-text">$destination_folder/path/to/foo-tq-csa.cc    # CSA 経由のビルトイン本体
+$destination_folder/path/to/foo-tq-csa.h     # CSA 経由のビルトイン宣言
+$destination_folder/path/to/foo-tq-inl.inc   # クラス inline 定義 (foo-inl.h から include)
+$destination_folder/path/to/foo-tq.cc        # クラスの heap verifier / printer 等
+$destination_folder/path/to/foo-tq.inc       # クラス定義のヘッダ部 (foo.h から include)
+</code></pre>
+
+<p>の 5 つが生成され、加えて全プロジェクト共通の以下が一括生成されます。</p>
+
+<pre><code class="language-text">$destination_folder/bit-fields.h                   # bitfield struct のマクロ
+$destination_folder/builtin-definitions.h          # BUILTIN_LIST_FROM_TORQUE
+$destination_folder/class-debug-readers.{cc,h}     # postmortem debugging 用
+$destination_folder/class-forward-declarations.h   # extern class の前方宣言
+$destination_folder/csa-types.h                    # TorqueStruct&lt;Name&gt; の C++ 定義
+$destination_folder/debug-macros.{cc,h}            # gdb から呼べるマクロ版
+$destination_folder/enum-verifiers.cc              # enum 値の Torque-C++ 整合性
+$destination_folder/exported-macros-assembler.{cc,h}  # @export マクロの C++ クラス
+$destination_folder/instance-types.h               # InstanceType の自動割当
+$destination_folder/interface-descriptors.inc      # builtin のインターフェース記述子
+</code></pre>
+
+<p>TSA を有効化した場合は <code>*-tq-tsa.cc</code> と <code>*-tq-tsa.h</code> が追加で出力されます。</p>
+
+<h3 id="sec-2-4">2.4 トラブルシュート観点</h3>
+
+<p><code class="file-ref">docs/torque/user-manual.md:79-84</code> に整理されているように、Torque ビルドは三層で失敗しえます。</p>
+
+<p>第一層は Torque コンパイラ自身が <code>.tq</code> を読めない・型エラーを吐く層で、これは Torque エラーとしてレポートされます。</p>
+
+<p>第二層は <code>mksnapshot</code> を作る C++ コンパイルで、<code>extern</code> 宣言と実体の不一致がよく出ます。Torque の <code>extern macro Foo(A, B): C;</code> という宣言は、生成された C++ から <code>CodeStubAssembler::Foo(A, B)</code> を呼ぼうとしますが、その実体が <code>code-stub-assembler.h</code> 等に存在しなかったり、シグネチャが微妙にずれていたりすると C++ 側で見つからずに失敗します。</p>
+
+<p>第三層は <code>mksnapshot</code> 自身の実行で、TurboFan が Torque 由来 CSA グラフをコンパイルしようとして <code>static_assert</code> の検証に落ちる、あるいは <code>Array.prototype.splice</code> のような snapshot 初期化中に呼ばれるビルトインがバグでクラッシュする、というケースです。<code>mksnapshot --gdb-jit-full</code> を付けると Torque 生成 builtin に名前が付き、<code>gdb</code> のバックトレースが解読可能になります。</p>
+
+<hr>
+

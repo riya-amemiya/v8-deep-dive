@@ -1,0 +1,37 @@
+<h2 id="chapter1">第1章 V8における配列とは何か</h2>
+
+<p>JavaScript の <code>Array</code> は ECMAScript 仕様の上では <code>Object</code> の特殊化であって、整数添字のプロパティアクセス、<code>length</code> プロパティ、Array.prototype のメソッドを持つ単なるオブジェクトに過ぎません。仕様上は要素を必ず実際の名前付きプロパティとして保持すれば良く、すべての操作はプロパティの抽象操作 (<code>[[Get]]</code>, <code>[[Set]]</code>, <code>[[DefineOwnProperty]]</code>) を通して定義されています。</p>
+
+<p>ところが現実のエンジンが愚直に仕様通りに実装すると、<code>arr[0]</code> ひとつ取るたびにハッシュテーブルを辿ることになり、C 言語の配列に比べて二桁以上遅くなります。そこで V8 は仕様の観測可能な振る舞いを変えない範囲で、JSArray のバッキングストアを多段階のスペシャライズドな表現に切り替えるという戦略をとります。この「いま配列がどのような表現を採用しているか」を表す内部状態が ElementsKind です。</p>
+
+<p>JSArray のクラス宣言は <code class="file-ref">src/objects/js-array.h:25</code> から始まります。</p>
+
+<pre><code class="language-cpp">// The JSArray describes JavaScript Arrays
+//  Such an array can be in one of two modes:
+//    - fast, backing storage is a FixedArray and length &lt;= elements.length();
+//       Please note: push and pop can be used to grow and shrink the array.
+//    - slow, backing storage is a HashTable with numbers as keys.
+V8_OBJECT class JSArray : public JSObject {
+ ...
+  TaggedMember&lt;Number&gt; length_;
+} V8_OBJECT_END;
+</code></pre>
+
+<p>JSArray が保持するインスタンスフィールドは <code>length_</code> ただ一つだけです。要素そのものは JSObject から継承した <code>elements</code> スロットに格納される FixedArray 系オブジェクトが保持しています。つまり JSArray 自身は「length + ヘッダ」だけの薄い構造体で、配列の本体は別オブジェクトに分離されているわけです。この分離があるおかげで、バッキングストアを差し替えるだけで配列の表現を切り替えられます。</p>
+
+<p>V8 における HeapObject の継承関係は次のとおりです。<code class="file-ref">src/objects/heap-object.h:62</code> の HeapObject が最上位で、すべての GC 管理オブジェクトの基底です。</p>
+
+<pre><code class="language-cpp">V8_OBJECT class HeapObject {
+ ...
+  TaggedMember&lt;Map&gt; map_;
+} V8_OBJECT_END;
+
+static_assert(offsetof(HeapObject, map_) == Internals::kHeapObjectMapOffset);
+</code></pre>
+
+<p><code>map_</code> は他のすべてのフィールドより先頭 (オフセット 0) に置かれ、これは唯一固定された不変条件です。Map (ヒドゥンクラス) へのポインタを保持し、ここからインスタンスサイズ、ElementsKind、プロトタイプチェーンなどがすべてロードされます。</p>
+
+<p>JSReceiver (<code class="file-ref">js-objects.h:45</code>) は <code>properties_or_hash_</code> を、JSObject (<code class="file-ref">js-objects.h:380</code>) は <code>elements_</code> を追加し、JSArray は <code>length_</code> を最後に追加します。</p>
+
+<hr>
+

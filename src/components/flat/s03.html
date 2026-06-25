@@ -1,0 +1,54 @@
+<h2 id="section-3">3. JSArray と FixedArray、FixedDoubleArray の物理表現</h2>
+
+<p>V8 における配列は二つのオブジェクトの組み合わせで表現されます。<code>JSArray</code> 本体が論理的な配列の外殻で、<code>FixedArray</code> または <code>FixedDoubleArray</code> がバッキングストアです。</p>
+
+<h3 id="section-3-1">3.1 JSArray のヘッダ構造</h3>
+
+<p><code class="file-ref">src/objects/js-array.h</code> 25 行以降と <code class="file-ref">src/objects/js-array.tq</code> 63-68 行に定義があります。継承チェインは <code>HeapObject → JSReceiver → JSObject → JSArray</code> で、各レイヤがフィールドを 1 つずつ足していくため JSArray のヘッダは以下の 4 スロットで構成されます。</p>
+
+<p>オフセット 0 が <code>map</code> フィールドで <code>TaggedMember&lt;Map&gt;</code> の 1 スロット (<code>kTaggedSize</code>)、続いて <code>properties_or_hash</code> が <code>JSReceiver</code> 由来の 1 スロット、<code>elements</code> が <code>JSObject</code> 由来の 1 スロット、そして <code>length</code> が <code>JSArray</code> 固有の 1 スロットで、合計 4 スロット = <code>4 * kTaggedSize</code> がヘッダサイズです。ポインタ圧縮を有効にした 64 ビットビルドでは 4 * 4 = 16 バイト、非圧縮では 4 * 8 = 32 バイトになります。</p>
+
+<p><code>elements</code> フィールドは <code>TaggedMember&lt;FixedArrayBase&gt;</code> 型で、<code>FixedArray</code>、<code>FixedDoubleArray</code>、<code>NumberDictionary</code>、または <code>SloppyArgumentsElements</code> などのバッキングストアへの tagged ポインタを保持します。<code>length</code> フィールドは <code>TaggedMember&lt;Number&gt;</code> 型で、通常は Smi (32 ビット unsigned 配列インデックス範囲) ですが、<code>Array(n)</code> で <code>n</code> が Smi 最大値を超える場合は HeapNumber になり得ます。<code>kMaxArrayLength = kMaxUInt32</code> (<code class="file-ref">src/objects/js-array.h</code> 143 行) は ECMA の 2^32-1 上限と一致します。</p>
+
+<p><code>map</code> フィールドは「この JSArray がどの ElementsKind の配列か」「prototype は何か」「named property のレイアウトはどうか」を表現する重要な mediator です。6 種類の fast ElementsKind それぞれに対応する初期 Map は <code>NativeContext</code> のスロット <code>JS_ARRAY_PACKED_SMI_ELEMENTS_MAP_INDEX</code> から <code>JS_ARRAY_HOLEY_DOUBLE_ELEMENTS_MAP_INDEX</code> まで (<code class="file-ref">src/objects/contexts.h</code> 行 242-251) に格納されており、これら 6 個は隣接配置されているため <code>ArrayMapIndex(kind) = int{kind} + FIRST_JS_ARRAY_MAP_SLOT</code> (行 694-697) で計算できます。これが Torque マクロ <code>LoadJSArrayElementsMap(targetKind, LoadNativeContext(context))</code> (array-flat.tq 行 22) が成立する根拠です。</p>
+
+<h3 id="section-3-2">3.2 FixedArray の物理レイアウト</h3>
+
+<p><code class="file-ref">src/objects/fixed-array.h</code> 行 250 から <code>class FixedArray : public TaggedArrayBase&lt;FixedArray, Object&gt;</code> が定義されています。レイアウトはまず <code>HeapObject</code> 部分の map word が <code>sizeof(HeapObject) = kTaggedSize</code> バイトあり、その直後に行 340 の <code>uint32_t length_;</code> が来ます。ポインタ圧縮なしの 64 ビットビルドでは map word が 8 バイト、length が 4 バイトなので 4 バイトの <code>optional_padding_</code> (行 342) が入り 8 バイト境界を保ちます。圧縮ありの場合は map word 4 バイト + length 4 バイトでちょうど 8 バイトです。<code>kFixedArrayHeaderSize = 2 * kApiTaggedSize</code> (<code class="file-ref">include/v8-internal.h</code> 行 1041) というのがヘッダの公式サイズです。</p>
+
+<p>ヘッダの直後に <code>FLEXIBLE_ARRAY_MEMBER(TaggedMember&lt;Object&gt;, objects);</code> (行 344) が続き、各スロットは <code>kTaggedSize</code> バイトです (圧縮時 4 バイト、非圧縮時 8 バイト)。<code>objects[i]</code> のアドレッシングは <code>OFFSET_OF_DATA_START(FixedArray) + i * kTaggedSize</code> で計算され、Torque の <code>.objects[]</code> 演算子は <code>LoadFixedArrayElement</code> / <code>StoreFixedArrayElement</code> の extern macro に展開されます。</p>
+
+<p>write barrier のデフォルトモード (行 96) は要素型が Smi 専用なら <code>SKIP_WRITE_BARRIER</code>、それ以外は <code>UPDATE_WRITE_BARRIER</code> です。PACKED_SMI_ELEMENTS 配列の場合バッキングストアは FixedArray ですが値が全部 Smi なのでスロット書き込み時の世代間ポインタ追跡を省略でき、これがホットパスのコスト差を生みます。</p>
+
+<p><code>kMaxFixedArrayCapacity</code> (行 33) は通常モードで 128 * 1024 * 1024 個、<code>V8_LOWER_LIMITS_MODE_BOOL</code> モードで 16 * 1024 * 1024 個です。</p>
+
+<p>COW (copy-on-write) は専用の ElementsKind ではなく、ElementsKind は PACKED_SMI_ELEMENTS や PACKED_ELEMENTS のまま、バッキング FixedArray の Map が <code>fixed_array_map</code> ではなく <code>fixed_cow_array_map</code> ROOT (<code class="file-ref">src/roots/roots.h</code> 行 68) になっていることで識別されます。書き込み前に <code>EnsureWriteableFastElements</code> を呼んで <code>elements.map != kCOWMap</code> を確認し、COW なら <code>ExtractFixedArray</code> で実コピーしてから書き込む仕組みです。</p>
+
+<h3 id="section-3-3">3.3 FixedDoubleArray の物理レイアウト</h3>
+
+<p><code class="file-ref">src/objects/fixed-array.h</code> 行 577 以降に <code>class FixedDoubleArray : public PrimitiveArrayBase&lt;FixedDoubleArray, double&gt;</code> が定義されています。これが <code>PACKED_DOUBLE_ELEMENTS</code> および <code>HOLEY_DOUBLE_ELEMENTS</code> のバッキングストアです。ヘッダレイアウトは FixedArray と同じ (map word + length + 必要に応じて 4 バイト padding) で、データ領域は <code>FLEXIBLE_ARRAY_MEMBER(ElementMemberT, values);</code> (行 629) で <code>ElementMemberT = UnalignedDoubleMember</code> です。</p>
+
+<p>各 double スロットは正確に 8 バイトで、alignment は <code>alignof(Tagged_t)</code> (圧縮時 4 バイト、非圧縮時 8 バイト) です。タグなしの生 IEEE 754 double がインラインで詰められるため、Smi の場合のような unbox / box が一切要りません。FixedDoubleArray は <code>BodyDescriptor</code> 上で GC スキャン対象外 (tagged ポインタを含まない) なのでガベージコレクションのコストも下がります。</p>
+
+<p>hole の表現は専用のシグナル NaN ビットパターン <code>kHoleNanInt64</code> (<code class="file-ref">src/common/globals.h</code> 行 2144) で、<code>(uint64_t(0xFFF7FFFF) &lt;&lt; 32) | 0xFFF7FFFF = 0xFFF7FFFF_FFF7FFFF</code> です。<code>set_the_hole(index)</code> は <code>values()[index].set_value_as_bits(kHoleNanInt64)</code> を呼び、<code>is_the_hole(index)</code> は <code>get_representation(index) == kHoleNanInt64</code> と完全一致比較を行います。普通の NaN を入れようとしたときは <code>set(index, value)</code> で <code>std::isnan(value)</code> を見て <code>std::numeric_limits&lt;double&gt;::quiet_NaN()</code> に置換し、hole と被らないように正規化します。<code>V8_ENABLE_UNDEFINED_DOUBLE</code> を有効にしたビルドではさらに <code>kUndefinedNanInt64 = 0xFFF6FFFF_FFF6FFFF</code> (行 2147) という別シグナル NaN を <code>undefined</code> の表現として使い分けます。</p>
+
+<h3 id="section-3-4">3.4 Smi とポインタ圧縮</h3>
+
+<p><code class="file-ref">src/objects/smi.h</code> 行 25 以降の <code>class Smi : public AllStatic</code> が定義する Smi は heap に存在しない即値で、tagged ポインタの最下位ビット (<code>kSmiTag = 0</code>, <code class="file-ref">include/v8-internal.h</code> 行 72) が 0 のものが Smi、1 のものが HeapObject として区別されます。<code>kSmiTagSize = 1</code> (行 73) です。</p>
+
+<p>範囲は 32 ビットと 64 ビットでレイアウトが異なります。32 ビットプラットフォームと 64 ビットでポインタ圧縮ありの場合 (<code>SmiTagging&lt;4&gt;</code>, 行 84) は <code>kSmiShiftSize = 0</code>, <code>kSmiValueSize = 31</code> で、ビットパターンは <code>[31-bit signed int][tag bit = 0]</code>、範囲は <code>[-2^30, 2^30 - 1]</code> です。64 ビットで圧縮なしの場合 (<code>SmiTagging&lt;8&gt;</code>, 行 135) は <code>kSmiShiftSize = 31</code>, <code>kSmiValueSize = 32</code> で、ビットパターンは <code>[32-bit signed int][31 bits zero padding][tag bit = 0]</code>、範囲は 32 ビット signed 整数全域です。</p>
+
+<p><code>FromIntptr</code> の実装は <code>int smi_shift_bits = kSmiTagSize + kSmiShiftSize; return Tagged&lt;Smi&gt;((value &lt;&lt; smi_shift_bits) | kSmiTag);</code> で、圧縮ありなら 1 ビット左シフトしてタグ 0 を付ける形になります。</p>
+
+<p>ポインタ圧縮時には <code>Tagged_t = uint32_t</code> (<code class="file-ref">src/common/globals.h</code> 行 569) で <code>kTaggedSize = 4</code> (行 564) となり、tagged 値 1 個が 4 バイトに圧縮されます。上位 32 ビットは ptr-compr cage の base アドレスから復元します。Smi タグも圧縮された 32 ビット内で完結します。</p>
+
+<p>Smi タグが bit 0 = 0 である理由は、Smi 同士の加減算をタグを剥がさずに行える点と、ヒープオブジェクトのアドレスが偶数アライン (<code>kHeapObjectTagMask</code> で 2 ビット確保しているため実際は 4 バイトアライン以上) になることでタグ用に下位ビットを使えるからです。これにより <code>FixedArray::objects[]</code> のスロットで Smi と HeapObject の区別が write barrier 判定に組み込まれます。</p>
+
+<h3 id="section-3-5">3.5 HeapNumber</h3>
+
+<p><code class="file-ref">src/objects/heap-number.h</code> 行 28 以降の <code>class HeapNumber : public PrimitiveHeapObject</code> が、Smi に収まらない数値 (32 ビット範囲を超える整数、すべての小数、NaN、Infinity 等) を保持するヒープ割り当て型です。レイアウトは <code>HeapObject</code> ヘッダの直後に <code>UnalignedDoubleMember value_</code> を 1 つ持ち、ポインタ圧縮ありの 64 ビットビルドでは <code>value_</code> フィールドは 4 バイト境界に置かれた double として <code>base::ReadUnalignedValue&lt;double&gt;</code> で読み出されます。</p>
+
+<p>GC 観点では HeapNumber は payload に tagged ポインタを含まないため、<code>BodyDescriptor</code> は map word だけスキャンすればよいリーフ型として扱われます。HeapNumber は不変ではなく <code>set_value</code> / <code>set_value_as_bits</code> でビットパターンを書き換えられますが、配列要素として使う場合、Smi が HeapNumber にプロモートされるたびに新しい HeapNumber を allocate するため、純粋な数値計算で <code>PACKED_DOUBLE_ELEMENTS</code> (FixedDoubleArray) を使う方がはるかに効率的です。これは flat の高速パスが <code>seenDouble</code> を検出して <code>PACKED_DOUBLE_ELEMENTS</code> をターゲットにする大きな動機になっています。</p>
+
+<hr/>
+

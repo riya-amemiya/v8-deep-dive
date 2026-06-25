@@ -1,0 +1,123 @@
+<h2 id="chapter10">第10章 インラインキャッシュ (IC) ― 型情報のフィードバック</h2>
+
+<p>V8 は配列要素アクセスのような頻発する操作について、過去にどんな型・Kind が現れたかを Inline Cache (IC) に記録します。これがあるからこそ Maglev / TurboFan が「この配列はだいたい PACKED_SMI だろう」と前提を置いた最適化コードを生成できるのです。</p>
+
+<h3 id="sec10-1">10.1 IC State</h3>
+
+<p><code class="file-ref">src/common/globals.h:1860</code> の InlineCacheState 列挙</p>
+
+<pre><code class="language-cpp">enum class InlineCacheState {
+  NO_FEEDBACK,
+  UNINITIALIZED,         // 一度も実行されていない
+  MONOMORPHIC,           // 1種類のreceiverのみ
+  RECOMPUTE_HANDLER,     // prototype変更などでチェック失敗
+  POLYMORPHIC,           // 複数の receiver
+  MEGADOM,               // 多数の DOM receiver
+  HOMOMORPHIC,           // 多数の receiver だが同じ handler
+  MEGAMORPHIC,           // 多数の receiver
+  GENERIC,               // 汎用 handler
+};
+</code></pre>
+
+<p>MEGAMORPHIC への遷移は最大ポリモーフィック数を超えた場合で、デフォルト <code>max_valid_polymorphic_map_count = 4</code> (<code class="file-ref">src/flags/flag-definitions.h:3238</code>) です。4種類のreceiver mapを超えると MEGAMORPHIC化します。</p>
+
+<p>Monomorphic な IC は対応する1つの Map に特化したコードがインストールされ、最も高速です。Polymorphic は分岐で対応する Map を選びますが、それでも汎用の dispatch より速いです。Megamorphic はキャッシュを諦めて汎用パスに常時落ちる状態で、最適化コンパイラからもインライン化されにくくなります。</p>
+
+<h3 id="sec10-2">10.2 KeyedLoadIC のハンドラ選択</h3>
+
+<p><code class="file-ref">src/ic/ic.cc:1450</code> の <code>KeyedLoadIC::UpdateLoadElement</code> がIC の更新ロジックの中心です。注目すべきは MONOMORPHIC 維持の条件 (1466 行目)</p>
+
+<pre><code class="language-cpp">if (state() == MONOMORPHIC) {
+  if ((IsJSObject(*receiver) &amp;&amp;
+       IsMoreGeneralElementsKindTransition(
+           target_maps_and_handlers[0].first-&gt;elements_kind(),
+           Cast&lt;JSObject&gt;(receiver)-&gt;GetElementsKind())) ||
+      IsWasmObject(*receiver)) {
+    DirectHandle&lt;Object&gt; handler =
+        LoadElementHandler(receiver_map, new_load_mode);
+    return ConfigureVectorState(DirectHandle&lt;Name&gt;(), receiver_map, handler);
+  }
+}
+</code></pre>
+
+<p>ElementsKind が単純に格上げ (PACKED_SMI → HOLEY_SMI 等) されただけならば、MONOMORPHIC のまま新しい Kind に切り替えます。これにより「数値配列に少しだけ穴ができた」程度では IC が megamorphic に堕ちず、性能が維持されます。</p>
+
+<h3 id="sec10-3">10.3 LoadHandler の構造</h3>
+
+<p><code class="file-ref">src/ic/handler-configuration-inl.h:133</code> の <code>LoadHandler::LoadElement</code> は、複数のビットフィールドを1個の Smi に詰め込んで返します。</p>
+
+<pre><code class="language-cpp">Handle&lt;Smi&gt; LoadHandler::LoadElement(Isolate* isolate,
+                                     ElementsKind elements_kind,
+                                     bool is_js_array,
+                                     KeyedAccessLoadMode load_mode) {
+  int config = KindBits::encode(Kind::kElement) |
+               AllowOutOfBoundsBits::encode(LoadModeHandlesOOB(load_mode)) |
+               ElementsKindBits::encode(elements_kind) |
+               AllowHandlingHole::encode(LoadModeHandlesHoles(load_mode)) |
+               IsJsArrayBits::encode(is_js_array);
+  return handle(Smi::FromInt(config), isolate);
+}
+</code></pre>
+
+<p>LoadHandler 自体は軽量で、ElementsKind・OOB対応・hole対応・JSArrayか否か等の情報を 1 つの Smi で表現します。これによりジャンプテーブルを使って各 Kind の専用コードに高速分岐できます。</p>
+
+<h3 id="sec10-4">10.4 KeyedAccessLoadMode</h3>
+
+<p>ロード時のモードは4種類 (<code class="file-ref">src/ic/ic.h</code> 周辺)</p>
+
+<pre><code class="language-text">kInBounds              境界内のみ
+kHandleOOB             境界外アクセス対応
+kHandleHoles           ホール対応
+kHandleOOBAndHoles     両方対応
+</code></pre>
+
+<p>過去のアクセスパターンに応じてモードが格上げされ、<code>kHandleOOB</code> や <code>kHandleHoles</code> に到達した場合、それ以降は IC ミスせずに対応するパスで処理します。</p>
+
+<h3 id="sec10-5">10.5 ElementsKind毎のロードコード</h3>
+
+<p><code class="file-ref">src/ic/accessor-assembler.cc:2656</code> の <code>EmitElementLoad</code> が実際の Kind 分岐です。</p>
+
+<pre><code class="language-cpp">int32_t kinds[] = {
+    PACKED_SMI_ELEMENTS, PACKED_ELEMENTS, ...
+    HOLEY_SMI_ELEMENTS, HOLEY_ELEMENTS, ...
+    PACKED_DOUBLE_ELEMENTS,
+    HOLEY_DOUBLE_ELEMENTS};
+
+Switch(elements_kind, unimplemented_elements_kind, kinds, labels, ...);
+
+BIND(&amp;if_fast_packed);
+{
+  exit_point-&gt;Return(
+      UnsafeLoadFixedArrayElement(CAST(elements), intptr_index));
+}
+BIND(&amp;if_fast_holey);
+{
+  TNode&lt;Object&gt; element =
+      UnsafeLoadFixedArrayElement(CAST(elements), intptr_index);
+  GotoIf(TaggedEqual(element, TheHoleConstant()), if_hole);
+  ...
+}
+</code></pre>
+
+<p>PACKED は穴チェック不要なので Load のみ、HOLEY は <code>TheHoleConstant</code> との比較が入ります。HOLEY_DOUBLE は NaN ビットパターンを検出する別途処理になります。</p>
+
+<h3 id="sec10-6">10.6 Feedback Vector</h3>
+
+<p><code class="file-ref">src/objects/feedback-vector.h:45</code> の FeedbackSlotKind に配列アクセス専用のスロット種別があります。</p>
+
+<pre><code class="language-cpp">enum class FeedbackSlotKind : uint8_t {
+  ...
+  kLoadKeyed,           // 配列読み込み
+  kHasKeyed,
+  ...
+  kSetKeyedStrict,      // 配列書き込み (strict mode)
+  kSetKeyedSloppy,      // 配列書き込み (sloppy mode)
+  kStoreInArrayLiteral,
+  ...
+};
+</code></pre>
+
+<p>各スロットには WeakMap (Monomorphic) や WeakFixedArray (Polymorphic) や sentinel (Megamorphic) が格納され、IC State を表現します。実用上、配列をひとつの関数で「Smi配列のときも Object 配列のときも String 配列のときも...」とごちゃまぜに扱うと IC が Megamorphic 化して性能が崩れます。型を絞って関数を分けるとか、特化したヘルパを書くといったテクニックは、この IC のキャッシュヒット率を維持するためのものです。</p>
+
+<hr>
+

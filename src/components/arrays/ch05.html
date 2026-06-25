@@ -1,0 +1,96 @@
+<h2 id="chapter5">第5章 容量の拡大と縮小 ― バッキングストア管理</h2>
+
+<h3 id="sec5-1">5.1 拡張アルゴリズム</h3>
+
+<p><code>push</code> などで配列に要素を追加し、バッキングストアの capacity を超えると新しい FixedArray を確保して中身をコピーします。新容量の計算式は <code class="file-ref">src/objects/js-objects.h:680</code> です。</p>
+
+<pre><code class="language-cpp">static constexpr uint32_t NewElementsCapacity(uint32_t old_capacity) {
+  // (old_capacity + 50%) + kMinAddedElementsCapacity
+  uint32_t new_capacity =
+      old_capacity + (old_capacity &gt;&gt; 1) + kMinAddedElementsCapacity;
+  ...
+}
+</code></pre>
+
+<p><code>kMinAddedElementsCapacity = 16</code> なので、空配列に push し始めると 0 → 17 → 41 → 77 → ... と毎回 1.5 倍 + 16 で増えていきます。Java の ArrayList の 1.5 倍、C++ std::vector の典型実装の 2 倍 (実装による) と比べて少しずつ異なる定数を持っています。</p>
+
+<p><code>+16</code> の効果として、小さな配列の最初の数 push が頻繁な再アロケーションを引き起こさないようになっています。同じ式が FixedArray::NewCapacityForIndex (<code class="file-ref">fixed-array-inl.h:376</code>) でも使われています。</p>
+
+<p>JSArray の初期予約容量は 4 です (<code class="file-ref">js-array.h:128</code>)。</p>
+
+<pre><code class="language-cpp">static const int kPreallocatedArrayElements = 4;
+</code></pre>
+
+<h3 id="sec5-2">5.2 Right Trim と Left Trim</h3>
+
+<p><code>pop</code> や <code>Array.prototype.splice</code> などで配列の末尾から要素を削除した場合、capacity に対して length が大きく下回るとメモリの無駄になります。そこで V8 は適切なタイミングで「末尾の不要分を解放」する Right Trim を行います。<code class="file-ref">elements.cc:906</code> の <code>DecreaseLength</code> がこの判断を担います。</p>
+
+<pre><code class="language-cpp">static void DecreaseLength(Isolate* isolate,
+                           Tagged&lt;BackingStore&gt; backing_store,
+                           uint32_t old_length, uint32_t length) {
+  const uint32_t capacity = backing_store-&gt;capacity().value();
+  if (V8_UNLIKELY(2 * length + JSObject::kMinAddedElementsCapacity &lt;=
+                  capacity)) {
+    // If more than half the elements won't be used, trim the array.
+    const uint32_t new_capacity =
+        length + 1 == old_length ? (capacity + length) / 2 : length;
+    isolate-&gt;heap()-&gt;RightTrimArray(backing_store, new_capacity, capacity);
+  }
+}
+</code></pre>
+
+<p>Right Trim は単に length を縮めるだけでなく、削除された部分を free space オブジェクトで埋め、GC がこれを認識できるようにします。これによりバッキングストアの実体は短くなり、メモリは即座に返却されます。</p>
+
+<p>shift にはもうひとつ別の最適化として Left Trim (<code class="file-ref">elements.cc:2741</code>) があります。</p>
+
+<pre><code class="language-cpp">if (V8_UNLIKELY(new_length &gt; JSArray::kMaxCopyElements &amp;&amp;
+                isolate-&gt;heap()-&gt;CanMoveObjectStart(dst_elms))) {
+  dst_elms = Cast&lt;BackingStore&gt;(
+      isolate-&gt;heap()-&gt;LeftTrimFixedArray(dst_elms, 1));
+  raw_receiver-&gt;set_elements(dst_elms);
+} else {
+  ...
+  dst_elms-&gt;MoveElements(isolate, 0, 1, new_length, mode);
+}
+</code></pre>
+
+<p><code>LeftTrimFixedArray</code> は「FixedArray ヘッダを 1 要素分だけ右に動かして要素を物理コピーしない」という GC 連携の最適化です。<code>kMaxCopyElements = 100</code> (<code class="file-ref">js-array.h:134</code>) を超える大きな配列の shift では、要素を1つずつずらすコストを払うより、ヘッダだけ動かすほうが断然安いという判断です。逆に小さい配列ではメモリ移動の方が安いので普通の <code>MoveElements</code> を使います。</p>
+
+<h3 id="sec5-3">5.3 push時の引数とElementsKind transition</h3>
+
+<p><code class="file-ref">src/builtins/builtins-array.cc:73</code> の <code>MatchArrayElementsKindToArguments</code> は、push の前に引数の型を走査して「これらの引数を入れた後、配列はどの Kind になるべきか」を予測し、必要なら事前に Transition を行います。</p>
+
+<pre><code class="language-cpp">void MatchArrayElementsKindToArguments(Isolate* isolate,
+                                       DirectHandle&lt;JSArray&gt; array,
+                                       BuiltinArguments* args,
+                                       int first_arg_index, int num_arguments) {
+  ...
+  ElementsKind target_kind = origin_kind;
+  {
+    DisallowGarbageCollection no_gc;
+    int last_arg_index = std::min(first_arg_index + num_arguments, args_length);
+    for (int i = first_arg_index; i &lt; last_arg_index; i++) {
+      Tagged&lt;Object&gt; arg = (*args)[i];
+      if (IsHeapObject(arg)) {
+        if (IsHeapNumber(arg)) {
+          target_kind = PACKED_DOUBLE_ELEMENTS;
+        } else {
+          target_kind = PACKED_ELEMENTS;
+          break;
+        }
+      }
+    }
+  }
+  if (target_kind != origin_kind) {
+    ...
+    JSObject::TransitionElementsKind(isolate, array, target_kind);
+  }
+}
+</code></pre>
+
+<p>これが行われると、push のループ内で要素ごとに「これは Smi か double か」を毎回判定するコストが消えます。あらかじめ Kind が決まっているので、後はループ内では型の合致するスロットに値を書き込むだけです。</p>
+
+<p>push の本体は <code class="file-ref">builtins-array.cc:505</code> の <code>BUILTIN(ArrayPush)</code> から始まりますが、ここで <code>IsJSArrayWithAddableFastElements</code> を通った後、ElementsAccessor (Kind ごとに特化されたヘルパクラス) の <code>Push</code> メソッドを呼ぶことで、Kind 専用のループに分岐します。</p>
+
+<hr>
+
