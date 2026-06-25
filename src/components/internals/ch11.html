@@ -412,48 +412,19 @@ void MachineLoweringPhase::Run(PipelineData* data, Zone* temp_zone) {
 
 <h3 id="ch11-8">11.8 まとめ</h3>
 
-<pre><code class="language-text">        ┌─────────────────────────────────────────────────┐
-        │     ソースコード (V8 parser → AST → Ignition)    │
-        └─────────────────────────────────────────────────┘
-                              │
-        Ignition バイトコード ▼ + FeedbackVector (IC, hint)
-        ┌─────────────────────────────────────────────────┐
-        │  Ignition インタプリタ (CSA で書かれた dispatch)  │
-        │  - threaded dispatch                            │
-        │  - register file + accumulator                  │
-        │  - FeedbackVector を更新しながら実行             │
-        └─────────────────────────────────────────────────┘
-                              │ 関数の hot 化検出
-                              ▼
-        ┌─────────────────────────────────────────────────┐
-        │  Sparkplug (Baseline JIT)                       │
-        │  - 中間表現なし、bytecode→機械語 直接生成        │
-        │  - Interpreter とスタックフレーム互換            │
-        │  - IC は Interpreter と同じ builtin を呼ぶ       │
-        └─────────────────────────────────────────────────┘
-                              │ さらに hot
-                              ▼ (FeedbackVector 充実)
-        ┌─────────────────────────────────────────────────┐
-        │  Maglev (Mid-tier Optimizer)                    │
-        │  - CFG ベース SSA IR                            │
-        │  - 投機的型特殊化 (BinaryOperationHint 等)       │
-        │  - 軽量な inlining                              │
-        │  - deopt 可能                                   │
-        └─────────────────────────────────────────────────┘
-                              │ さらにさらに hot
-                              ▼ (またはループで OSR)
-        ┌─────────────────────────────────────────────────┐
-        │  TurboFan (Top-tier Optimizer)                  │
-        │  - Sea of Nodes (Cliff Click)                   │
-        │  - JS → Simplified → Machine の三段下げ          │
-        │  - Range Type, Escape Analysis, Inlining        │
-        │  - Turboshaft (block-based IR) を後段に持つ      │
-        │  - deopt 可能                                   │
-        └─────────────────────────────────────────────────┘
-                              │ assumption 違反
-                              ▼ eager / lazy deopt
-                  Interpreter (Ignition) に戻る
-</code></pre>
+<pre class="mermaid">
+flowchart TD
+  SRC["ソースコード（parser → AST → Ignition）"]
+  IGN["Ignition インタプリタ（CSA dispatch、FeedbackVector を更新）"]
+  SP["Sparkplug（Baseline JIT、bytecode から機械語を直接生成）"]
+  MG["Maglev（Mid-tier、CFG ベース SSA、投機的型特殊化）"]
+  TF["TurboFan（Top-tier、Sea of Nodes、後段に Turboshaft）"]
+  SRC -->|"バイトコード + FeedbackVector"| IGN
+  IGN -->|"hot 化を検出"| SP
+  SP -->|"さらに hot"| MG
+  MG -->|"さらに hot またはループで OSR"| TF
+  TF -->|"assumption 違反で eager / lazy deopt"| IGN
+</pre>
 
 <p>この階層は「JIT のコンパイル時間と実行性能のトレードオフを段階的に投資する」設計の頂点であり、各 tier が IC / FeedbackVector / Hidden Class / CompilationDependencies という共通インフラを通じて互いに連携します。Ignition がインフラを蓄積し、Sparkplug がコストゼロでそれを土台にし、Maglev がフィードバックに賭けて中位の最適化を試み、TurboFan が最終的にピーク性能を引き出します。失敗 (投機外し、状態変化) が起きれば deopt で Ignition に戻り、再度フィードバックを蓄積し直します。これが V8 の adaptive optimization の完成形であり、Turboshaft によって最後段のさらなる進化が現在進行中です。</p>
 

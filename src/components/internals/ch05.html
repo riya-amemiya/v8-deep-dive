@@ -120,19 +120,17 @@ bool IsMoreGeneralElementsKindTransition(ElementsKind from_kind,
 
 <p>これを図示すると以下のようになります。</p>
 
-<pre><code class="language-text">                      ElementsKind 遷移グラフ (Fast Elements)
-
-         PACKED_SMI ───────► HOLEY_SMI
-              │                  │
-              │                  │
-              ▼                  ▼
-       PACKED_DOUBLE ──────► HOLEY_DOUBLE
-              │                  │
-              │                  │
-              ▼                  ▼
-         PACKED ──────────────► HOLEY ────────► DICTIONARY
-                                                (terminal)
-</code></pre>
+<pre class="mermaid">
+flowchart TD
+  PS["PACKED_SMI"] --> HS["HOLEY_SMI"]
+  PS --> PD["PACKED_DOUBLE"]
+  HS --> HD["HOLEY_DOUBLE"]
+  PD --> HD
+  PD --> P["PACKED"]
+  HD --> H["HOLEY"]
+  P --> H
+  H --> DICT["DICTIONARY（terminal）"]
+</pre>
 
 <p>矢印はすべて一方向です。HOLEY からは PACKED に戻れず、DOUBLE からは SMI に戻れず、終端は HOLEY_ELEMENTS または DICTIONARY_ELEMENTS のみです。</p>
 

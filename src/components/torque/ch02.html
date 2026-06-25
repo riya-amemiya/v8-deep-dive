@@ -6,46 +6,28 @@
 
 <p><code class="file-ref">docs/torque/architecture.md:16-41</code> および <code class="file-ref">src/torque/torque-compiler.cc:53-127</code> (<code>CompileCurrentAst</code>) を一次資料として、パイプラインは以下の段階を踏みます。</p>
 
-<pre><code class="language-text">.tq files
-  │
-  ▼
-[1] Lexing / Earley Parsing       (torque-parser.cc, earley-parser.cc)
-  │ ─▶ AST (ast.h)
-  ▼
-[2] Predeclaration               (declaration-visitor.h, type-oracle.cc)
-  │
-  ▼
-[3] Predeclaration Resolution    (Type 名前→Type オブジェクト)
-  │
-  ▼
-[4] Declaration Visit            (declaration-visitor.cc)
-  │ ─▶ Macro/Builtin/Runtime/Intrinsic/Const objects
-  ▼
-[5] TypeOracle::FinalizeAggregateTypes
-  │ ─▶ クラスフィールドの offset 確定
-  ▼
-[6] ImplementationVisitor::VisitAllDeclarables
-  │   - 各 macro/builtin の body を VisitStatement / VisitExpression
-  │   - CfgAssembler を通じて Instruction 列を CFG に Emit
-  ▼
-[7] Code Generation
-  ├─ CSAGenerator    (csa-generator.cc)  ─▶ *-tq-csa.cc, *-tq-csa.h
-  ├─ CCGenerator     (cc-generator.cc)   ─▶ *-tq.cc, *-tq.inc, *-tq-inl.inc
-  └─ TSAGenerator    (tsa-generator.cc)  ─▶ *-tq-tsa.cc, *-tq-tsa.h (実験的)
-  │
-  ▼
-[8] グローバル一括生成
-   ├─ instance-types.h
-   ├─ bit-fields.h
-   ├─ builtin-definitions.h
-   ├─ interface-descriptors.inc
-   ├─ class-forward-declarations.h
-   ├─ class-debug-readers.{h,cc}
-   ├─ csa-types.h
-   ├─ enum-verifiers.cc
-   ├─ exported-macros-assembler.{h,cc}
-   └─ debug-macros.{h,cc}
-</code></pre>
+<pre class="mermaid">
+flowchart TD
+  TQ[".tq files"]
+  P1["[1] Lexing / Earley Parsing"]
+  P2["[2] Predeclaration"]
+  P3["[3] Predeclaration Resolution"]
+  P4["[4] Declaration Visit"]
+  P5["[5] TypeOracle FinalizeAggregateTypes"]
+  P6["[6] ImplementationVisitor VisitAllDeclarables"]
+  P7["[7] Code Generation"]
+  P8["[8] グローバル一括生成"]
+  TQ --> P1
+  P1 -->|"AST"| P2
+  P2 --> P3 --> P4
+  P4 -->|"Macro / Builtin / Runtime / Intrinsic"| P5
+  P5 -->|"クラスフィールドの offset 確定"| P6
+  P6 --> P7
+  P7 --> CSA["CSAGenerator → *-tq-csa.cc/.h"]
+  P7 --> CC["CCGenerator → *-tq.cc/.inc"]
+  P7 --> TSA["TSAGenerator → *-tq-tsa.cc/.h（実験的）"]
+  P7 --> P8
+</pre>
 
 <h3 id="sec-2-2">2.2 CompileCurrentAst の実コード</h3>
 
