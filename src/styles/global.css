@@ -628,6 +628,16 @@
     border-bottom-color: var(--color-primary-strong);
   }
 
+  /* Break long unbreakable tokens (identifiers, URLs, signatures) so a heading,
+     paragraph or inline code can never widen the page on small screens.
+     No effect inside <pre> (white-space: pre suppresses soft wrapping). */
+  .chapter,
+  .prologue,
+  .bridge,
+  .epilogue {
+    overflow-wrap: anywhere;
+  }
+
   /* Inline code + file references */
   .chapter code,
   .prologue code,
@@ -640,9 +650,6 @@
     font-family: var(--font-mono);
     font-size: 0.86em;
     font-weight: 500;
-    /* Long identifiers must break rather than widen the page on small screens.
-       No effect inside <pre> (white-space: pre suppresses soft wrapping). */
-    overflow-wrap: anywhere;
   }
   .chapter code.file-ref,
   .prologue code.file-ref,
@@ -739,8 +746,11 @@
   .chapter th code {
     font-size: 0.85em;
     padding: 1px 5px;
-    /* Cells live inside the horizontal scroll box, so let code keep its width
-       and scroll rather than breaking a path apart one character per line. */
+  }
+  /* Cells live inside the horizontal scroll box, so let their content keep its
+     width and scroll rather than breaking a path apart one char per line. */
+  .chapter td,
+  .chapter th {
     overflow-wrap: normal;
   }
 
