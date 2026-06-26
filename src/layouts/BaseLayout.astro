@@ -37,6 +37,16 @@ import "../styles/global.css";
     }
   });
 
+  // --- Wrap tables so wide ones scroll inside their own box instead of
+  //     stretching the page into a horizontal scroll on small screens. ---
+  document.querySelectorAll(".chapter table").forEach((table) => {
+    if (table.parentElement?.classList.contains("table-scroll")) return;
+    const wrap = document.createElement("div");
+    wrap.className = "table-scroll";
+    table.parentNode.insertBefore(wrap, table);
+    wrap.appendChild(table);
+  });
+
   // --- Sidebar scroll-spy ---
   const links = Array.from(document.querySelectorAll(".sidebar a[href^='#']"));
   const targets = links
