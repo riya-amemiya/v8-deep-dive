@@ -640,6 +640,9 @@
     font-family: var(--font-mono);
     font-size: 0.86em;
     font-weight: 500;
+    /* Long identifiers must break rather than widen the page on small screens.
+       No effect inside <pre> (white-space: pre suppresses soft wrapping). */
+    overflow-wrap: anywhere;
   }
   .chapter code.file-ref,
   .prologue code.file-ref,
@@ -685,16 +688,23 @@
     font-weight: 700;
   }
 
-  /* Tables */
+  /* Tables — the wrapper (injected at runtime) owns the frame so a wide table
+     scrolls within its box instead of pushing the page into a horizontal
+     scroll on narrow screens. */
+  .table-scroll {
+    margin: 20px 0;
+    max-width: 100%;
+    overflow-x: auto;
+    border: 1px solid var(--color-border);
+    border-radius: 10px;
+    box-shadow: var(--shadow-card);
+    -webkit-overflow-scrolling: touch;
+  }
   .chapter table {
     border-collapse: collapse;
-    margin: 20px 0;
+    margin: 0;
     width: 100%;
     font-size: 14px;
-    box-shadow: var(--shadow-card);
-    border-radius: 10px;
-    overflow: hidden;
-    border: 1px solid var(--color-border);
   }
   .chapter thead {
     background: linear-gradient(135deg, var(--color-primary-strong), var(--color-primary));
@@ -725,9 +735,13 @@
   .chapter tbody tr:last-child td {
     border-bottom: none;
   }
-  .chapter td code {
+  .chapter td code,
+  .chapter th code {
     font-size: 0.85em;
     padding: 1px 5px;
+    /* Cells live inside the horizontal scroll box, so let code keep its width
+       and scroll rather than breaking a path apart one character per line. */
+    overflow-wrap: normal;
   }
 
   .chapter blockquote,
@@ -898,6 +912,17 @@
   }
   .chapter {
     padding: 26px 20px;
+  }
+  /* Cap the table box so a long table scrolls inside it, and pin the header
+     row so the column labels stay visible while scrolling. */
+  .table-scroll {
+    max-height: 70vh;
+  }
+  .chapter thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--color-primary-strong);
   }
   .chapter-prelude,
   .learning-card,
